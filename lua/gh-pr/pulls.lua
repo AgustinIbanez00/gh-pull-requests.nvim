@@ -1,6 +1,8 @@
 local M = {}
 local utils = require("gh-pr.utils")
 
+local reviewed = {}
+
 -- Fetch open pull requests for the authenticated user using the `gh` CLI.
 -- Returns an array of tables with fields: number, title, reviewDecision,
 -- reviewRequests (array), reviews (array).
@@ -103,23 +105,46 @@ function M.open_file_diff(details, file)
 	end
 	local left = file_content(details.baseRepository, details.baseRefName, path)
 	local right = file_content(details.headRepository, details.headRefName, path)
+	local ft = vim.filetype.match({ filename = path }) or ""
 	vim.cmd("tabnew")
 	local buf_left = vim.api.nvim_get_current_buf()
 	vim.api.nvim_buf_set_lines(buf_left, 0, -1, false, vim.split(left, "\n", { plain = true }))
 	vim.api.nvim_buf_set_option(buf_left, "buftype", "nofile")
 	vim.api.nvim_buf_set_option(buf_left, "bufhidden", "wipe")
+	vim.api.nvim_buf_set_option(buf_left, "filetype", ft)
 	vim.api.nvim_buf_set_name(buf_left, path .. " (base)")
+	vim.b[buf_left].gh_pr_path = path
+	vim.b[buf_left].gh_pr_reviewed = reviewed[path] or false
+	vim.bo[buf_left].statusline = "%f %=%{b:gh_pr_reviewed and '[reviewed]' or '[unreviewed]'}"
 	vim.cmd("vsplit")
 	local buf_right = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_win_set_buf(0, buf_right)
 	vim.api.nvim_buf_set_lines(buf_right, 0, -1, false, vim.split(right, "\n", { plain = true }))
 	vim.api.nvim_buf_set_option(buf_right, "buftype", "nofile")
 	vim.api.nvim_buf_set_option(buf_right, "bufhidden", "wipe")
+	vim.api.nvim_buf_set_option(buf_right, "filetype", ft)
 	vim.api.nvim_buf_set_name(buf_right, path .. " (PR)")
+	vim.b[buf_right].gh_pr_path = path
+	vim.b[buf_right].gh_pr_reviewed = reviewed[path] or false
+	vim.bo[buf_right].statusline = "%f %=%{b:gh_pr_reviewed and '[reviewed]' or '[unreviewed]'}"
 	vim.cmd("wincmd h")
 	vim.cmd("diffthis")
 	vim.cmd("wincmd l")
 	vim.cmd("diffthis")
+end
+
+function M.toggle_reviewed()
+	local buf = vim.api.nvim_get_current_buf()
+	local path = vim.b[buf].gh_pr_path
+	if not path then
+		return
+	end
+	reviewed[path] = not reviewed[path]
+	for _, b in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.b[b].gh_pr_path == path then
+			vim.b[b].gh_pr_reviewed = reviewed[path]
+		end
+	end
 end
 
 return M

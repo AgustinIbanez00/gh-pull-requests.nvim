@@ -13,5 +13,10 @@ Commands
     picker. Each entry shows the pull request number, title, review state,
     and reviewer statuses. Selecting a pull request opens another picker with
     the files changed in that pull request. Choosing a file will download the
-    base and head versions and display them side-by-side in diff mode.
+    base and head versions and display them side-by-side in diff mode. Buffers
+    retain the original filetype so syntax highlighting and plugins are loaded.
+
+:GhPrToggleReviewed
+    Toggles a marker in the statusline of the current buffer indicating whether
+    the file has been reviewed.
 
