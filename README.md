@@ -10,6 +10,17 @@ side-by-side in diff mode. Buffers keep the original filetype so syntax
 highlighting and other plugins work as expected. Use `:GhPrToggleReviewed`
 while inspecting a file to toggle a `[reviewed]` indicator in the statusline.
 
+## Usage
+
+The plugin defines default keymaps that all begin with `<leader>gh`:
+
+| Mapping       | Description                |
+| ------------- | -------------------------- |
+| `<leader>ghl` | List pull requests         |
+| `<leader>ght` | Toggle reviewed indicator  |
+| `<leader>ghn` | Jump to next diff change   |
+| `<leader>ghp` | Jump to previous change    |
+
 ## Installation
 
 The plugin works with all major Neovim plugin managers.

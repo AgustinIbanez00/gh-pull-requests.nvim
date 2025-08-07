@@ -147,4 +147,18 @@ function M.toggle_reviewed()
 	end
 end
 
+---Move to the next diff hunk when viewing a pull request file.
+function M.next_change()
+        if vim.wo.diff then
+                vim.cmd("normal! ]c")
+        end
+end
+
+---Move to the previous diff hunk when viewing a pull request file.
+function M.prev_change()
+        if vim.wo.diff then
+                vim.cmd("normal! [c")
+        end
+end
+
 return M
