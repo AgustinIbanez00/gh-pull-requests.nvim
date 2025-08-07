@@ -20,3 +20,20 @@ Commands
     Toggles a marker in the statusline of the current buffer indicating whether
     the file has been reviewed.
 
+:GhPrNextChange
+    When viewing a pull request file in diff mode, jump to the next change hunk.
+
+:GhPrPrevChange
+    When viewing a pull request file in diff mode, jump to the previous change
+    hunk.
+
+Keymaps
+=======
+
+The plugin defines default mappings that begin with `<leader>gh`:
+
+    <leader>ghl       List pull requests (:GhPrList)
+    <leader>ght       Toggle reviewed flag (:GhPrToggleReviewed)
+    <leader>ghn       Next change hunk (:GhPrNextChange)
+    <leader>ghp       Previous change hunk (:GhPrPrevChange)
+
