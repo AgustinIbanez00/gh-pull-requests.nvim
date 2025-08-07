@@ -36,9 +36,40 @@ function M.fetch()
 		"--author",
 		"@me",
 		"--json",
-		"number,title,reviewDecision,reviewRequests,reviews",
-	}
-	return read_gh_json(cmd)
+		"number,title,reviewRequests,reviews",
+}
+	local prs = read_gh_json(cmd)
+	for _, pr in ipairs(prs) do
+		pr.reviewDecision = M.compute_review_decision(pr)
+	end
+	return prs
+end
+
+---Infer the overall review decision for a pull request.
+---@param pr table
+---@return string
+function M.compute_review_decision(pr)
+	local by_login = {}
+	for _, review in ipairs(pr.reviews or {}) do
+		if review.author and review.author.login then
+			by_login[review.author.login] = review.state
+		end
+	end
+	for _, state in pairs(by_login) do
+		if state == "CHANGES_REQUESTED" then
+			return "CHANGES_REQUESTED"
+		end
+	end
+	local approved = false
+	for _, state in pairs(by_login) do
+		if state == "APPROVED" then
+			approved = true
+		end
+	end
+	if not approved or #(pr.reviewRequests or {}) > 0 then
+		return "REVIEW_REQUIRED"
+	end
+	return "APPROVED"
 end
 
 ---Compute reviewer states for a pull request.
@@ -149,16 +180,16 @@ end
 
 ---Move to the next diff hunk when viewing a pull request file.
 function M.next_change()
-        if vim.wo.diff then
-                vim.cmd("normal! ]c")
-        end
+	if vim.wo.diff then
+		vim.cmd("normal! ]c")
+	end
 end
 
 ---Move to the previous diff hunk when viewing a pull request file.
 function M.prev_change()
-        if vim.wo.diff then
-                vim.cmd("normal! [c")
-        end
+	if vim.wo.diff then
+		vim.cmd("normal! [c")
+	end
 end
 
 return M
