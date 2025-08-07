@@ -27,18 +27,18 @@ end
 ---Fetch open pull requests authored by the authenticated user.
 ---@return table[] pull_requests
 function M.fetch()
-	local cmd = {
-		"gh",
-		"search",
-		"prs",
-		"--state",
-		"open",
-		"--author",
-		"@me",
-		"--json",
-		"number,title,reviewRequests,reviews",
-}
-	local prs = read_gh_json(cmd)
+        local cmd = {
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--author",
+                "@me",
+                "--json",
+                "number,title,reviewRequests,reviews",
+        }
+        local prs = read_gh_json(cmd)
 	for _, pr in ipairs(prs) do
 		pr.reviewDecision = M.compute_review_decision(pr)
 	end
