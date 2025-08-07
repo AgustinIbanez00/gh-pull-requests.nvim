@@ -1,0 +1,5 @@
+*gh-pr.txt*    gh-pr plugin
+
+GH-PR is a Neovim plugin to review GitHub pull requests inside the editor.
+
+The functionality is under active development.
