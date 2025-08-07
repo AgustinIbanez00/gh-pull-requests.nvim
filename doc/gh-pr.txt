@@ -3,3 +3,13 @@
 GH-PR is a Neovim plugin to review GitHub pull requests inside the editor.
 
 The functionality is under active development.
+
+Commands
+========
+
+:GhPrList
+    Displays open pull requests for the authenticated user in a Telescope
+    picker. Each entry shows the pull request number, title, review state,
+    and reviewer statuses. Selecting an entry will display an alert
+    "accediste a PR#<number>".
+
