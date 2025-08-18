@@ -175,9 +175,8 @@ end
 local function file_content(repo, ref, path)
         local owner = repo.owner and repo.owner.login or repo.owner or ""
         local name = repo.name
-        local api = string.format("repos/%s/%s/contents/%s", owner, name, path)
-        local cmd = { "gh", "api", api, "--raw-field", "ref=" .. ref }
-        local data = read_gh_json(cmd)
+        local api = string.format("repos/%s/%s/contents/%s?ref=%s", owner, name, path, ref)
+        local data = read_gh_json({ "gh", "api", api })
         return decode_base64(data.content or "")
 end
 
