@@ -139,14 +139,13 @@ end
 ---@return table
 function M.fetch_details(number)
 	local fields = table.concat({
-		"files",
-		"baseRefName",
-		"headRefName",
-		"baseRepository",
-		"headRepository",
-	}, ",")
-	local cmd = { "gh", "pr", "view", tostring(number), "--json", fields }
-	return read_gh_json(cmd)
+                "files",
+                "baseRefName",
+                "headRefName",
+                "headRepository",
+        }, ",")
+        local cmd = { "gh", "pr", "view", tostring(number), "--json", fields }
+        return read_gh_json(cmd)
 end
 
 local function decode_base64(data)
@@ -157,26 +156,43 @@ local function decode_base64(data)
 	return decoded
 end
 
+local function current_repo()
+        local url = vim.fn.system({ "git", "remote", "get-url", "origin" })
+        if vim.v.shell_error ~= 0 then
+                return { owner = "", name = "" }
+        end
+        url = vim.trim(url)
+        local owner, name = url:match("[/:]([^/]+)/([^/]+)%.git$")
+        if not owner or not name then
+                owner, name = url:match("[/:]([^/]+)/([^/]+)$")
+                if name then
+                        name = name:gsub("%.git$", "")
+                end
+        end
+        return { owner = owner or "", name = name or "" }
+end
+
 local function file_content(repo, ref, path)
-	local owner = repo.owner and repo.owner.login or repo.owner or ""
-	local name = repo.name
-	local api = string.format("repos/%s/%s/contents/%s", owner, name, path)
-	local cmd = { "gh", "api", api, "--raw-field", "ref=" .. ref }
-	local data = read_gh_json(cmd)
-	return decode_base64(data.content or "")
+        local owner = repo.owner and repo.owner.login or repo.owner or ""
+        local name = repo.name
+        local api = string.format("repos/%s/%s/contents/%s", owner, name, path)
+        local cmd = { "gh", "api", api, "--raw-field", "ref=" .. ref }
+        local data = read_gh_json(cmd)
+        return decode_base64(data.content or "")
 end
 
 ---Open a diff view for a file from the pull request.
 ---@param details table Output of fetch_details
 ---@param file table File information from the PR
 function M.open_file_diff(details, file)
-	local path = file.path or file.filename
-	if not path then
-		return
-	end
-	local left = file_content(details.baseRepository, details.baseRefName, path)
-	local right = file_content(details.headRepository, details.headRefName, path)
-	local ft = vim.filetype.match({ filename = path }) or ""
+        local path = file.path or file.filename
+        if not path then
+                return
+        end
+        local repo = current_repo()
+        local left = file_content(repo, details.baseRefName, path)
+        local right = file_content(details.headRepository, details.headRefName, path)
+        local ft = vim.filetype.match({ filename = path }) or ""
 	vim.cmd("tabnew")
 	local buf_left = vim.api.nvim_get_current_buf()
 	vim.api.nvim_buf_set_lines(buf_left, 0, -1, false, vim.split(left, "\n", { plain = true }))
