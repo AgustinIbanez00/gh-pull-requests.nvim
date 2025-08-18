@@ -45,6 +45,46 @@ function M.fetch()
 	return prs
 end
 
+---Fetch open pull requests that request a review from the authenticated user.
+---@return table[] pull_requests
+function M.fetch_assigned()
+        local cmd = {
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--review-requested",
+                "@me",
+                "--json",
+                "number,title,reviewRequests,reviews",
+        }
+        local prs = read_gh_json(cmd)
+        for _, pr in ipairs(prs) do
+                pr.reviewDecision = M.compute_review_decision(pr)
+        end
+        return prs
+end
+
+---Fetch all open pull requests for the current repository.
+---@return table[] pull_requests
+function M.fetch_all()
+        local cmd = {
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--json",
+                "number,title,reviewRequests,reviews",
+        }
+        local prs = read_gh_json(cmd)
+        for _, pr in ipairs(prs) do
+                pr.reviewDecision = M.compute_review_decision(pr)
+        end
+        return prs
+end
+
 ---Infer the overall review decision for a pull request.
 ---@param pr table
 ---@return string
