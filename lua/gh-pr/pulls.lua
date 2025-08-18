@@ -54,8 +54,8 @@ function M.fetch_assigned()
                 "list",
                 "--state",
                 "open",
-                "--review-requested",
-                "@me",
+                "--search",
+                "review-requested:@me",
                 "--json",
                 "number,title,reviewRequests,reviews",
         }
