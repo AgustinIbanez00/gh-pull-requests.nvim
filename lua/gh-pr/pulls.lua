@@ -206,27 +206,30 @@ function M.open_file_diff(details, file)
         local left = file_content(repo, details.baseRefName, path)
         local right = file_content(details.headRepository, details.headRefName, path)
         local ft = vim.filetype.match({ filename = path }) or ""
-	vim.cmd("tabnew")
-	local buf_left = vim.api.nvim_get_current_buf()
+        vim.cmd("tabnew")
+        local buf_left = vim.api.nvim_get_current_buf()
+        local win_left = vim.api.nvim_get_current_win()
 	vim.api.nvim_buf_set_lines(buf_left, 0, -1, false, vim.split(left, "\n", { plain = true }))
 	vim.api.nvim_buf_set_option(buf_left, "buftype", "nofile")
 	vim.api.nvim_buf_set_option(buf_left, "bufhidden", "wipe")
 	vim.api.nvim_buf_set_option(buf_left, "filetype", ft)
 	vim.api.nvim_buf_set_name(buf_left, path .. " (base)")
-	vim.b[buf_left].gh_pr_path = path
-	vim.b[buf_left].gh_pr_reviewed = reviewed[path] or false
-	vim.bo[buf_left].statusline = "%f %=%{b:gh_pr_reviewed and '[reviewed]' or '[unreviewed]'}"
-	vim.cmd("vsplit")
-	local buf_right = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_win_set_buf(0, buf_right)
-	vim.api.nvim_buf_set_lines(buf_right, 0, -1, false, vim.split(right, "\n", { plain = true }))
+        vim.b[buf_left].gh_pr_path = path
+        vim.b[buf_left].gh_pr_reviewed = reviewed[path] or false
+        local statusline = "%f %=%{b:gh_pr_reviewed and '[reviewed]' or '[unreviewed]'}"
+        vim.api.nvim_win_set_option(win_left, "statusline", statusline)
+        vim.cmd("vsplit")
+        local win_right = vim.api.nvim_get_current_win()
+        local buf_right = vim.api.nvim_create_buf(false, true)
+        vim.api.nvim_win_set_buf(win_right, buf_right)
+        vim.api.nvim_buf_set_lines(buf_right, 0, -1, false, vim.split(right, "\n", { plain = true }))
 	vim.api.nvim_buf_set_option(buf_right, "buftype", "nofile")
 	vim.api.nvim_buf_set_option(buf_right, "bufhidden", "wipe")
 	vim.api.nvim_buf_set_option(buf_right, "filetype", ft)
 	vim.api.nvim_buf_set_name(buf_right, path .. " (PR)")
-	vim.b[buf_right].gh_pr_path = path
-	vim.b[buf_right].gh_pr_reviewed = reviewed[path] or false
-	vim.bo[buf_right].statusline = "%f %=%{b:gh_pr_reviewed and '[reviewed]' or '[unreviewed]'}"
+        vim.b[buf_right].gh_pr_path = path
+        vim.b[buf_right].gh_pr_reviewed = reviewed[path] or false
+        vim.api.nvim_win_set_option(win_right, "statusline", statusline)
 	vim.cmd("wincmd h")
 	vim.cmd("diffthis")
 	vim.cmd("wincmd l")
