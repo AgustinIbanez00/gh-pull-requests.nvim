@@ -9,6 +9,9 @@ a pull request you can browse the changed files in a directory tree and view the
 side-by-side in diff mode. Buffers keep the original filetype so syntax
 highlighting and other plugins work as expected. Use `:GhPrToggleReviewed`
 while inspecting a file to toggle a `[reviewed]` indicator in the statusline.
+Alternatively, `<leader>ghr` opens a side tree showing pull requests assigned to
+you and all open pull requests, which can be expanded to reveal individual
+files.
 
 ## Usage
 
@@ -17,6 +20,7 @@ The plugin defines default keymaps that all begin with `<leader>gh`:
 | Mapping       | Description                |
 | ------------- | -------------------------- |
 | `<leader>ghl` | List pull requests         |
+| `<leader>ghr` | Review tree for pull requests |
 | `<leader>ght` | Toggle reviewed indicator  |
 | `<leader>ghn` | Jump to next diff change   |
 | `<leader>ghp` | Jump to previous change    |
