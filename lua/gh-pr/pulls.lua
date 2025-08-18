@@ -151,12 +151,22 @@ function M.fetch_details(number)
         return read_gh_json(cmd)
 end
 
+local has_vim_base64, vim_base64 = pcall(require, "vim.base64")
+
 local function decode_base64(data)
-	local decoded = vim.fn.system({ "base64", "--decode" }, data)
-	if vim.v.shell_error ~= 0 then
-		return ""
-	end
-	return decoded
+        if has_vim_base64 then
+                return vim_base64.decode(data)
+        end
+        if vim.fn.executable("base64") == 1 then
+                local decoded = vim.fn.system({ "base64", "--decode" }, data)
+                if vim.v.shell_error == 0 then
+                        return decoded
+                end
+                utils.debug("base64 command failed: " .. decoded)
+        else
+                utils.debug("'base64' executable not found")
+        end
+        return ""
 end
 
 local function current_repo()
