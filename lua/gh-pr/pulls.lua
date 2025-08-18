@@ -8,20 +8,23 @@ local reviewed = {}
 -- reviewRequests (array), reviews (array).
 -- Requires the GitHub CLI to be installed and authenticated.
 local function read_gh_json(cmd)
-	if not utils.ensure_git_repo() then
-		return {}
-	end
-	local output = vim.fn.system(cmd)
-	if vim.v.shell_error ~= 0 then
-		vim.notify("gh command failed: " .. output, vim.log.levels.ERROR)
-		return {}
-	end
-	local ok, decoded = pcall(vim.json.decode, output)
-	if not ok then
-		vim.notify("failed to parse gh output: " .. output, vim.log.levels.ERROR)
-		return {}
-	end
-	return decoded
+        if not utils.ensure_git_repo() then
+                return {}
+        end
+        utils.debug("Running: " .. table.concat(cmd, " "))
+        local output = vim.fn.system(cmd)
+        if vim.v.shell_error ~= 0 then
+                utils.debug("Command failed: " .. output)
+                vim.notify("gh command failed: " .. output, vim.log.levels.ERROR)
+                return {}
+        end
+        local ok, decoded = pcall(vim.json.decode, output)
+        if not ok then
+                utils.debug("Failed to parse output: " .. output)
+                vim.notify("failed to parse gh output: " .. output, vim.log.levels.ERROR)
+                return {}
+        end
+        return decoded
 end
 
 ---Fetch open pull requests authored by the authenticated user.

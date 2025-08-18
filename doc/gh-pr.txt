@@ -37,3 +37,13 @@ The plugin defines default mappings that begin with `<leader>gh`:
     <leader>ghn       Next change hunk (:GhPrNextChange)
     <leader>ghp       Previous change hunk (:GhPrPrevChange)
 
+Configuration
+============
+
+Enable debug logging of `gh` commands by calling `setup` with the `debug`
+option:
+
+    lua << EOF
+    require('gh-pr').setup({debug = true})
+    EOF
+

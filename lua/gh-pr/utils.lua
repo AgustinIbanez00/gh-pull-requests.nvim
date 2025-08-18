@@ -1,4 +1,11 @@
 local M = {}
+local config = require("gh-pr.config")
+
+function M.debug(msg)
+        if config.debug then
+                vim.notify(msg, vim.log.levels.DEBUG)
+        end
+end
 
 ---Check if the current working directory is inside a git repository.
 ---@return boolean

@@ -62,6 +62,16 @@ Plug 'nvim-lua/plenary.nvim'
 Plug 'nvim-telescope/telescope.nvim'
 ```
 
+## Configuration
+
+Enable optional debug logging of `gh` commands:
+
+```lua
+require("gh-pr").setup({
+  debug = true,
+})
+```
+
 ## Contributing
 
 Contributions are welcome and greatly appreciated. To contribute:
