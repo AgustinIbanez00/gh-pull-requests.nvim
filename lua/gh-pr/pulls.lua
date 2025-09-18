@@ -175,9 +175,8 @@ end
 local function file_content(repo, ref, path)
         local owner = repo.owner and repo.owner.login or repo.owner or ""
         local name = repo.name
-        local api = string.format("repos/%s/%s/contents/%s", owner, name, path)
-        local cmd = { "gh", "api", api, "--raw-field", "ref=" .. ref }
-        local data = read_gh_json(cmd)
+        local api = string.format("repos/%s/%s/contents/%s?ref=%s", owner, name, path, ref)
+        local data = read_gh_json({ "gh", "api", api })
         return decode_base64(data.content or "")
 end
 
@@ -192,17 +191,18 @@ function M.open_file_diff(details, file)
         local repo = current_repo()
         local left = file_content(repo, details.baseRefName, path)
         local right = file_content(details.headRepository, details.headRefName, path)
-        local ft = vim.filetype.match({ filename = path }) or ""
-	vim.cmd("tabnew")
-	local buf_left = vim.api.nvim_get_current_buf()
-	vim.api.nvim_buf_set_lines(buf_left, 0, -1, false, vim.split(left, "\n", { plain = true }))
-	vim.api.nvim_buf_set_option(buf_left, "buftype", "nofile")
-	vim.api.nvim_buf_set_option(buf_left, "bufhidden", "wipe")
-	vim.api.nvim_buf_set_option(buf_left, "filetype", ft)
-	vim.api.nvim_buf_set_name(buf_left, path .. " (base)")
-	vim.b[buf_left].gh_pr_path = path
-	vim.b[buf_left].gh_pr_reviewed = reviewed[path] or false
-	vim.bo[buf_left].statusline = "%f %=%{b:gh_pr_reviewed and '[reviewed]' or '[unreviewed]'}"
+       local ft = vim.filetype.match({ filename = path }) or ""
+       local statusline = "%f %=%{b:gh_pr_reviewed ? '[reviewed]' : '[unreviewed]'}"
+       vim.cmd("tabnew")
+       local buf_left = vim.api.nvim_get_current_buf()
+       vim.api.nvim_buf_set_lines(buf_left, 0, -1, false, vim.split(left, "\n", { plain = true }))
+       vim.api.nvim_buf_set_option(buf_left, "buftype", "nofile")
+       vim.api.nvim_buf_set_option(buf_left, "bufhidden", "wipe")
+       vim.api.nvim_buf_set_option(buf_left, "filetype", ft)
+       vim.api.nvim_buf_set_name(buf_left, path .. " (base)")
+       vim.b[buf_left].gh_pr_path = path
+       vim.b[buf_left].gh_pr_reviewed = reviewed[path] or false
+       vim.bo[buf_left].statusline = statusline
 	vim.cmd("vsplit")
 	local buf_right = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_win_set_buf(0, buf_right)
@@ -210,10 +210,10 @@ function M.open_file_diff(details, file)
 	vim.api.nvim_buf_set_option(buf_right, "buftype", "nofile")
 	vim.api.nvim_buf_set_option(buf_right, "bufhidden", "wipe")
 	vim.api.nvim_buf_set_option(buf_right, "filetype", ft)
-	vim.api.nvim_buf_set_name(buf_right, path .. " (PR)")
-	vim.b[buf_right].gh_pr_path = path
-	vim.b[buf_right].gh_pr_reviewed = reviewed[path] or false
-	vim.bo[buf_right].statusline = "%f %=%{b:gh_pr_reviewed and '[reviewed]' or '[unreviewed]'}"
+       vim.api.nvim_buf_set_name(buf_right, path .. " (PR)")
+       vim.b[buf_right].gh_pr_path = path
+       vim.b[buf_right].gh_pr_reviewed = reviewed[path] or false
+       vim.bo[buf_right].statusline = statusline
 	vim.cmd("wincmd h")
 	vim.cmd("diffthis")
 	vim.cmd("wincmd l")
