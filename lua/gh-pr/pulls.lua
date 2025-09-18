@@ -213,16 +213,20 @@ local function fetch_default(def)
 end
 
 local function fetch_with_search(def)
-        local search = apply_placeholders(def.query)
+        local search = vim.trim(apply_placeholders(def.query))
         if search == "" then
                 return {}
         end
         local fields = def.fields or { "number", "title", "reviewDecision", "reviewRequests", "reviews", "repository" }
-        local cmd = { "gh", "search", "prs", "--json", table.concat(fields, ","), "--search", search }
+        local cmd = { "gh", "search", "prs", "--json", table.concat(fields, ",") }
         append_option(cmd, "--limit", def.limit)
         append_option(cmd, "--sort", def.sort)
         append_option(cmd, "--order", def.order)
         extend_args(cmd, def.args)
+        if search:match("^%s*-") then
+                table.insert(cmd, "--")
+        end
+        table.insert(cmd, search)
         local prs = read_gh_json(cmd)
         local results = {}
         for _, pr in ipairs(prs) do
