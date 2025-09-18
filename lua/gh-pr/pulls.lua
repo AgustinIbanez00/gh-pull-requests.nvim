@@ -4,22 +4,114 @@ local config = require("gh-pr.config")
 
 local reviewed = {}
 local cached_user
+local unsupported_json_fields_notified = {}
 
-local function read_gh_json(cmd)
+local function read_gh_json(cmd, opts)
+        opts = opts or {}
         if not utils.ensure_git_repo() then
-                return {}
+                return {}, "not inside a git repository"
         end
         local output = vim.fn.system(cmd)
         if vim.v.shell_error ~= 0 then
-                vim.notify("gh command failed: " .. output, vim.log.levels.ERROR)
-                return {}
+                if not opts.quiet then
+                        vim.notify("gh command failed: " .. output, vim.log.levels.ERROR)
+                end
+                return {}, output
         end
         local ok, decoded = pcall(vim.json.decode, output)
         if not ok then
-                vim.notify("failed to parse gh output: " .. output, vim.log.levels.ERROR)
-                return {}
+                if not opts.quiet then
+                        vim.notify("failed to parse gh output: " .. output, vim.log.levels.ERROR)
+                end
+                return {}, output
         end
         return decoded
+end
+
+local function read_gh_json_with_fields(cmd, fields, opts)
+        opts = opts or {}
+        local sanitized = {}
+        local seen = {}
+        for _, field in ipairs(fields or {}) do
+                if type(field) == "string" then
+                        local trimmed = vim.trim(field)
+                        if trimmed ~= "" and not seen[trimmed] then
+                                table.insert(sanitized, trimmed)
+                                seen[trimmed] = true
+                        end
+                end
+        end
+        local has_json_flag = false
+        for _, value in ipairs(cmd) do
+                if value == "--json" then
+                        has_json_flag = true
+                        break
+                end
+        end
+        if has_json_flag then
+                local attempt = vim.deepcopy(cmd)
+                for _, arg in ipairs(opts.post_args or {}) do
+                        table.insert(attempt, arg)
+                end
+                return read_gh_json(attempt, opts)
+        end
+        if #sanitized == 0 then
+                vim.notify("gh command failed: no JSON fields specified", vim.log.levels.ERROR)
+                return {}
+        end
+        local remaining = vim.deepcopy(sanitized)
+        local command_identity = {}
+        for i = 1, math.min(#cmd, 3) do
+                table.insert(command_identity, tostring(cmd[i]))
+        end
+        local command_key = table.concat(command_identity, " ")
+        local removed_fields = {}
+        while #remaining > 0 do
+                local attempt = vim.deepcopy(cmd)
+                table.insert(attempt, "--json")
+                table.insert(attempt, table.concat(remaining, ","))
+                for _, arg in ipairs(opts.post_args or {}) do
+                        table.insert(attempt, arg)
+                end
+                local result, err = read_gh_json(attempt, { quiet = true })
+                if not err then
+                        for field in pairs(removed_fields) do
+                                local key = command_key .. "|" .. field
+                                if not unsupported_json_fields_notified[key] then
+                                        vim.notify(
+                                                string.format(
+                                                        "%s does not support JSON field '%s'; retrying without it",
+                                                        command_key,
+                                                        field
+                                                ),
+                                                vim.log.levels.WARN
+                                        )
+                                        unsupported_json_fields_notified[key] = true
+                                end
+                        end
+                        return result
+                end
+                local unsupported = err:match('Unknown JSON field:%s*"([^"]+)"')
+                        or err:match("Unknown JSON field:?%s*'([^'\n]+)'")
+                if not unsupported then
+                        vim.notify("gh command failed: " .. err, vim.log.levels.ERROR)
+                        return {}
+                end
+                removed_fields[unsupported] = true
+                local next_fields = {}
+                for _, field in ipairs(remaining) do
+                        if field ~= unsupported then
+                                table.insert(next_fields, field)
+                        end
+                end
+                if #next_fields == #remaining then
+                        vim.notify("gh command failed: " .. err, vim.log.levels.ERROR)
+                        return {}
+                end
+                remaining = next_fields
+        end
+        vim.notify("gh command failed: no supported JSON fields", vim.log.levels.ERROR)
+        return {}
 end
 
 local function normalized_repo(owner, name)
@@ -169,6 +261,8 @@ local function normalize_reviews(collection)
 end
 
 local function normalize_pr(pr, repo_override, query_label)
+        local has_review_requests = pr.reviewRequests ~= nil and pr.reviewRequests ~= vim.NIL
+        local has_reviews = pr.reviews ~= nil and pr.reviews ~= vim.NIL
         pr.reviewRequests = normalize_review_requests(pr.reviewRequests)
         pr.reviews = normalize_reviews(pr.reviews)
         if repo_override and (repo_override.owner ~= "" or repo_override.name ~= "") then
@@ -177,7 +271,7 @@ local function normalize_pr(pr, repo_override, query_label)
                 pr.repository = parse_repo(pr.repository)
         end
         pr.query_label = query_label
-        if not pr.reviewDecision or pr.reviewDecision == vim.NIL then
+        if (not pr.reviewDecision or pr.reviewDecision == vim.NIL) and (has_review_requests or has_reviews) then
                 pr.reviewDecision = M.compute_review_decision(pr)
         end
         return pr
@@ -196,14 +290,14 @@ end
 
 local function fetch_default(def)
         local fields = def.fields or { "number", "title", "reviewDecision", "reviewRequests", "reviews" }
-        local cmd = { "gh", "pr", "list", "--json", table.concat(fields, ",") }
+        local cmd = { "gh", "pr", "list" }
         append_option(cmd, "--state", def.state or "open")
         append_option(cmd, "--limit", def.limit)
         if def.author then
                 append_option(cmd, "--author", apply_placeholders(def.author))
         end
         extend_args(cmd, def.args)
-        local prs = read_gh_json(cmd)
+        local prs = read_gh_json_with_fields(cmd, fields)
         local repo = current_repo()
         local results = {}
         for _, pr in ipairs(prs) do
@@ -213,17 +307,22 @@ local function fetch_default(def)
 end
 
 local function fetch_with_search(def)
-        local search = apply_placeholders(def.query)
+        local search = vim.trim(apply_placeholders(def.query))
         if search == "" then
                 return {}
         end
         local fields = def.fields or { "number", "title", "reviewDecision", "reviewRequests", "reviews", "repository" }
-        local cmd = { "gh", "search", "prs", "--json", table.concat(fields, ","), "--search", search }
+        local cmd = { "gh", "search", "prs" }
         append_option(cmd, "--limit", def.limit)
         append_option(cmd, "--sort", def.sort)
         append_option(cmd, "--order", def.order)
         extend_args(cmd, def.args)
-        local prs = read_gh_json(cmd)
+        local post_args = {}
+        if search:match("^%s*-") then
+                table.insert(post_args, "--")
+        end
+        table.insert(post_args, search)
+        local prs = read_gh_json_with_fields(cmd, fields, { post_args = post_args })
         local results = {}
         for _, pr in ipairs(prs) do
                 table.insert(results, normalize_pr(pr, nil, def.label))
