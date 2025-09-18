@@ -37,3 +37,37 @@ The plugin defines default mappings that begin with `<leader>gh`:
     <leader>ghn       Next change hunk (:GhPrNextChange)
     <leader>ghp       Previous change hunk (:GhPrPrevChange)
 
+Configuration
+=============
+
+Use `require("gh-pr").setup()` to customise the plugin. The `queries`
+parameter controls which pull request sections are shown in both the Telescope
+picker and the side tree. Each entry must provide a `label` and a `query`.
+Queries are executed through `gh search prs`, and the strings `${owner}`,
+`${repository}`, and `${user}` are expanded to the current repository owner,
+repository name, and authenticated GitHub login respectively. Additional keys
+such as `limit`, `sort`, `order`, or `args` are appended to the GitHub CLI
+command for more control. When `query` is set to `"default"`, the plugin falls
+back to `gh pr list` for the current repository.
+
+Example configuration:
+
+>lua
+require("gh-pr").setup({
+  queries = {
+    {
+      label = "Waiting For My Review",
+      query = "repo:${owner}/${repository} is:open review-requested:${user}",
+    },
+    {
+      label = "Created By Me",
+      query = "repo:${owner}/${repository} is:open author:${user}",
+    },
+    {
+      label = "All Open",
+      query = "repo:${owner}/${repository} is:open",
+    },
+  },
+})
+<
+

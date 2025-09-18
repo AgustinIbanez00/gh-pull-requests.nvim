@@ -62,6 +62,40 @@ Plug 'nvim-lua/plenary.nvim'
 Plug 'nvim-telescope/telescope.nvim'
 ```
 
+## Configuration
+
+Call `require("gh-pr").setup()` to customise the behaviour of the plugin. The
+main entrypoint is the `queries` option, which controls the sections displayed
+in both the Telescope picker and the review tree. Each query entry is a table
+with a `label` and a `query` string. The query string is passed to
+`gh search prs` and supports the placeholders `${owner}`, `${repository}`, and
+`${user}`, which expand to the current repository owner, repository name, and
+authenticated GitHub user respectively. Additional keys such as `limit`,
+`sort`, `order`, or `args` are forwarded to the GitHub CLI command for advanced
+filtering. Setting `query = "default"` instructs the plugin to use
+`gh pr list` for the current repository instead of the search endpoint.
+
+The default configuration matches the following Lua snippet:
+
+```lua
+require("gh-pr").setup({
+  queries = {
+    {
+      label = "Waiting For My Review",
+      query = "repo:${owner}/${repository} is:open review-requested:${user}",
+    },
+    {
+      label = "Created By Me",
+      query = "repo:${owner}/${repository} is:open author:${user}",
+    },
+    {
+      label = "All Open",
+      query = "repo:${owner}/${repository} is:open",
+    },
+  },
+})
+```
+
 ## Contributing
 
 Contributions are welcome and greatly appreciated. To contribute:

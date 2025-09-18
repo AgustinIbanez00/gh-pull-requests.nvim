@@ -1,10 +1,11 @@
 local M = {}
 local utils = require("gh-pr.utils")
+local config = require("gh-pr.config")
 
 ---Setup gh-pr plugin.
----Currently a placeholder for future configuration.
-function M.setup()
-	-- TODO: initialize plugin components
+---@param opts table|nil
+function M.setup(opts)
+        config.setup(opts or {})
 end
 
 ---Open a picker displaying the user's open pull requests.

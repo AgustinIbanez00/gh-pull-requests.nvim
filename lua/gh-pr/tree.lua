@@ -3,8 +3,22 @@ local pulls = require("gh-pr.pulls")
 
 local state = { buf = nil, win = nil, nodes = {} }
 
+local function pr_text(pr)
+        local repo = pr.repository and pr.repository.full_name or ""
+        local identifier = string.format("#%d", pr.number)
+        if repo ~= "" then
+                identifier = string.format("%s %s", repo, identifier)
+        end
+        local decision = pr.reviewDecision or "UNKNOWN"
+        return string.format("  %s %s [%s]", identifier, pr.title, decision)
+end
+
 local function render()
         if not state.buf then
+                return
+        end
+        if vim.tbl_isempty(state.nodes) then
+                vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, { "No pull requests found" })
                 return
         end
         local lines = {}
@@ -66,7 +80,7 @@ local function toggle()
                         node.children = nil
                         render()
                 else
-                        local details = pulls.fetch_details(node.number)
+                        local details = pulls.fetch_details(node.pr)
                         node.details = details
                         node.children = {}
                         for _, f in ipairs(details.files or {}) do
@@ -76,7 +90,7 @@ local function toggle()
                         render()
                 end
         elseif node.type == "file" and parent and parent.details then
-                pulls.open_file_diff(parent.details, node.file)
+                pulls.open_file_diff(parent.pr, parent.details, node.file)
         end
 end
 
@@ -103,15 +117,13 @@ function M.open()
         vim.bo[state.buf].bufhidden = "wipe"
         vim.bo[state.buf].swapfile = false
         vim.bo[state.buf].filetype = "ghprtree"
-        state.nodes = {
-                { type = "group", text = "Assigned", open = false, children = {} },
-                { type = "group", text = "All", open = false, children = {} },
-        }
-        for _, pr in ipairs(pulls.fetch_assigned()) do
-                table.insert(state.nodes[1].children, { type = "pr", number = pr.number, pr = pr, text = string.format("  #%d %s", pr.number, pr.title) })
-        end
-        for _, pr in ipairs(pulls.fetch_all()) do
-                table.insert(state.nodes[2].children, { type = "pr", number = pr.number, pr = pr, text = string.format("  #%d %s", pr.number, pr.title) })
+        state.nodes = {}
+        for _, group in ipairs(pulls.fetch_by_query()) do
+                local group_node = { type = "group", text = group.label, open = false, children = {} }
+                for _, pr in ipairs(group.pull_requests or {}) do
+                        table.insert(group_node.children, { type = "pr", number = pr.number, pr = pr, text = pr_text(pr) })
+                end
+                table.insert(state.nodes, group_node)
         end
         render()
         vim.keymap.set("n", "<CR>", toggle, { buffer = state.buf })
