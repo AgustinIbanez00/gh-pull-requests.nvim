@@ -279,6 +279,8 @@ function M.fetch_details(pr)
                 "baseRefName",
                 "headRefName",
                 "headRepository",
+                "reviewThreads",
+                "comments",
         }, ",")
         local cmd = { "gh", "pr", "view", tostring(pr.number), "--json", fields }
         if repo.owner ~= "" and repo.name ~= "" then
@@ -290,6 +292,12 @@ function M.fetch_details(pr)
         if details.headRepository then
                 details.headRepository = parse_repo(details.headRepository)
         end
+        details.files = normalize_nodes(details.files)
+        details.reviewThreads = normalize_nodes(details.reviewThreads)
+        for _, thread in ipairs(details.reviewThreads or {}) do
+                thread.comments = normalize_nodes(thread.comments)
+        end
+        details.comments = normalize_nodes(details.comments)
         return details
 end
 
@@ -316,7 +324,21 @@ end
 ---@param pr table
 ---@param details table Output of fetch_details
 ---@param file table File information from the PR
-function M.open_file_diff(pr, details, file)
+local comment_highlight_namespace = vim.api.nvim_create_namespace("gh-pr-comment-target")
+local comment_highlight_defined = false
+
+local function ensure_comment_highlight()
+        if comment_highlight_defined then
+                return
+        end
+        comment_highlight_defined = true
+        local ok = pcall(vim.api.nvim_set_hl, 0, "GhPRCommentTarget", { link = "Search" })
+        if not ok then
+                vim.api.nvim_set_hl(0, "GhPRCommentTarget", { fg = "#FFFF00", bg = "#5F005F" })
+        end
+end
+
+function M.open_file_diff(pr, details, file, opts)
         local path = file.path or file.filename
         if not path then
                 return
@@ -329,11 +351,13 @@ function M.open_file_diff(pr, details, file)
                 vim.notify("missing ref information for pull request", vim.log.levels.WARN)
                 return
         end
+        opts = opts or {}
         local left = file_content(base_repo, base_ref, path)
         local right = file_content(head_repo, head_ref, path)
         local ft = vim.filetype.match({ filename = path }) or ""
         local statusline = "%f %=%{b:gh_pr_reviewed ? '[reviewed]' : '[unreviewed]'}"
         vim.cmd("tabnew")
+        local win_left = vim.api.nvim_get_current_win()
         local buf_left = vim.api.nvim_get_current_buf()
         vim.api.nvim_buf_set_lines(buf_left, 0, -1, false, vim.split(left, "\n", { plain = true }))
         vim.api.nvim_buf_set_option(buf_left, "buftype", "nofile")
@@ -344,6 +368,7 @@ function M.open_file_diff(pr, details, file)
         vim.b[buf_left].gh_pr_reviewed = reviewed[path] or false
         vim.bo[buf_left].statusline = statusline
         vim.cmd("vsplit")
+        local win_right = vim.api.nvim_get_current_win()
         local buf_right = vim.api.nvim_create_buf(false, true)
         vim.api.nvim_win_set_buf(0, buf_right)
         vim.api.nvim_buf_set_lines(buf_right, 0, -1, false, vim.split(right, "\n", { plain = true }))
@@ -355,9 +380,69 @@ function M.open_file_diff(pr, details, file)
         vim.b[buf_right].gh_pr_reviewed = reviewed[path] or false
         vim.bo[buf_right].statusline = statusline
         vim.cmd("wincmd h")
+        win_left = vim.api.nvim_get_current_win()
         vim.cmd("diffthis")
         vim.cmd("wincmd l")
+        win_right = vim.api.nvim_get_current_win()
         vim.cmd("diffthis")
+        local target_side = opts.side and string.upper(opts.side) or "RIGHT"
+        if target_side ~= "LEFT" then
+                target_side = "RIGHT"
+        end
+        local target_win = target_side == "LEFT" and win_left or win_right
+        local target_buf = target_side == "LEFT" and buf_left or buf_right
+        ensure_comment_highlight()
+        vim.api.nvim_buf_clear_namespace(buf_left, comment_highlight_namespace, 0, -1)
+        vim.api.nvim_buf_clear_namespace(buf_right, comment_highlight_namespace, 0, -1)
+        local line = tonumber(opts.line)
+        local range_start
+        local range_finish
+        if type(opts.range) == "table" then
+                range_start = tonumber(opts.range.start or opts.range[1])
+                range_finish = tonumber(opts.range.finish or opts.range[2])
+        end
+        if range_start and range_finish and range_start > range_finish then
+                range_start, range_finish = range_finish, range_start
+        end
+        if not line and range_start then
+                line = range_start
+        end
+        if range_start and range_finish then
+                local max_line = vim.api.nvim_buf_line_count(target_buf)
+                for row = range_start, range_finish do
+                        if row >= 1 and row <= max_line then
+                                vim.api.nvim_buf_add_highlight(
+                                        target_buf,
+                                        comment_highlight_namespace,
+                                        "GhPRCommentTarget",
+                                        row - 1,
+                                        0,
+                                        -1
+                                )
+                        end
+                end
+        elseif line then
+                local max_line = vim.api.nvim_buf_line_count(target_buf)
+                local row = math.min(math.max(line, 1), math.max(max_line, 1))
+                vim.api.nvim_buf_add_highlight(
+                        target_buf,
+                        comment_highlight_namespace,
+                        "GhPRCommentTarget",
+                        row - 1,
+                        0,
+                        -1
+                )
+        end
+        if line then
+                local max_line = vim.api.nvim_buf_line_count(target_buf)
+                local row = math.min(math.max(line, 1), math.max(max_line, 1))
+                vim.api.nvim_set_current_win(target_win)
+                vim.api.nvim_win_set_cursor(target_win, { row, 0 })
+                vim.cmd("normal! zz")
+        end
+        if not line then
+                vim.api.nvim_set_current_win(target_side == "LEFT" and win_left or win_right)
+        end
 end
 
 ---Infer the overall review decision for a pull request.
