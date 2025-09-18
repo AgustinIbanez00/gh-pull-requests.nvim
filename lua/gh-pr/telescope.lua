@@ -31,9 +31,25 @@ local function build_tree(files)
         return root
 end
 local function make_display(pr)
-	local reviewers = pulls.reviewer_summary(pr)
-	local decision = pr.reviewDecision or "UNKNOWN"
-	return string.format("#%d %s [%s] %s", pr.number, pr.title, decision, reviewers)
+        local reviewers = pulls.reviewer_summary(pr)
+        local decision = pr.reviewDecision or "UNKNOWN"
+        local segments = {}
+        if pr.query_label and pr.query_label ~= "" then
+                table.insert(segments, string.format("[%s]", pr.query_label))
+        end
+        local repo = pr.repository and pr.repository.full_name or ""
+        local identifier = string.format("#%d", pr.number)
+        if repo ~= "" then
+                identifier = string.format("%s %s", repo, identifier)
+        end
+        table.insert(segments, identifier)
+        table.insert(segments, pr.title)
+        local display = table.concat(segments, " ")
+        display = string.format("%s [%s]", display, decision)
+        if reviewers ~= "" then
+                display = string.format("%s %s", display, reviewers)
+        end
+        return display
 end
 
 function M.pull_requests()
@@ -44,13 +60,13 @@ function M.pull_requests()
 	end
 	local finders = require("telescope.finders")
 	local conf = require("telescope.config").values
-	local pulls_data = pulls.fetch()
-	if vim.tbl_isempty(pulls_data) then
-		return
-	end
-	pickers
-		.new({}, {
-			prompt_title = "My Pull Requests",
+        local pulls_data = pulls.fetch()
+        if vim.tbl_isempty(pulls_data) then
+                return
+        end
+        pickers
+                .new({}, {
+                        prompt_title = "GitHub Pull Requests",
 			finder = finders.new_table({
 				results = pulls_data,
 				entry_maker = function(pr)
@@ -71,7 +87,7 @@ function M.pull_requests()
 					if not (selection and selection.value) then
 						return
 					end
-					local details = pulls.fetch_details(selection.value.number)
+                                        local details = pulls.fetch_details(selection.value)
                                         local files = details.files or {}
                                         if vim.tbl_isempty(files) then
                                                 vim.notify("no files in pull request", vim.log.levels.WARN)
@@ -105,7 +121,7 @@ function M.pull_requests()
                                                                                 if item.type == "dir" then
                                                                                         browse(item, prefix .. item.name .. "/")
                                                                                 else
-                                                                                        pulls.open_file_diff(details, item.file)
+                                                                                        pulls.open_file_diff(selection.value, details, item.file)
                                                                                 end
                                                                         end
                                                                         fmap("i", "<CR>", select_entry)
