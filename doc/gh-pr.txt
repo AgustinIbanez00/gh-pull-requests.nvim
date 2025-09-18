@@ -16,6 +16,22 @@ Commands
     base and head versions and display them side-by-side in diff mode. Buffers
     retain the original filetype so syntax highlighting and plugins are loaded.
 
+:GhPrReviewTree
+    Opens a sidebar tree listing the configured pull request queries. Use
+    `<CR>` on a group to expand it and on a pull request to fetch its files.
+    Files are prefixed with status icons (`+`, `~`, `-`, `>`) and are colour
+    coded to match their Git status. Deleted entries are rendered with a
+    strikethrough, and comment counts are shown alongside unresolved thread
+    totals. Pressing `<CR>` on a file opens the side-by-side diff view.
+
+    Expanding a pull request also opens a companion panel at the bottom of the
+    screen that lists review comments grouped by file, similar to
+    `trouble.nvim`. Comments display their line number, author, and a preview
+    of the message. Unresolved threads are highlighted and outdated comments
+    are annotated. Use `<CR>` on a comment to jump directly to the relevant
+    line inside the diff view. The comment panel can be toggled like a tree,
+    and `q` closes either the tree or the panel.
+
 :GhPrToggleReviewed
     Toggles a marker in the statusline of the current buffer indicating whether
     the file has been reviewed.
