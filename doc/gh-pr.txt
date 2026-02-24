@@ -73,14 +73,15 @@ Overview buffer keymaps:
     `M` open modified for selected file row
     Every overview edit asks confirmation before execution and refreshes
     the overview on success.
+    PR description is rendered inline as markdown in `Summary`.
 
 :GhPrCheckout [number]
     Runs `gh pr checkout` for the active PR or provided number.
 
 :GhPrOpenDiff
     Opens active file as virtual base/head side-by-side diff.
-    In virtual PR buffers, `K` opens a floating window with comments for
-    the current line.
+    In virtual PR buffers, `K` opens a modal floating window with comments
+    for the current line.
     Additional virtual-buffer shortcuts:
       `,n` next change
       `,p` previous change
@@ -155,11 +156,21 @@ Call `require("gh-pr").setup({ ... })` with:
 - `hide_viewed_files` (`false`)
 - `line_comments.enabled` (`true`)
 - `line_comments.keymap` (`"K"`)
-- `line_comments.indicator_style` (`"sign_and_highlight"`)
+- `line_comments.indicator_style` (`"sign_and_virtual_text"`)
 - `line_comments.show_resolved` (`true`)
 - `line_comments.show_outdated` (`true`)
 - `line_comments.max_popup_width` (`90`)
 - `line_comments.max_popup_height` (`18`)
+- `line_comments.popup.enter` (`true`, modal popup on `K`)
+- `line_comments.popup.position` (`"cursor"`, or `"editor"` / `"preview_window"`)
+- `line_comments.popup.border` (`"rounded"`)
+- `line_comments.popup.wrap` (`true`)
+- `line_comments.popup.close_on_move` (`true`, only relevant for non-modal popup)
+- `line_comments.popup.max_width|max_height` (`90|18`)
+- `line_comments.virtual_text.enabled` (`true`)
+- `line_comments.virtual_text.prefix` (`"C"`)
+- `line_comments.virtual_text.show_count` (`true`)
+- `line_comments.virtual_text.position` (`"eol"`, or `"inline"`)
 - `line_comments.signs.open|resolved|outdated` (`"C>"`, `"C="`, `"C~"`)
 - `line_comments.comments_tree.preview.keymap` (`"p"`)
 - `line_comments.comments_tree.preview.position` (`"right"`)
@@ -181,6 +192,10 @@ Call `require("gh-pr").setup({ ... })` with:
 - `overview.theme.labels` (`true`)
 - `overview.theme.reviewers` (`true`)
 - `overview.theme.timeline_kinds` (`true`)
+- `overview.markdown.enabled` (`true`)
+- `overview.markdown.provider` (`"auto"`)
+- `overview.markdown.max_lines` (`500`)
+- `overview.markdown.code_block_border` (`false`)
 - `overview.max_items` (checks/commits/timeline)
 - `overview.show` (toggle sections)
 - `queries` list: `{ folder, label, query }`

@@ -53,6 +53,14 @@ local function notify_warn(message)
   vim.notify(message, vim.log.levels.WARN)
 end
 
+local function is_valid_buf(bufnr)
+  return type(bufnr) == "number" and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr)
+end
+
+local function is_valid_win(winid)
+  return type(winid) == "number" and winid > 0 and vim.api.nvim_win_is_valid(winid)
+end
+
 local function positive_integer(value, fallback)
   local number = tonumber(value)
   if not number then
@@ -604,13 +612,24 @@ function M.open_overview(number, opts)
     thread_error = thread_err,
   })
 
+  local target_bufnr = nil
+  if is_valid_buf(opts.bufnr) then
+    target_bufnr = opts.bufnr
+  elseif opts.reuse_buffer then
+    local current = vim.api.nvim_get_current_buf()
+    if is_valid_buf(current) then
+      target_bufnr = current
+    end
+  end
+
   overview.open(model, {
-    bufnr = opts.reuse_buffer and vim.api.nvim_get_current_buf() or nil,
+    bufnr = target_bufnr,
     cursor_line = opts.cursor_line,
     ui = overview_config.ui or "snacks",
     layout = overview_config.layout or "tabs",
     window = overview_config.window or {},
     theme = overview_config.theme or {},
+    markdown = overview_config.markdown or {},
     tabs = overview_config.tabs,
     show = overview_config.show or {},
     date_format = overview_config.date_format or "%Y-%m-%d %H:%M",
@@ -1084,8 +1103,60 @@ local function build_overview_edit_operation(kind, choice, details)
   return nil, "Unsupported overview edit action", false
 end
 
-local function refresh_overview_after_edit()
-  local ok, err = pcall(M.refresh_overview)
+local function capture_overview_context()
+  local bufnr = vim.api.nvim_get_current_buf()
+  if not is_valid_buf(bufnr) then
+    return nil
+  end
+
+  local number = vim.b[bufnr].gh_pr_number
+  if type(number) ~= "number" then
+    return nil
+  end
+
+  local context = {
+    bufnr = bufnr,
+    pr_number = number,
+  }
+
+  local winid = vim.fn.bufwinid(bufnr)
+  if is_valid_win(winid) then
+    context.winid = winid
+    local ok, cursor = pcall(vim.api.nvim_win_get_cursor, winid)
+    if ok and type(cursor) == "table" and type(cursor[1]) == "number" then
+      context.cursor_line = math.max(1, math.floor(cursor[1]))
+    end
+  end
+
+  local limits = vim.b[bufnr].gh_pr_overview_limits
+  if type(limits) == "table" then
+    context.overview_limits = vim.deepcopy(limits)
+  end
+
+  return context
+end
+
+local function refresh_overview_after_edit(pr_number, context)
+  local options = {
+    refresh = true,
+  }
+
+  if type(pr_number) ~= "number" then
+    return
+  end
+
+  if type(context) == "table" and is_valid_buf(context.bufnr) then
+    options.reuse_buffer = true
+    options.bufnr = context.bufnr
+    if type(context.cursor_line) == "number" then
+      options.cursor_line = context.cursor_line
+    end
+    if type(context.overview_limits) == "table" then
+      options.overview_limits = context.overview_limits
+    end
+  end
+
+  local ok, err = pcall(M.open_overview, pr_number, options)
   if not ok then
     notify_warn("Overview updated remotely, but local refresh failed: " .. tostring(err))
   end
@@ -1132,7 +1203,9 @@ function M.overview_edit_stub(kind, payload)
     return notify_warn("Unsupported overview edit action")
   end
 
-  local pr, details, err = resolve_active_pr()
+  local overview_context = capture_overview_context()
+  local target_number = overview_context and overview_context.pr_number or nil
+  local pr, details, err = resolve_active_pr(target_number)
   if not pr then
     return notify_error(err)
   end
@@ -1166,7 +1239,7 @@ function M.overview_edit_stub(kind, payload)
       end
 
       notify_info(operation.success or (label .. " completed"))
-      refresh_overview_after_edit()
+      refresh_overview_after_edit(pr.number, overview_context)
     end)
   end)
 end

@@ -298,6 +298,32 @@ function M.sanitize_theme_opts(input)
   }
 end
 
+function M.sanitize_markdown_opts(input)
+  local source = type(input) == "table" and input or {}
+  local provider = M.safe_string(source.provider, "auto"):lower()
+  if provider ~= "auto"
+    and provider ~= "builtin"
+    and provider ~= "render-markdown"
+    and provider ~= "markview" then
+    provider = "auto"
+  end
+
+  local max_lines = math.floor(tonumber(source.max_lines) or 500)
+  if max_lines < 50 then
+    max_lines = 50
+  end
+  if max_lines > 4000 then
+    max_lines = 4000
+  end
+
+  return {
+    enabled = M.bool_or_default(source.enabled, true),
+    provider = provider,
+    max_lines = max_lines,
+    code_block_border = M.bool_or_default(source.code_block_border, false),
+  }
+end
+
 function M.resolve_float_size(window_opts)
   local editor_width = math.max(1, vim.o.columns)
   local editor_height = math.max(1, vim.o.lines - vim.o.cmdheight - 2)

@@ -422,6 +422,7 @@ function M.open(model, opts)
   view.date_format = utils.safe_string(opts.date_format, "%Y-%m-%d %H:%M")
   view.window = utils.sanitize_window_opts(opts.window)
   view.theme = utils.sanitize_theme_opts(opts.theme)
+  view.markdown = utils.sanitize_markdown_opts(opts.markdown)
 
   if type(opts.cursor_line) == "number" then
     view.cursor_by_tab[view.current_tab] = math.max(1, math.floor(opts.cursor_line))

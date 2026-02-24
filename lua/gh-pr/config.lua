@@ -14,11 +14,26 @@ local defaults = {
   line_comments = {
     enabled = true,
     keymap = "K",
-    indicator_style = "sign_and_highlight",
+    indicator_style = "sign_and_virtual_text",
     show_resolved = true,
     show_outdated = true,
     max_popup_width = 90,
     max_popup_height = 18,
+    popup = {
+      enter = true,
+      position = "cursor",
+      border = "rounded",
+      wrap = true,
+      close_on_move = true,
+      max_width = 90,
+      max_height = 18,
+    },
+    virtual_text = {
+      enabled = true,
+      prefix = "C",
+      show_count = true,
+      position = "eol",
+    },
     comments_tree = {
       auto_open_thread_popup = true,
       preview = {
@@ -36,7 +51,7 @@ local defaults = {
         max_height = 40,
         border = "rounded",
         wrap = true,
-        enter = false,
+        enter = true,
         position = "cursor",
       },
     },
@@ -69,6 +84,12 @@ local defaults = {
       labels = true,
       reviewers = true,
       timeline_kinds = true,
+    },
+    markdown = {
+      enabled = true,
+      provider = "auto",
+      max_lines = 500,
+      code_block_border = false,
     },
     tabs = {
       "summary",
@@ -334,6 +355,27 @@ local function sanitize_overview(overview)
     result.theme.timeline_kinds = defaults.overview.theme.timeline_kinds
   end
 
+  result.markdown = type(result.markdown) == "table" and result.markdown or {}
+  if type(result.markdown.enabled) ~= "boolean" then
+    result.markdown.enabled = defaults.overview.markdown.enabled
+  end
+  if type(result.markdown.provider) == "string" then
+    result.markdown.provider = result.markdown.provider:lower()
+  end
+  if result.markdown.provider ~= "auto"
+    and result.markdown.provider ~= "builtin"
+    and result.markdown.provider ~= "render-markdown"
+    and result.markdown.provider ~= "markview" then
+    result.markdown.provider = defaults.overview.markdown.provider
+  end
+  result.markdown.max_lines = sanitize_positive_integer(result.markdown.max_lines, defaults.overview.markdown.max_lines)
+  if result.markdown.max_lines < 50 then
+    result.markdown.max_lines = 50
+  end
+  if type(result.markdown.code_block_border) ~= "boolean" then
+    result.markdown.code_block_border = defaults.overview.markdown.code_block_border
+  end
+
   result.tabs = sanitize_overview_tabs(result.tabs)
   result.expand_step = sanitize_positive_integer(result.expand_step, defaults.overview.expand_step)
 
@@ -431,12 +473,61 @@ local function sanitize_line_comments(line_comments)
     result.keymap = defaults.line_comments.keymap
   end
 
-  if result.indicator_style ~= "sign_and_highlight" and result.indicator_style ~= "sign_only" and result.indicator_style ~= "highlight_only" then
+  if result.indicator_style ~= "sign_and_highlight"
+    and result.indicator_style ~= "sign_only"
+    and result.indicator_style ~= "highlight_only"
+    and result.indicator_style ~= "sign_and_virtual_text"
+    and result.indicator_style ~= "virtual_text_only" then
     result.indicator_style = defaults.line_comments.indicator_style
   end
 
   result.max_popup_width = sanitize_positive_integer(result.max_popup_width, defaults.line_comments.max_popup_width)
   result.max_popup_height = sanitize_positive_integer(result.max_popup_height, defaults.line_comments.max_popup_height)
+
+  result.popup = type(result.popup) == "table" and result.popup or {}
+  if type(result.popup.enter) ~= "boolean" then
+    result.popup.enter = defaults.line_comments.popup.enter
+  end
+
+  if result.popup.position ~= "cursor" and result.popup.position ~= "editor" and result.popup.position ~= "preview_window" then
+    result.popup.position = defaults.line_comments.popup.position
+  end
+
+  if result.popup.border ~= "rounded"
+    and result.popup.border ~= "single"
+    and result.popup.border ~= "double"
+    and result.popup.border ~= "solid"
+    and result.popup.border ~= "shadow"
+    and result.popup.border ~= "none" then
+    result.popup.border = defaults.line_comments.popup.border
+  end
+
+  if type(result.popup.wrap) ~= "boolean" then
+    result.popup.wrap = defaults.line_comments.popup.wrap
+  end
+
+  if type(result.popup.close_on_move) ~= "boolean" then
+    result.popup.close_on_move = defaults.line_comments.popup.close_on_move
+  end
+
+  local legacy_popup_width = sanitize_positive_integer(result.max_popup_width, defaults.line_comments.max_popup_width)
+  local legacy_popup_height = sanitize_positive_integer(result.max_popup_height, defaults.line_comments.max_popup_height)
+  result.popup.max_width = sanitize_positive_integer(result.popup.max_width, legacy_popup_width)
+  result.popup.max_height = sanitize_positive_integer(result.popup.max_height, legacy_popup_height)
+
+  result.virtual_text = type(result.virtual_text) == "table" and result.virtual_text or {}
+  if type(result.virtual_text.enabled) ~= "boolean" then
+    result.virtual_text.enabled = defaults.line_comments.virtual_text.enabled
+  end
+  if type(result.virtual_text.prefix) ~= "string" or result.virtual_text.prefix == "" then
+    result.virtual_text.prefix = defaults.line_comments.virtual_text.prefix
+  end
+  if type(result.virtual_text.show_count) ~= "boolean" then
+    result.virtual_text.show_count = defaults.line_comments.virtual_text.show_count
+  end
+  if result.virtual_text.position ~= "eol" and result.virtual_text.position ~= "inline" then
+    result.virtual_text.position = defaults.line_comments.virtual_text.position
+  end
 
   result.signs = type(result.signs) == "table" and result.signs or {}
   result.signs.open = type(result.signs.open) == "string" and result.signs.open ~= "" and result.signs.open

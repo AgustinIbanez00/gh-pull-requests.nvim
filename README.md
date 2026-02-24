@@ -7,14 +7,14 @@ A Neovim plugin that brings a GitHub Pull Requests workflow (similar to VSCode) 
 - Query-based PR lists grouped by folders.
 - Neo-tree source (`gh_pr`) as primary UI.
 - Telescope fallback picker.
-- Pull request overview interactive tabs UI (Snacks-based, no markdown rendering).
+- Pull request overview interactive tabs UI (Snacks-based) with inline markdown rendering in PR description.
 - Overview timeline tab that merges comments, reviews, and review-thread comments in chronological order.
 - Open commit diffs directly from Overview > Commits (virtual patch buffers, no checkout).
 - Virtual readonly file buffers for base/head versions (no disk writes).
 - Side-by-side diff view for changed files.
 - Configurable path rendering in `Files` and `Comments` trees (`compact`, `tree`, `flat`).
-- Line comment indicators in PR file buffers (signcolumn + line highlight).
-- Floating popup with PR line comments on `K` in virtual PR buffers.
+- Line comment indicators in PR file buffers (signcolumn + virtual text).
+- Floating modal popup with PR line comments on `K` in virtual PR buffers.
 - Comments tree (`gh_pr_comments`) with Problems-like navigation and preview.
 - PR checkout (`gh pr checkout`).
 - Review actions:
@@ -64,11 +64,26 @@ Optional:
     line_comments = {
       enabled = true,
       keymap = "K",
-      indicator_style = "sign_and_highlight", -- "sign_and_highlight" | "sign_only" | "highlight_only"
+      indicator_style = "sign_and_virtual_text", -- "sign_and_highlight" | "sign_only" | "highlight_only" | "sign_and_virtual_text" | "virtual_text_only"
       show_resolved = true,
       show_outdated = true,
       max_popup_width = 90,
       max_popup_height = 18,
+      popup = {
+        enter = true, -- modal by default
+        position = "cursor", -- "cursor" | "editor" | "preview_window"
+        border = "rounded",
+        wrap = true,
+        close_on_move = true, -- applies when enter = false
+        max_width = 90,
+        max_height = 18,
+      },
+      virtual_text = {
+        enabled = true,
+        prefix = "C",
+        show_count = true,
+        position = "eol", -- "eol" | "inline"
+      },
       comments_tree = {
         preview = {
           keymap = "p",
@@ -106,6 +121,12 @@ Optional:
         labels = true,
         reviewers = true,
         timeline_kinds = true,
+      },
+      markdown = {
+        enabled = true,
+        provider = "auto", -- "auto" | "builtin" | "render-markdown" | "markview"
+        max_lines = 500,
+        code_block_border = false,
       },
       max_items = {
         checks = 10,
@@ -200,7 +221,7 @@ Inside the overview buffer:
 - Every overview edit asks confirmation before execution and refreshes the overview on success.
 
 Inside PR virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenModified`):
-- `K` show PR comments for the current line in a floating window
+- `K` show PR comments for the current line in a modal floating window
 - `,n` next diff change
 - `,p` previous diff change
 - `,f` next file in PR

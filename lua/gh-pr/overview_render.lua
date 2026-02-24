@@ -1,4 +1,5 @@
 local runtime_state = require("gh-pr.state")
+local markdown = require("gh-pr.overview_markdown")
 local utils = require("gh-pr.overview_utils")
 local styles = require("gh-pr.overview_styles")
 
@@ -365,12 +366,10 @@ local function build_summary_items(view)
     trailing_blank = false,
   }
 
-  local body_lines = utils.split_lines(utils.safe_string(model.description, ""))
-  if vim.tbl_isempty(body_lines) then
-    body_lines = { "(no pull request description)" }
-  end
+  local body_payload = markdown.render(model.description, view.markdown)
   items[#items + 1] = {
-    lines = body_lines,
+    lines = body_payload.lines,
+    highlights = body_payload.highlights,
     trailing_blank = false,
   }
 
