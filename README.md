@@ -12,6 +12,7 @@ A Neovim plugin that brings a GitHub Pull Requests workflow (similar to VSCode) 
 - Open commit diffs directly from Overview > Commits (virtual patch buffers, no checkout).
 - Virtual readonly file buffers for base/head versions (no disk writes).
 - Side-by-side diff view for changed files.
+- Configurable path rendering in `Files` and `Comments` trees (`compact`, `tree`, `flat`).
 - Line comment indicators in PR file buffers (signcolumn + line highlight).
 - Floating popup with PR line comments on `K` in virtual PR buffers.
 - Comments tree (`gh_pr_comments`) with Problems-like navigation and preview.
@@ -52,7 +53,13 @@ Optional:
   },
   opts = {
     remotes = { "origin", "upstream" },
-    file_list_layout = "tree", -- "tree" | "flat"
+    file_list_layout = "tree", -- legacy fallback for gh_pr ("tree" | "flat")
+    path_render = {
+      scope = "both", -- "both" | "files" | "comments"
+      mode = "compact", -- "compact" | "tree" | "flat"
+      separator = "/", -- visual separator for compact directories
+      show_status_prefix = true, -- show [M]/[A]/... in Files nodes
+    },
     hide_viewed_files = false,
     line_comments = {
       enabled = true,
@@ -81,6 +88,25 @@ Optional:
       tabs = { "summary", "checks", "commits", "timeline", "files" },
       expand_step = 20,
       date_format = "%Y-%m-%d %H:%M",
+      window = {
+        enabled = true,
+        border = "rounded",
+        width_ratio = 0.88,
+        height_ratio = 0.88,
+        min_width = 100,
+        min_height = 28,
+        max_width = 180,
+        max_height = 60,
+        backdrop = 0,
+        enter = true,
+      },
+      theme = {
+        state_colors = true,
+        checks_colors = true,
+        labels = true,
+        reviewers = true,
+        timeline_kinds = true,
+      },
       max_items = {
         checks = 10,
         commits = 10,
@@ -123,9 +149,9 @@ Optional:
 - `:GhPrToggleReviewed` toggle local viewed state.
 - `:GhPrNextChange` jump to next diff hunk.
 - `:GhPrPrevChange` jump to previous diff hunk.
-- `:GhPrApprove` submit approve review.
-- `:GhPrRequestChanges` submit request changes review.
-- `:GhPrComment` submit general PR review comment.
+- `:GhPrApprove` prompt review message and confirm before submit.
+- `:GhPrRequestChanges` prompt review message and confirm before submit.
+- `:GhPrComment` prompt review message and confirm before submit.
 - `:GhPrMerge [merge|squash|rebase]` merge active PR.
 - `:GhPrQueryAdd` add query.
 - `:GhPrQueryEdit` edit query.
@@ -153,15 +179,25 @@ Inside the overview buffer:
 - `k` checkout branch
 - `R` refresh overview
 - `o` open PR in browser
+- `C` open `Comments PR` tree for the current PR
 - `q` close overview
 - `H` / `L` previous/next tab
 - `1..9` jump to tab
+- `et` edit title
+- `eb` edit description
+- `el` edit labels (comma-separated, replacement mode)
+- `er` edit reviewers (comma-separated, replacement mode)
+- `ea` edit assignees (comma-separated, replacement mode)
+- `em` edit milestone (empty input removes milestone)
+- `es` change state (`open`/`closed`)
+- `ed` toggle draft status (`ready`/`draft`)
 - `<CR>` open selected row action
 - `<CR>` on `Commits` opens commit diff details in a virtual patch buffer
 - `gr` load more for current section tab
 - `D` open diff for selected row (file or commit)
 - `O` open original file for selected file row
 - `M` open modified file for selected file row
+- Every overview edit asks confirmation before execution and refreshes the overview on success.
 
 Inside PR virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenModified`):
 - `K` show PR comments for the current line in a floating window
@@ -175,8 +211,9 @@ Inside PR virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenMod
 Inside `gh_pr_comments` Neo-tree source:
 - `<CR>` open comment location
 - `o` open comment location
-- `p` preview comment location in right split and keep focus in tree
+- `p` preview comment location in right split
 - `R` refresh comments
+- Long threads open a focused floating buffer; navigate with normal motions and close with `q`/`<Esc>`
 
 ## Neo-tree source
 
@@ -187,4 +224,5 @@ The plugin exposes a source module named `gh_pr` (`lua/gh_pr.lua`).
 
 - Query definitions are persisted in `stdpath("state")/gh-pr/queries.json`.
 - Viewed file state is persisted in `stdpath("state")/gh-pr/state.json`.
+- PR cache is persisted in `stdpath("state")/gh-pr/pr_cache.json`.
 - File content is fetched from GitHub API through `gh api` and opened in readonly buffers.

@@ -29,6 +29,8 @@ Commands
     Opens a comments tree (Problems-like) for the active PR or provided
     PR number. Selecting a line/comment node navigates to file + line.
     In `gh_pr_comments`: `p` previews in right split, `<CR>` opens.
+    Long threads open a focused floating buffer; navigate with normal
+    motions and close with `q`/`<Esc>`.
 
 :GhPrRefresh
     Refreshes PR data in active views.
@@ -51,15 +53,26 @@ Overview buffer keymaps:
     `k` checkout PR branch
     `R` refresh overview
     `o` open PR URL in browser
+    `C` open Comments PR tree for current PR
     `q` close buffer
     `H`/`L` previous/next tab
     `1..9` jump to tab
+    `et` edit title
+    `eb` edit description
+    `el` edit labels (comma-separated, replacement mode)
+    `er` edit reviewers (comma-separated, replacement mode)
+    `ea` edit assignees (comma-separated, replacement mode)
+    `em` edit milestone (empty input removes milestone)
+    `es` change state (`open`/`closed`)
+    `ed` toggle draft status (`ready`/`draft`)
     `<CR>` open selected row action
     `<CR>` on `Commits` opens commit diff details in virtual patch buffer
     `gr` load more for current section tab
     `D` open diff for selected row (file/commit)
     `O` open original for selected file row
     `M` open modified for selected file row
+    Every overview edit asks confirmation before execution and refreshes
+    the overview on success.
 
 :GhPrCheckout [number]
     Runs `gh pr checkout` for the active PR or provided number.
@@ -92,13 +105,13 @@ Overview buffer keymaps:
     Jump to previous diff hunk.
 
 :GhPrApprove
-    Submit approve review for active PR.
+    Prompt review message and confirm before submitting approve review.
 
 :GhPrRequestChanges
-    Submit request-changes review for active PR.
+    Prompt review message and confirm before submitting request-changes review.
 
 :GhPrComment
-    Submit general comment review for active PR.
+    Prompt review message and confirm before submitting general comment review.
 
 :GhPrMerge [merge|squash|rebase]
     Merge active PR with selected strategy.
@@ -134,7 +147,11 @@ Call `require("gh-pr").setup({ ... })` with:
 
 - `remotes` (`{ "origin", "upstream" }` by default)
 - `max_results` (`30`)
-- `file_list_layout` (`"tree"` or `"flat"`)
+- `file_list_layout` (`"tree"` or `"flat"`, legacy fallback for `gh_pr`)
+- `path_render.scope` (`"both"`, or `"files"` / `"comments"`)
+- `path_render.mode` (`"compact"`, or `"tree"` / `"flat"`)
+- `path_render.separator` (`"/"`, visual separator in compact mode)
+- `path_render.show_status_prefix` (`true`, `Files` source only)
 - `hide_viewed_files` (`false`)
 - `line_comments.enabled` (`true`)
 - `line_comments.keymap` (`"K"`)
@@ -152,6 +169,18 @@ Call `require("gh-pr").setup({ ... })` with:
 - `overview.tabs` (`summary/checks/commits/timeline/files`)
 - `overview.expand_step` (`20`)
 - `overview.date_format` (`"%Y-%m-%d %H:%M"`)
+- `overview.window.enabled` (`true`)
+- `overview.window.border` (`"rounded"`)
+- `overview.window.width_ratio|height_ratio` (`0.88`)
+- `overview.window.min_width|min_height` (`100|28`)
+- `overview.window.max_width|max_height` (`180|60`)
+- `overview.window.backdrop` (`0`)
+- `overview.window.enter` (`true`)
+- `overview.theme.state_colors` (`true`)
+- `overview.theme.checks_colors` (`true`)
+- `overview.theme.labels` (`true`)
+- `overview.theme.reviewers` (`true`)
+- `overview.theme.timeline_kinds` (`true`)
 - `overview.max_items` (checks/commits/timeline)
 - `overview.show` (toggle sections)
 - `queries` list: `{ folder, label, query }`
@@ -163,3 +192,4 @@ Persistence
 
 - Queries: `stdpath("state")/gh-pr/queries.json`
 - Viewed files: `stdpath("state")/gh-pr/state.json`
+- PR cache: `stdpath("state")/gh-pr/pr_cache.json`

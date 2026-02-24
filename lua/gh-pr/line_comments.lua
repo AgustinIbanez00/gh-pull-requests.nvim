@@ -207,13 +207,27 @@ local function format_line_comment_popup(entries, line)
   return lines
 end
 
+local function wrapped_rows(lines, content_width)
+  local width = math.max(1, content_width)
+  local rows = 0
+  for _, line in ipairs(lines) do
+    local display_width = vim.fn.strdisplaywidth(line)
+    rows = rows + math.max(1, math.ceil(display_width / width))
+  end
+  return rows
+end
+
 local function popup_dimensions(lines, max_width, max_height)
   local width = 40
   for _, line in ipairs(lines) do
     width = math.max(width, vim.fn.strdisplaywidth(line) + 2)
   end
-  width = math.min(width, max_width)
-  local height = math.min(#lines, max_height)
+  local screen_width = math.max(20, vim.o.columns - 4)
+  width = math.min(width, math.max(20, math.min(max_width, screen_width)))
+  local screen_height = math.max(8, vim.o.lines - vim.o.cmdheight - 2)
+  local bounded_height = math.max(6, math.min(max_height, screen_height))
+  local content_height = wrapped_rows(lines, math.max(1, width - 2))
+  local height = math.max(3, math.min(content_height, bounded_height))
   return width, height
 end
 
@@ -256,7 +270,7 @@ function M.show_at_cursor(bufnr)
     height = height,
     style = "minimal",
     border = "rounded",
-    focusable = false,
+    focusable = true,
     noautocmd = true,
   })
 
@@ -266,7 +280,23 @@ function M.show_at_cursor(bufnr)
 
   vim.b[bufnr].gh_pr_comment_popup_win = popup_win
 
-  vim.api.nvim_create_autocmd({ "CursorMoved", "BufLeave", "InsertEnter", "WinScrolled" }, {
+  local function close_current_popup()
+    close_popup(bufnr)
+  end
+  vim.keymap.set("n", "q", close_current_popup, {
+    buffer = popup_buf,
+    silent = true,
+    nowait = true,
+    desc = "Close PR comments popup",
+  })
+  vim.keymap.set("n", "<Esc>", close_current_popup, {
+    buffer = popup_buf,
+    silent = true,
+    nowait = true,
+    desc = "Close PR comments popup",
+  })
+
+  vim.api.nvim_create_autocmd({ "CursorMoved", "InsertEnter", "WinScrolled" }, {
     buffer = bufnr,
     once = true,
     callback = function()

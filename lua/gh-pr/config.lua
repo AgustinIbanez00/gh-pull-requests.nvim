@@ -4,6 +4,12 @@ local defaults = {
   remotes = { "origin", "upstream" },
   max_results = 30,
   file_list_layout = "tree",
+  path_render = {
+    scope = "both",
+    mode = "compact",
+    separator = "/",
+    show_status_prefix = true,
+  },
   hide_viewed_files = false,
   line_comments = {
     enabled = true,
@@ -14,10 +20,24 @@ local defaults = {
     max_popup_width = 90,
     max_popup_height = 18,
     comments_tree = {
+      auto_open_thread_popup = true,
       preview = {
         keymap = "p",
         position = "right",
         keep_focus = true,
+      },
+      thread_popup = {
+        enabled = true,
+        width_ratio = 0.62,
+        height_ratio = 0.55,
+        min_width = 80,
+        min_height = 12,
+        max_width = 140,
+        max_height = 40,
+        border = "rounded",
+        wrap = true,
+        enter = false,
+        position = "cursor",
       },
     },
     signs = {
@@ -31,6 +51,25 @@ local defaults = {
     layout = "tabs",
     expand_step = 20,
     date_format = "%Y-%m-%d %H:%M",
+    window = {
+      enabled = true,
+      border = "rounded",
+      width_ratio = 0.88,
+      height_ratio = 0.88,
+      min_width = 100,
+      min_height = 28,
+      max_width = 180,
+      max_height = 60,
+      backdrop = 0,
+      enter = true,
+    },
+    theme = {
+      state_colors = true,
+      checks_colors = true,
+      labels = true,
+      reviewers = true,
+      timeline_kinds = true,
+    },
     tabs = {
       "summary",
       "checks",
@@ -167,6 +206,25 @@ local function sanitize_positive_integer(value, default_value)
   return rounded
 end
 
+local function sanitize_ratio(value, default_value)
+  if type(value) ~= "number" then
+    return default_value
+  end
+
+  if value < 0.2 or value > 0.95 then
+    return default_value
+  end
+
+  return value
+end
+
+local function sanitize_legacy_file_list_layout(value)
+  if value == "flat" then
+    return "flat"
+  end
+  return "tree"
+end
+
 local function sanitize_overview_tabs(tabs)
   local allowed = {
     summary = true,
@@ -226,6 +284,56 @@ local function sanitize_overview(overview)
     result.date_format = defaults.overview.date_format
   end
 
+  result.window = type(result.window) == "table" and result.window or {}
+  if type(result.window.enabled) ~= "boolean" then
+    result.window.enabled = defaults.overview.window.enabled
+  end
+  if result.window.border ~= "rounded"
+    and result.window.border ~= "single"
+    and result.window.border ~= "double"
+    and result.window.border ~= "solid"
+    and result.window.border ~= "shadow"
+    and result.window.border ~= "none" then
+    result.window.border = defaults.overview.window.border
+  end
+  result.window.width_ratio = sanitize_ratio(result.window.width_ratio, defaults.overview.window.width_ratio)
+  result.window.height_ratio = sanitize_ratio(result.window.height_ratio, defaults.overview.window.height_ratio)
+  result.window.min_width = sanitize_positive_integer(result.window.min_width, defaults.overview.window.min_width)
+  result.window.min_height = sanitize_positive_integer(result.window.min_height, defaults.overview.window.min_height)
+  result.window.max_width = sanitize_positive_integer(result.window.max_width, defaults.overview.window.max_width)
+  result.window.max_height = sanitize_positive_integer(result.window.max_height, defaults.overview.window.max_height)
+  if result.window.max_width < result.window.min_width then
+    result.window.max_width = result.window.min_width
+  end
+  if result.window.max_height < result.window.min_height then
+    result.window.max_height = result.window.min_height
+  end
+  if type(result.window.backdrop) == "number" then
+    result.window.backdrop = math.max(0, math.min(100, math.floor(result.window.backdrop)))
+  elseif result.window.backdrop ~= false then
+    result.window.backdrop = defaults.overview.window.backdrop
+  end
+  if type(result.window.enter) ~= "boolean" then
+    result.window.enter = defaults.overview.window.enter
+  end
+
+  result.theme = type(result.theme) == "table" and result.theme or {}
+  if type(result.theme.state_colors) ~= "boolean" then
+    result.theme.state_colors = defaults.overview.theme.state_colors
+  end
+  if type(result.theme.checks_colors) ~= "boolean" then
+    result.theme.checks_colors = defaults.overview.theme.checks_colors
+  end
+  if type(result.theme.labels) ~= "boolean" then
+    result.theme.labels = defaults.overview.theme.labels
+  end
+  if type(result.theme.reviewers) ~= "boolean" then
+    result.theme.reviewers = defaults.overview.theme.reviewers
+  end
+  if type(result.theme.timeline_kinds) ~= "boolean" then
+    result.theme.timeline_kinds = defaults.overview.theme.timeline_kinds
+  end
+
   result.tabs = sanitize_overview_tabs(result.tabs)
   result.expand_step = sanitize_positive_integer(result.expand_step, defaults.overview.expand_step)
 
@@ -282,6 +390,32 @@ local function sanitize_cache(cache_options)
   return result
 end
 
+local function sanitize_path_render(path_render, opts)
+  local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.path_render), type(path_render) == "table" and path_render or {})
+
+  if result.scope ~= "both" and result.scope ~= "files" and result.scope ~= "comments" then
+    result.scope = defaults.path_render.scope
+  end
+
+  if result.mode ~= "compact" and result.mode ~= "tree" and result.mode ~= "flat" then
+    result.mode = defaults.path_render.mode
+  end
+
+  if type(result.separator) ~= "string" or result.separator == "" then
+    result.separator = defaults.path_render.separator
+  end
+
+  if type(result.show_status_prefix) ~= "boolean" then
+    result.show_status_prefix = defaults.path_render.show_status_prefix
+  end
+
+  if opts.path_render == nil and opts.file_list_layout ~= nil then
+    result.mode = sanitize_legacy_file_list_layout(opts.file_list_layout)
+  end
+
+  return result
+end
+
 local function sanitize_line_comments(line_comments)
   if type(line_comments) ~= "table" then
     return vim.deepcopy(defaults.line_comments)
@@ -313,6 +447,10 @@ local function sanitize_line_comments(line_comments)
     or defaults.line_comments.signs.outdated
 
   result.comments_tree = type(result.comments_tree) == "table" and result.comments_tree or {}
+  if type(result.comments_tree.auto_open_thread_popup) ~= "boolean" then
+    result.comments_tree.auto_open_thread_popup = defaults.line_comments.comments_tree.auto_open_thread_popup
+  end
+
   result.comments_tree.preview = type(result.comments_tree.preview) == "table" and result.comments_tree.preview or {}
   result.comments_tree.preview.keymap = type(result.comments_tree.preview.keymap) == "string"
       and result.comments_tree.preview.keymap ~= "" and result.comments_tree.preview.keymap
@@ -324,6 +462,66 @@ local function sanitize_line_comments(line_comments)
     result.comments_tree.preview.keep_focus = defaults.line_comments.comments_tree.preview.keep_focus
   end
 
+  result.comments_tree.thread_popup = type(result.comments_tree.thread_popup) == "table"
+      and result.comments_tree.thread_popup
+    or {}
+  if type(result.comments_tree.thread_popup.enabled) ~= "boolean" then
+    result.comments_tree.thread_popup.enabled = defaults.line_comments.comments_tree.thread_popup.enabled
+  end
+
+  result.comments_tree.thread_popup.width_ratio = sanitize_ratio(
+    result.comments_tree.thread_popup.width_ratio,
+    defaults.line_comments.comments_tree.thread_popup.width_ratio
+  )
+  result.comments_tree.thread_popup.height_ratio = sanitize_ratio(
+    result.comments_tree.thread_popup.height_ratio,
+    defaults.line_comments.comments_tree.thread_popup.height_ratio
+  )
+  result.comments_tree.thread_popup.min_width = sanitize_positive_integer(
+    result.comments_tree.thread_popup.min_width,
+    defaults.line_comments.comments_tree.thread_popup.min_width
+  )
+  result.comments_tree.thread_popup.min_height = sanitize_positive_integer(
+    result.comments_tree.thread_popup.min_height,
+    defaults.line_comments.comments_tree.thread_popup.min_height
+  )
+  result.comments_tree.thread_popup.max_width = sanitize_positive_integer(
+    result.comments_tree.thread_popup.max_width,
+    defaults.line_comments.comments_tree.thread_popup.max_width
+  )
+  result.comments_tree.thread_popup.max_height = sanitize_positive_integer(
+    result.comments_tree.thread_popup.max_height,
+    defaults.line_comments.comments_tree.thread_popup.max_height
+  )
+
+  if result.comments_tree.thread_popup.max_width < result.comments_tree.thread_popup.min_width then
+    result.comments_tree.thread_popup.max_width = result.comments_tree.thread_popup.min_width
+  end
+  if result.comments_tree.thread_popup.max_height < result.comments_tree.thread_popup.min_height then
+    result.comments_tree.thread_popup.max_height = result.comments_tree.thread_popup.min_height
+  end
+
+  if result.comments_tree.thread_popup.border ~= "rounded"
+    and result.comments_tree.thread_popup.border ~= "single"
+    and result.comments_tree.thread_popup.border ~= "double"
+    and result.comments_tree.thread_popup.border ~= "solid"
+    and result.comments_tree.thread_popup.border ~= "shadow"
+    and result.comments_tree.thread_popup.border ~= "none" then
+    result.comments_tree.thread_popup.border = defaults.line_comments.comments_tree.thread_popup.border
+  end
+
+  if type(result.comments_tree.thread_popup.wrap) ~= "boolean" then
+    result.comments_tree.thread_popup.wrap = defaults.line_comments.comments_tree.thread_popup.wrap
+  end
+
+  if type(result.comments_tree.thread_popup.enter) ~= "boolean" then
+    result.comments_tree.thread_popup.enter = defaults.line_comments.comments_tree.thread_popup.enter
+  end
+
+  if result.comments_tree.thread_popup.position ~= "cursor" and result.comments_tree.thread_popup.position ~= "preview_window" then
+    result.comments_tree.thread_popup.position = defaults.line_comments.comments_tree.thread_popup.position
+  end
+
   return result
 end
 
@@ -333,9 +531,7 @@ function M.setup(opts)
   state.remotes = sanitize_remotes(state.remotes)
   state.queries = sanitize_queries(state.queries)
 
-  if state.file_list_layout ~= "flat" then
-    state.file_list_layout = "tree"
-  end
+  state.file_list_layout = sanitize_legacy_file_list_layout(state.file_list_layout)
 
   if type(state.max_results) ~= "number" or state.max_results < 1 then
     state.max_results = defaults.max_results
@@ -348,6 +544,7 @@ function M.setup(opts)
   state.line_comments = sanitize_line_comments(state.line_comments)
   state.overview = sanitize_overview(state.overview)
   state.cache = sanitize_cache(state.cache)
+  state.path_render = sanitize_path_render(state.path_render, opts)
 
   if type(state.ui) ~= "table" then
     state.ui = vim.deepcopy(defaults.ui)
@@ -364,6 +561,38 @@ end
 
 function M.get()
   return state
+end
+
+function M.get_path_render(source_name)
+  local path_render = type(state.path_render) == "table" and state.path_render or vim.deepcopy(defaults.path_render)
+  local applies =
+    path_render.scope == "both"
+    or (path_render.scope == "files" and source_name == "gh_pr")
+    or (path_render.scope == "comments" and source_name == "gh_pr_comments")
+
+  if applies then
+    return vim.deepcopy(path_render)
+  end
+
+  if source_name == "gh_pr" then
+    return {
+      scope = "files",
+      mode = sanitize_legacy_file_list_layout(state.file_list_layout),
+      separator = path_render.separator or defaults.path_render.separator,
+      show_status_prefix = path_render.show_status_prefix ~= false,
+    }
+  end
+
+  if source_name == "gh_pr_comments" then
+    return {
+      scope = "comments",
+      mode = "flat",
+      separator = path_render.separator or defaults.path_render.separator,
+      show_status_prefix = path_render.show_status_prefix ~= false,
+    }
+  end
+
+  return vim.deepcopy(path_render)
 end
 
 function M.get_queries()

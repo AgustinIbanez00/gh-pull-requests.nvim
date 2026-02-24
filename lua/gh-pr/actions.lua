@@ -4,6 +4,7 @@ local config = require("gh-pr.config")
 local overview = require("gh-pr.overview")
 local pr_service = require("gh-pr.pr_service")
 local state = require("gh-pr.state")
+local thread_popup = require("gh-pr.thread_popup")
 local virtual_files = require("gh-pr.virtual_files")
 
 local function normalize_repository(details)
@@ -354,7 +355,7 @@ end
 
 local function resolve_comment_target(target)
   if type(target) ~= "table" then
-    return nil, nil, nil, "Invalid comment target"
+    return nil, nil, nil, nil, "Invalid comment target"
   end
 
   local pr = target.pr
@@ -362,7 +363,7 @@ local function resolve_comment_target(target)
   if type(pr) ~= "table" or type(details) ~= "table" then
     local resolved_pr, resolved_details, err = resolve_active_pr(target.pr_number or target.number, { refresh = false })
     if not resolved_pr then
-      return nil, nil, nil, err
+      return nil, nil, nil, nil, err
     end
     pr = resolved_pr
     details = resolved_details
@@ -372,7 +373,7 @@ local function resolve_comment_target(target)
 
   local path = target.path
   if type(path) ~= "string" or path == "" then
-    return nil, nil, nil, "Missing comment path"
+    return nil, nil, nil, nil, "Missing comment path"
   end
 
   local file = find_file_in_details(details, path) or {
@@ -383,7 +384,45 @@ local function resolve_comment_target(target)
 
   local side = type(target.side) == "string" and target.side or "head"
   local line = side == "base" and (target.original_line or target.line) or (target.line or target.original_line)
-  return file, side, line, nil
+  local popup_comments = nil
+  if type(target.thread_comments) == "table" and not vim.tbl_isempty(target.thread_comments) then
+    popup_comments = target.thread_comments
+  elseif type(target.line_comments) == "table" and not vim.tbl_isempty(target.line_comments) then
+    popup_comments = target.line_comments
+  end
+
+  local popup_thread = nil
+  if type(popup_comments) == "table" then
+    popup_thread = {
+      thread_id = type(target.thread_id) == "string" and target.thread_id ~= ""
+          and target.thread_id
+        or string.format("line:%s:%s:%s", path, side, tostring(line or 0)),
+      path = path,
+      side = side,
+      line = tonumber(target.line) or tonumber(line) or tonumber(target.original_line),
+      original_line = tonumber(target.original_line) or tonumber(line) or tonumber(target.line),
+      selected_comment_id = type(target.selected_comment_id) == "string" and target.selected_comment_id or "",
+      is_resolved = target.thread_is_resolved == true,
+      is_outdated = target.thread_is_outdated == true,
+      comments = {},
+    }
+
+    for index, item in ipairs(popup_comments) do
+      if type(item) == "table" then
+        popup_thread.comments[#popup_thread.comments + 1] = {
+          id = type(item.id) == "string" and item.id ~= "" and item.id or tostring(index),
+          author = type(item.author) == "string" and item.author ~= "" and item.author or "unknown",
+          created_at = type(item.created_at) == "string" and item.created_at or "",
+          body = type(item.body) == "string" and item.body or "",
+          url = type(item.url) == "string" and item.url or "",
+          state = type(item.state) == "string" and item.state or "",
+          outdated = item.outdated == true,
+        }
+      end
+    end
+  end
+
+  return file, side, line, popup_thread, nil
 end
 
 local function open_target_file(file, side, line)
@@ -411,25 +450,53 @@ function M.activate_pr(number, refresh)
   return pr, details, nil
 end
 
-function M.open_comment_location(target)
-  local file, side, line, err = resolve_comment_target(target)
+function M.open_comment_location(target, opts)
+  opts = opts or {}
+  local file, side, line, popup_thread, err = resolve_comment_target(target)
   if not file then
     return notify_error(err)
+  end
+
+  local comments_tree_options = (((config.get() or {}).line_comments or {}).comments_tree or {})
+  local open_thread_popup = comments_tree_options.auto_open_thread_popup ~= false
+  if type(opts.open_thread_popup) == "boolean" then
+    open_thread_popup = opts.open_thread_popup
   end
 
   ensure_navigation_window()
   open_target_file(file, side, line)
+
+  if open_thread_popup and popup_thread and type(popup_thread.comments) == "table" and not vim.tbl_isempty(popup_thread.comments) then
+    local current_buf = vim.api.nvim_get_current_buf()
+    local current_win = vim.api.nvim_get_current_win()
+    local ok, popup_err = thread_popup.open(popup_thread, {
+      mode = opts.popup_mode == "preview" and "preview" or "open",
+      origin_bufnr = current_buf,
+      anchor_win = current_win,
+      enter = opts.focus_thread_popup,
+    })
+    if not ok and popup_err ~= "thread popup disabled by config" and popup_err ~= "thread has no comments" then
+      notify_warn("Unable to open thread popup: " .. tostring(popup_err))
+    end
+  end
 end
 
-function M.preview_comment_location(target)
-  local file, side, line, err = resolve_comment_target(target)
+function M.preview_comment_location(target, opts)
+  opts = opts or {}
+  local file, side, line, popup_thread, err = resolve_comment_target(target)
   if not file then
     return notify_error(err)
   end
 
-  local opts = preview_options()
+  local comments_tree_options = (((config.get() or {}).line_comments or {}).comments_tree or {})
+  local open_thread_popup = comments_tree_options.auto_open_thread_popup ~= false
+  if type(opts.open_thread_popup) == "boolean" then
+    open_thread_popup = opts.open_thread_popup
+  end
+
+  local preview_opts = preview_options()
   local origin_window = vim.api.nvim_get_current_win()
-  local preview_win = ensure_preview_window(opts.position)
+  local preview_win = ensure_preview_window(preview_opts.position)
   if not valid_window(preview_win) then
     return notify_error("Unable to open preview window")
   end
@@ -440,8 +507,25 @@ function M.preview_comment_location(target)
   end
 
   open_target_file(file, side, line)
+  local popup_focused = false
 
-  if opts.keep_focus and valid_window(origin_window) then
+  if open_thread_popup and popup_thread and type(popup_thread.comments) == "table" and not vim.tbl_isempty(popup_thread.comments) then
+    local preview_buf = vim.api.nvim_get_current_buf()
+    local ok, popup_err = thread_popup.open(popup_thread, {
+      mode = opts.popup_mode == "open" and "open" or "preview",
+      origin_bufnr = preview_buf,
+      anchor_win = preview_win,
+      enter = opts.focus_thread_popup,
+    })
+    if ok then
+      popup_focused = vim.api.nvim_get_current_win() ~= preview_win
+    end
+    if not ok and popup_err ~= "thread popup disabled by config" and popup_err ~= "thread has no comments" then
+      notify_warn("Unable to open thread popup: " .. tostring(popup_err))
+    end
+  end
+
+  if preview_opts.keep_focus and valid_window(origin_window) and not popup_focused then
     pcall(vim.api.nvim_set_current_win, origin_window)
   end
 end
@@ -468,6 +552,12 @@ local function build_overview_callbacks(pr_number)
     end,
     open_url = function()
       M.open_overview_url(pr_number)
+    end,
+    open_comments_tree = function()
+      M.open_comments(pr_number)
+    end,
+    edit_stub = function(kind, payload)
+      M.overview_edit_stub(kind, payload)
     end,
     more_section = function(section)
       M.overview_more(section)
@@ -519,6 +609,8 @@ function M.open_overview(number, opts)
     cursor_line = opts.cursor_line,
     ui = overview_config.ui or "snacks",
     layout = overview_config.layout or "tabs",
+    window = overview_config.window or {},
+    theme = overview_config.theme or {},
     tabs = overview_config.tabs,
     show = overview_config.show or {},
     date_format = overview_config.date_format or "%Y-%m-%d %H:%M",
@@ -592,6 +684,491 @@ function M.open_overview_url(number)
     end
     return notify_error(open_err)
   end
+end
+
+function M.open_comments(number)
+  local pr, _, err = resolve_active_pr(number)
+  if not pr then
+    return notify_error(err)
+  end
+
+  local command = string.format("GhPrComments %d", pr.number)
+  local ok, run_err = pcall(vim.cmd, command)
+  if not ok then
+    return notify_error("Unable to open Comments PR view: " .. tostring(run_err))
+  end
+end
+
+local overview_edit_labels = {
+  edit_title = "Edit title",
+  edit_body = "Edit description",
+  edit_labels = "Edit labels",
+  edit_reviewers = "Edit reviewers",
+  edit_assignees = "Edit assignees",
+  edit_milestone = "Edit milestone",
+  change_state = "Change state",
+  change_draft = "Change draft status",
+}
+
+local function normalize_string(value)
+  if type(value) ~= "string" then
+    return ""
+  end
+  return vim.trim(value)
+end
+
+local function normalize_key(value)
+  return normalize_string(value):lower()
+end
+
+local function parse_csv_items(value)
+  if type(value) ~= "string" then
+    return {}
+  end
+
+  local items = {}
+  local seen = {}
+  for _, raw in ipairs(vim.split(value, ",", { plain = true })) do
+    local item = normalize_string(raw)
+    if item ~= "" then
+      local key = normalize_key(item)
+      if key ~= "" and not seen[key] then
+        seen[key] = true
+        items[#items + 1] = item
+      end
+    end
+  end
+
+  return items
+end
+
+local function summarize_list(items, empty_label)
+  items = type(items) == "table" and items or {}
+  if vim.tbl_isempty(items) then
+    return empty_label or "(none)"
+  end
+
+  if #items <= 5 then
+    return table.concat(items, ", ")
+  end
+
+  local preview = {}
+  for index = 1, 4 do
+    preview[#preview + 1] = items[index]
+  end
+  preview[#preview + 1] = string.format("+%d more", #items - 4)
+  return table.concat(preview, ", ")
+end
+
+local function summarize_text(value, max_length)
+  local text = normalize_string(value)
+  if text == "" then
+    return "(empty)"
+  end
+
+  text = text:gsub("\n", " ")
+  local limit = positive_integer(max_length, 80)
+  if #text > limit then
+    return text:sub(1, limit - 3) .. "..."
+  end
+  return text
+end
+
+local function extract_name(item)
+  if type(item) == "string" then
+    return normalize_string(item)
+  end
+
+  if type(item) ~= "table" then
+    return ""
+  end
+
+  if type(item.login) == "string" and item.login ~= "" then
+    return normalize_string(item.login)
+  end
+
+  if type(item.name) == "string" and item.name ~= "" then
+    return normalize_string(item.name)
+  end
+
+  if type(item.slug) == "string" and item.slug ~= "" then
+    if type(item.organization) == "table" and type(item.organization.login) == "string" and item.organization.login ~= "" then
+      return normalize_string(item.organization.login .. "/" .. item.slug)
+    end
+    return normalize_string(item.slug)
+  end
+
+  if type(item.requestedReviewer) == "table" then
+    return extract_name(item.requestedReviewer)
+  end
+
+  if type(item.user) == "table" then
+    return extract_name(item.user)
+  end
+
+  if type(item.team) == "table" then
+    return extract_name(item.team)
+  end
+
+  return ""
+end
+
+local function normalize_items(items)
+  local result = {}
+  local seen = {}
+
+  for _, item in ipairs(type(items) == "table" and items or {}) do
+    local name = extract_name(item)
+    if name ~= "" then
+      local key = normalize_key(name)
+      if key ~= "" and not seen[key] then
+        seen[key] = true
+        result[#result + 1] = name
+      end
+    end
+  end
+
+  return result
+end
+
+local function compute_replacement_diff(current_items, desired_items)
+  local current = {}
+  local desired = {}
+  local add = {}
+  local remove = {}
+
+  for _, item in ipairs(current_items) do
+    local key = normalize_key(item)
+    if key ~= "" then
+      current[key] = item
+    end
+  end
+
+  for _, item in ipairs(desired_items) do
+    local key = normalize_key(item)
+    if key ~= "" and not desired[key] then
+      desired[key] = item
+      if not current[key] then
+        add[#add + 1] = item
+      end
+    end
+  end
+
+  for _, item in ipairs(current_items) do
+    local key = normalize_key(item)
+    if key ~= "" and not desired[key] then
+      remove[#remove + 1] = item
+    end
+  end
+
+  return add, remove
+end
+
+local function current_milestone(details)
+  if type(details.milestone) == "table" and type(details.milestone.title) == "string" then
+    return normalize_string(details.milestone.title)
+  end
+  return ""
+end
+
+local function current_labels(details)
+  return normalize_items(details.labels)
+end
+
+local function current_reviewers(details)
+  return normalize_items(details.reviewRequests)
+end
+
+local function current_assignees(details)
+  return normalize_items(details.assignees)
+end
+
+local function confirm_overview_edit(pr_number, action_label, summary, callback)
+  local prompt = string.format(
+    "Apply %s on PR #%d? %s",
+    action_label,
+    pr_number,
+    summary
+  )
+
+  vim.ui.select({ "confirm", "cancel" }, {
+    prompt = prompt,
+  }, function(choice)
+    callback(choice == "confirm")
+  end)
+end
+
+local function build_title_edit(choice, details)
+  local next_title = normalize_string(choice)
+  local current_title = normalize_string(details.title)
+  if next_title == "" then
+    return nil, "Title cannot be empty", false
+  end
+  if next_title == current_title then
+    return nil, "No changes detected for title", true
+  end
+
+  return {
+    summary = string.format("title: %s", summarize_text(next_title, 80)),
+    success = "Title updated",
+    run = function(pr_number)
+      return pr_service.edit(pr_number, { title = next_title })
+    end,
+  }, nil, false
+end
+
+local function build_body_edit(choice, details)
+  local next_body = type(choice) == "string" and choice or ""
+  local current_body = type(details.body) == "string" and details.body or ""
+  if next_body == current_body then
+    return nil, "No changes detected for description", true
+  end
+
+  local summary
+  if normalize_string(next_body) == "" then
+    summary = "description: clear"
+  else
+    summary = string.format("description: %s", summarize_text(next_body, 80))
+  end
+
+  return {
+    summary = summary,
+    success = "Description updated",
+    run = function(pr_number)
+      return pr_service.edit(pr_number, { body = next_body })
+    end,
+  }, nil, false
+end
+
+local function build_milestone_edit(choice, details)
+  local next_milestone = normalize_string(choice)
+  local current_value = current_milestone(details)
+  if next_milestone == current_value then
+    return nil, "No changes detected for milestone", true
+  end
+
+  if next_milestone == "" then
+    if current_value == "" then
+      return nil, "No changes detected for milestone", true
+    end
+
+    return {
+      summary = "milestone: remove",
+      success = "Milestone removed",
+      run = function(pr_number)
+        return pr_service.edit(pr_number, { remove_milestone = true })
+      end,
+    }, nil, false
+  end
+
+  return {
+    summary = string.format("milestone: %s", summarize_text(next_milestone, 60)),
+    success = "Milestone updated",
+    run = function(pr_number)
+      return pr_service.edit(pr_number, { milestone = next_milestone })
+    end,
+  }, nil, false
+end
+
+local function build_list_edit(kind, choice, current_values)
+  local desired = parse_csv_items(type(choice) == "string" and choice or "")
+  local add, remove = compute_replacement_diff(current_values, desired)
+
+  if vim.tbl_isempty(add) and vim.tbl_isempty(remove) then
+    return nil, "No changes detected", true
+  end
+
+  local summary = string.format(
+    "final: [%s] | add: [%s] | remove: [%s]",
+    summarize_list(desired),
+    summarize_list(add),
+    summarize_list(remove)
+  )
+
+  local operations = {}
+  local success
+
+  if kind == "edit_labels" then
+    operations.add_labels = add
+    operations.remove_labels = remove
+    success = "Labels updated"
+  elseif kind == "edit_reviewers" then
+    operations.add_reviewers = add
+    operations.remove_reviewers = remove
+    success = "Reviewers updated"
+  elseif kind == "edit_assignees" then
+    operations.add_assignees = add
+    operations.remove_assignees = remove
+    success = "Assignees updated"
+  else
+    return nil, "Unsupported list edit action", false
+  end
+
+  return {
+    summary = summary,
+    success = success,
+    run = function(pr_number)
+      return pr_service.edit(pr_number, operations)
+    end,
+  }, nil, false
+end
+
+local function build_state_change(choice, details)
+  local target = normalize_key(choice)
+  if target ~= "open" and target ~= "closed" then
+    return nil, "Invalid state selection", false
+  end
+
+  local current = normalize_key(details.state)
+  if current == target then
+    return nil, "No changes detected for PR state", true
+  end
+
+  local before_state = (current ~= "" and current or "unknown"):upper()
+  local after_state = target:upper()
+  return {
+    summary = string.format("state: %s -> %s", before_state, after_state),
+    success = string.format("PR state changed to %s", after_state),
+    run = function(pr_number)
+      return pr_service.change_state(pr_number, target)
+    end,
+  }, nil, false
+end
+
+local function build_draft_change(choice, details)
+  local target = normalize_key(choice)
+  if target ~= "ready" and target ~= "draft" then
+    return nil, "Invalid draft status selection", false
+  end
+
+  local current = details.isDraft == true and "draft" or "ready"
+  if current == target then
+    return nil, "No changes detected for draft status", true
+  end
+
+  return {
+    summary = string.format("draft status: %s -> %s", current:upper(), target:upper()),
+    success = string.format("Draft status changed to %s", target:upper()),
+    run = function(pr_number)
+      return pr_service.change_draft(pr_number, target)
+    end,
+  }, nil, false
+end
+
+local function build_overview_edit_operation(kind, choice, details)
+  if kind == "edit_title" then
+    return build_title_edit(choice, details)
+  end
+  if kind == "edit_body" then
+    return build_body_edit(choice, details)
+  end
+  if kind == "edit_milestone" then
+    return build_milestone_edit(choice, details)
+  end
+  if kind == "edit_labels" then
+    return build_list_edit(kind, choice, current_labels(details))
+  end
+  if kind == "edit_reviewers" then
+    return build_list_edit(kind, choice, current_reviewers(details))
+  end
+  if kind == "edit_assignees" then
+    return build_list_edit(kind, choice, current_assignees(details))
+  end
+  if kind == "change_state" then
+    return build_state_change(choice, details)
+  end
+  if kind == "change_draft" then
+    return build_draft_change(choice, details)
+  end
+
+  return nil, "Unsupported overview edit action", false
+end
+
+local function refresh_overview_after_edit()
+  local ok, err = pcall(M.refresh_overview)
+  if not ok then
+    notify_warn("Overview updated remotely, but local refresh failed: " .. tostring(err))
+  end
+end
+
+local function overview_edit_picker(kind, payload, callback)
+  payload = type(payload) == "table" and payload or {}
+
+  if kind == "change_state" then
+    vim.ui.select({ "open", "closed" }, {
+      prompt = "Target state:",
+    }, function(choice)
+      callback(choice)
+    end)
+    return
+  end
+
+  if kind == "change_draft" then
+    vim.ui.select({ "ready", "draft" }, {
+      prompt = "Target draft status:",
+    }, function(choice)
+      callback(choice)
+    end)
+    return
+  end
+
+  local default_value = payload.current
+  if type(default_value) ~= "string" then
+    default_value = ""
+  end
+
+  local prompt = string.format("%s: ", overview_edit_labels[kind] or "Edit")
+  vim.ui.input({
+    prompt = prompt,
+    default = default_value,
+  }, function(input)
+    callback(input)
+  end)
+end
+
+function M.overview_edit_stub(kind, payload)
+  local label = overview_edit_labels[kind]
+  if not label then
+    return notify_warn("Unsupported overview edit action")
+  end
+
+  local pr, details, err = resolve_active_pr()
+  if not pr then
+    return notify_error(err)
+  end
+
+  overview_edit_picker(kind, payload, function(choice)
+    if choice == nil then
+      notify_info(label .. " cancelled")
+      return
+    end
+
+    local operation, build_err, noop = build_overview_edit_operation(kind, choice, details)
+    if noop then
+      notify_info(build_err or "No changes detected")
+      return
+    end
+    if not operation then
+      notify_error(build_err)
+      return
+    end
+
+    confirm_overview_edit(pr.number, label, operation.summary or "", function(confirmed)
+      if not confirmed then
+        notify_info(label .. " cancelled")
+        return
+      end
+
+      local ok, op_err = operation.run(pr.number)
+      if not ok then
+        notify_error(op_err)
+        return
+      end
+
+      notify_info(operation.success or (label .. " completed"))
+      refresh_overview_after_edit()
+    end)
+  end)
 end
 
 local function resolve_commit(commit)
@@ -972,7 +1549,54 @@ local function prompt_review_body(default_body, callback)
     prompt = "Review message: ",
     default = default_body,
   }, function(input)
-    callback(input or "")
+    if input == nil then
+      callback("", true)
+      return
+    end
+    callback(input, false)
+  end)
+end
+
+local function review_event_label(event)
+  local labels = {
+    approve = "approve",
+    request_changes = "request changes",
+    comment = "comment",
+  }
+
+  return labels[event]
+end
+
+local function review_body_summary(body)
+  local raw = type(body) == "string" and body or ""
+  if raw == "" then
+    return "(empty message)"
+  end
+
+  local first_line = vim.split(raw, "\n", { plain = true })[1] or ""
+  first_line = vim.trim(first_line)
+  if first_line == "" then
+    return "(empty message)"
+  end
+  if #first_line > 70 then
+    return first_line:sub(1, 67) .. "..."
+  end
+  return first_line
+end
+
+local function confirm_review_submission(event, pr_number, body, callback)
+  local label = review_event_label(event) or event
+  local prompt = string.format(
+    "Submit %s review for PR #%d? Message: %s",
+    label,
+    pr_number,
+    review_body_summary(body)
+  )
+
+  vim.ui.select({ "confirm", "cancel" }, {
+    prompt = prompt,
+  }, function(choice)
+    callback(choice == "confirm")
   end)
 end
 
@@ -982,20 +1606,37 @@ function M.review(event)
     return notify_error(err)
   end
 
+  local label = review_event_label(event)
+  if not label then
+    return notify_error("Unsupported review event")
+  end
+
   local defaults = {
     approve = "",
     request_changes = "Requested changes from Neovim",
     comment = "Comment from Neovim",
   }
 
-  prompt_review_body(defaults[event] or "", function(body)
-    local ok, review_err = pr_service.review(pr.number, event, body)
-    if not ok then
-      notify_error(review_err)
+  prompt_review_body(defaults[event] or "", function(body, input_cancelled)
+    if input_cancelled then
+      notify_info("Review submission cancelled")
       return
     end
 
-    notify_info(string.format("Review submitted for PR #%d", pr.number))
+    confirm_review_submission(event, pr.number, body, function(confirmed)
+      if not confirmed then
+        notify_info("Review submission cancelled")
+        return
+      end
+
+      local ok, review_err = pr_service.review(pr.number, event, body)
+      if not ok then
+        notify_error(review_err)
+        return
+      end
+
+      notify_info(string.format("%s review submitted for PR #%d", label:gsub("^%l", string.upper), pr.number))
+    end)
   end)
 end
 

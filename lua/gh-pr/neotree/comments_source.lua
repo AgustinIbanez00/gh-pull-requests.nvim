@@ -3,7 +3,8 @@ local M = {
   display_name = "GH Comments",
 }
 
-local actions = require("gh-pr.actions")
+local config = require("gh-pr.config")
+local path_tree = require("gh-pr.path_tree")
 local pr_service = require("gh-pr.pr_service")
 local repo = require("gh-pr.repo")
 local runtime_state = require("gh-pr.state")
@@ -140,6 +141,10 @@ local function file_node_id(pr_number, path)
   return string.format("ghpr-comments:%d:file:%s", pr_number, path)
 end
 
+local function directory_node_id(pr_number, path)
+  return string.format("ghpr-comments:%d:dir:%s", pr_number, path)
+end
+
 local function line_node_id(pr_number, path, side, line)
   return string.format("ghpr-comments:%d:line:%s:%s:%d", pr_number, path, side, line)
 end
@@ -156,6 +161,154 @@ local function normalize_comment_time(created_at)
   return created_at:gsub("T", " "):gsub("Z", "")
 end
 
+local function sort_comments_by_time(comments)
+  table.sort(comments, function(left, right)
+    local left_key = normalize_comment_time(left.created_at) .. ":" .. (left.id or "")
+    local right_key = normalize_comment_time(right.created_at) .. ":" .. (right.id or "")
+    return left_key < right_key
+  end)
+end
+
+local function sorted_line_buckets(line_map)
+  local line_buckets = {}
+  for _, bucket in pairs(line_map or {}) do
+    line_buckets[#line_buckets + 1] = bucket
+  end
+
+  table.sort(line_buckets, function(left, right)
+    if left.line ~= right.line then
+      return left.line < right.line
+    end
+    return left.side < right.side
+  end)
+
+  return line_buckets
+end
+
+local function normalize_thread_comment(comment, fallback_index)
+  local author = "unknown"
+  if type(comment.author) == "table" and type(comment.author.login) == "string" and comment.author.login ~= "" then
+    author = comment.author.login
+  elseif type(comment.author) == "string" and comment.author ~= "" then
+    author = comment.author
+  end
+
+  return {
+    id = type(comment.id) == "string" and comment.id ~= "" and comment.id or tostring(fallback_index),
+    author = author,
+    body = type(comment.body) == "string" and comment.body or "",
+    created_at = type(comment.createdAt) == "string" and comment.createdAt or (type(comment.created_at) == "string" and comment.created_at or ""),
+    url = type(comment.url) == "string" and comment.url or "",
+    state = type(comment.state) == "string" and comment.state or "",
+    outdated = comment.outdated == true,
+  }
+end
+
+local function normalize_thread_comments(thread)
+  local items = {}
+  for index, comment in ipairs(type(thread.comments) == "table" and thread.comments or {}) do
+    items[#items + 1] = normalize_thread_comment(comment, index)
+  end
+  sort_comments_by_time(items)
+  return items
+end
+
+local function normalize_line_bucket_comments(comments)
+  local items = {}
+  for index, comment in ipairs(type(comments) == "table" and comments or {}) do
+    items[#items + 1] = {
+      id = type(comment.id) == "string" and comment.id ~= "" and comment.id or tostring(index),
+      author = type(comment.author) == "string" and comment.author ~= "" and comment.author or "unknown",
+      body = type(comment.body) == "string" and comment.body or "",
+      created_at = type(comment.created_at) == "string" and comment.created_at or "",
+      url = type(comment.url) == "string" and comment.url or "",
+      state = type(comment.state) == "string" and comment.state or "",
+      outdated = comment.outdated == true,
+    }
+  end
+  sort_comments_by_time(items)
+  return items
+end
+
+local function line_bucket_target(pr, details, path, bucket, first_target)
+  local line_comments = normalize_line_bucket_comments(bucket.comments)
+  local line_value = tonumber((first_target and first_target.line) or bucket.line) or bucket.line
+  local original_line_value = tonumber((first_target and first_target.original_line) or bucket.line) or bucket.line
+
+  return {
+    pr = pr,
+    details = details,
+    path = path,
+    side = bucket.side,
+    line = line_value,
+    original_line = original_line_value,
+    thread_id = string.format("line:%s:%s:%d", path, bucket.side, bucket.line),
+    thread_comments = line_comments,
+    selected_comment_id = line_comments[1] and line_comments[1].id or nil,
+    thread_is_resolved = bucket.has_open ~= true and bucket.has_outdated ~= true,
+    thread_is_outdated = bucket.has_open ~= true and bucket.has_outdated == true,
+    line_comments = line_comments,
+  }
+end
+
+local function build_line_nodes(pr, details, path, file_bucket)
+  local nodes = {}
+  local line_buckets = sorted_line_buckets(file_bucket and file_bucket.lines or {})
+
+  for _, bucket in ipairs(line_buckets) do
+    local status = bucket.has_open and "OPEN" or (bucket.has_outdated and "OUTDATED" or "RESOLVED")
+    local first_target = bucket.comments[1] and bucket.comments[1].target or nil
+    local line_node = {
+      id = line_node_id(pr.number, path, bucket.side, bucket.line),
+      name = string.format("L%d (%s) [%s] x%d", bucket.line, bucket.side, status, #bucket.comments),
+      type = "directory",
+      path = path,
+      extra = {
+        kind = "line",
+        pr = pr,
+        details = details,
+        target = line_bucket_target(pr, details, path, bucket, first_target),
+      },
+      children = {},
+    }
+
+    for index, comment in ipairs(bucket.comments) do
+      line_node.children[#line_node.children + 1] = {
+        id = comment_node_id(pr.number, comment.id, index),
+        name = string.format("@%s: %s", comment.author or "unknown", body_preview(comment.body)),
+        type = "file",
+        path = path,
+        extra = {
+          kind = "comment",
+          pr = pr,
+          details = details,
+          target = comment.target,
+          comment = comment,
+        },
+      }
+    end
+
+    table.sort(line_node.children, function(left, right)
+      local left_comment = left.extra and left.extra.comment or {}
+      local right_comment = right.extra and right.extra.comment or {}
+      local left_key = normalize_comment_time(left_comment.created_at) .. ":" .. (left_comment.id or "")
+      local right_key = normalize_comment_time(right_comment.created_at) .. ":" .. (right_comment.id or "")
+      return left_key < right_key
+    end)
+
+    nodes[#nodes + 1] = line_node
+  end
+
+  return nodes
+end
+
+local function file_group_name(path, mode)
+  if mode == "flat" then
+    return path
+  end
+  return path:match("[^/\\]+$") or path
+end
+
 local function build_nodes(pr, details, threads, options)
   local files = {}
 
@@ -165,6 +318,9 @@ local function build_nodes(pr, details, threads, options)
       local thread_side = type(thread.diffSide) == "string" and thread.diffSide or ""
       local thread_head_line = first_positive_line(thread.line, thread.startLine)
       local thread_base_line = first_positive_line(thread.originalLine, thread.originalStartLine)
+      local thread_comments = normalize_thread_comments(thread)
+      local thread_is_resolved = thread.isResolved == true
+      local thread_is_outdated = thread.isOutdated == true
 
       for index, comment in ipairs(type(thread.comments) == "table" and thread.comments or {}) do
         local path = type(comment.path) == "string" and comment.path or thread_path
@@ -181,17 +337,26 @@ local function build_nodes(pr, details, threads, options)
               side = side,
               line = line,
               comments = {},
-              is_resolved = thread.isResolved == true,
-              is_outdated = thread.isOutdated == true,
+              has_open = false,
+              has_outdated = false,
             }
 
             local line_bucket = file_bucket.lines[line_key]
+            if not thread_is_resolved and not thread_is_outdated then
+              line_bucket.has_open = true
+            end
+            if thread_is_outdated then
+              line_bucket.has_outdated = true
+            end
             line_bucket.comments[#line_bucket.comments + 1] = {
               id = comment.id,
               author = type(comment.author) == "table" and comment.author.login or "unknown",
               body = comment.body,
               created_at = comment.createdAt,
               url = comment.url,
+              state = comment.state,
+              outdated = comment.outdated == true,
+              thread_id = thread.id,
               target = {
                 pr = pr,
                 details = details,
@@ -199,10 +364,15 @@ local function build_nodes(pr, details, threads, options)
                 side = side,
                 line = head_line or line,
                 original_line = base_line or line,
+                thread_id = thread.id,
+                thread_comments = thread_comments,
+                selected_comment_id = comment.id,
+                thread_is_resolved = thread_is_resolved,
+                thread_is_outdated = thread_is_outdated,
               },
               thread_flags = {
-                is_resolved = thread.isResolved == true,
-                is_outdated = thread.isOutdated == true,
+                is_resolved = thread_is_resolved,
+                is_outdated = thread_is_outdated,
               },
               fallback_index = index,
             }
@@ -213,7 +383,6 @@ local function build_nodes(pr, details, threads, options)
   end
 
   local file_paths = vim.tbl_keys(files)
-  table.sort(file_paths)
   if vim.tbl_isempty(file_paths) then
     return {
       {
@@ -229,6 +398,17 @@ local function build_nodes(pr, details, threads, options)
     }
   end
 
+  local render_options = config.get_path_render("gh_pr_comments")
+  local entries = {}
+  for _, path in ipairs(file_paths) do
+    entries[#entries + 1] = {
+      path = path,
+      payload = {
+        file_bucket = files[path],
+      },
+    }
+  end
+
   local nodes = {
     {
       id = string.format("ghpr-comments:%d:root", pr.number),
@@ -239,80 +419,42 @@ local function build_nodes(pr, details, threads, options)
         pr = pr,
         details = details,
       },
-      children = {},
+      children = path_tree.build_nodes(entries, {
+        mode = render_options.mode,
+        separator = render_options.separator,
+        create_directory_node = function(display_name, full_path)
+          return {
+            id = directory_node_id(pr.number, full_path),
+            name = display_name,
+            type = "directory",
+            path = full_path,
+            extra = {
+              kind = "directory",
+              pr = pr,
+              details = details,
+            },
+            children = {},
+          }
+        end,
+        create_file_node = function(file_item, context)
+          local path = file_item.path
+          local file_bucket = file_item.payload.file_bucket
+          return {
+            id = file_node_id(pr.number, path),
+            name = file_group_name(path, context and context.mode or render_options.mode),
+            type = "directory",
+            path = path,
+            extra = {
+              kind = "file_group",
+              pr = pr,
+              details = details,
+            },
+            children = build_line_nodes(pr, details, path, file_bucket),
+          }
+        end,
+      }),
     },
   }
-
-  local root = nodes[1]
-
-  for _, path in ipairs(file_paths) do
-    local line_buckets = {}
-    for _, bucket in pairs(files[path].lines) do
-      line_buckets[#line_buckets + 1] = bucket
-    end
-    table.sort(line_buckets, function(left, right)
-      if left.line ~= right.line then
-        return left.line < right.line
-      end
-      return left.side < right.side
-    end)
-
-    local file_node = {
-      id = file_node_id(pr.number, path),
-      name = path,
-      type = "directory",
-      path = path,
-      extra = {
-        kind = "file_group",
-        pr = pr,
-        details = details,
-      },
-      children = {},
-    }
-
-    for _, bucket in ipairs(line_buckets) do
-      local status = bucket.is_resolved and "RESOLVED" or (bucket.is_outdated and "OUTDATED" or "OPEN")
-      local line_node = {
-        id = line_node_id(pr.number, path, bucket.side, bucket.line),
-        name = string.format("L%d (%s) [%s] x%d", bucket.line, bucket.side, status, #bucket.comments),
-        type = "directory",
-        path = path,
-        extra = {
-          kind = "line",
-          pr = pr,
-          details = details,
-          target = bucket.comments[1] and bucket.comments[1].target or nil,
-        },
-        children = {},
-      }
-
-      for index, comment in ipairs(bucket.comments) do
-        line_node.children[#line_node.children + 1] = {
-          id = comment_node_id(pr.number, comment.id, index),
-          name = string.format("@%s: %s", comment.author or "unknown", body_preview(comment.body)),
-          type = "file",
-          path = path,
-          extra = {
-            kind = "comment",
-            pr = pr,
-            details = details,
-            target = comment.target,
-            comment = comment,
-          },
-        }
-      end
-
-      table.sort(line_node.children, function(left, right)
-        local left_comment = left.extra and left.extra.comment or {}
-        local right_comment = right.extra and right.extra.comment or {}
-        return normalize_comment_time(left_comment.created_at) < normalize_comment_time(right_comment.created_at)
-      end)
-
-      file_node.children[#file_node.children + 1] = line_node
-    end
-
-    root.children[#root.children + 1] = file_node
-  end
 
   return nodes
 end
@@ -330,7 +472,7 @@ M.navigate = function(state, path)
     return
   end
 
-  local options = (require("gh-pr.config").get() or {}).line_comments or {}
+  local options = (config.get() or {}).line_comments or {}
   local pr, details, context_err = active_pr_context()
   if not pr or not details then
     renderer.show_nodes({
@@ -369,7 +511,7 @@ end
 M.setup = function(source_config, _)
   local commands = require("gh-pr.neotree.comments_commands")
   local components = require("gh-pr.neotree.components")
-  local options = (((require("gh-pr.config").get() or {}).line_comments or {}).comments_tree or {}).preview or {}
+  local options = (((config.get() or {}).line_comments or {}).comments_tree or {}).preview or {}
   local preview_keymap = type(options.keymap) == "string" and options.keymap ~= "" and options.keymap or "p"
   source_config.commands = vim.tbl_deep_extend("force", source_config.commands or {}, commands)
   source_config.components = source_config.components or components

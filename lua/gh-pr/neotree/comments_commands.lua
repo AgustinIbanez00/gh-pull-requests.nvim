@@ -34,7 +34,11 @@ local function open_target_from_node(node)
 
   local target = node.extra and node.extra.target
   if type(target) == "table" then
-    actions.open_comment_location(target)
+    actions.open_comment_location(target, {
+      open_thread_popup = true,
+      popup_mode = "open",
+      focus_thread_popup = true,
+    })
   end
 end
 
@@ -45,7 +49,11 @@ local function preview_target_from_node(node)
 
   local target = node.extra and node.extra.target
   if type(target) == "table" then
-    actions.preview_comment_location(target)
+    actions.preview_comment_location(target, {
+      open_thread_popup = true,
+      popup_mode = "preview",
+      focus_thread_popup = true,
+    })
   end
 end
 

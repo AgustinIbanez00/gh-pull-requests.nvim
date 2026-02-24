@@ -1189,6 +1189,126 @@ function M.fetch_commit_details(pr_number, oid, opts)
   }, nil
 end
 
+local function append_csv_flag(args, flag, values)
+  if type(values) ~= "table" or vim.tbl_isempty(values) then
+    return false
+  end
+
+  local normalized = {}
+  for _, value in ipairs(values) do
+    if type(value) == "string" and value ~= "" then
+      normalized[#normalized + 1] = value
+    end
+  end
+
+  if vim.tbl_isempty(normalized) then
+    return false
+  end
+
+  table.insert(args, flag)
+  table.insert(args, table.concat(normalized, ","))
+  return true
+end
+
+function M.edit(number, operations)
+  operations = type(operations) == "table" and operations or {}
+  local args = { "pr", "edit", tostring(number) }
+  local has_operations = false
+
+  if operations.title ~= nil then
+    table.insert(args, "--title")
+    table.insert(args, tostring(operations.title))
+    has_operations = true
+  end
+
+  if operations.body ~= nil then
+    table.insert(args, "--body")
+    table.insert(args, tostring(operations.body))
+    has_operations = true
+  end
+
+  if operations.base ~= nil then
+    table.insert(args, "--base")
+    table.insert(args, tostring(operations.base))
+    has_operations = true
+  end
+
+  if operations.remove_milestone == true then
+    table.insert(args, "--remove-milestone")
+    has_operations = true
+  elseif operations.milestone ~= nil then
+    table.insert(args, "--milestone")
+    table.insert(args, tostring(operations.milestone))
+    has_operations = true
+  end
+
+  if append_csv_flag(args, "--add-label", operations.add_labels) then
+    has_operations = true
+  end
+  if append_csv_flag(args, "--remove-label", operations.remove_labels) then
+    has_operations = true
+  end
+  if append_csv_flag(args, "--add-reviewer", operations.add_reviewers) then
+    has_operations = true
+  end
+  if append_csv_flag(args, "--remove-reviewer", operations.remove_reviewers) then
+    has_operations = true
+  end
+  if append_csv_flag(args, "--add-assignee", operations.add_assignees) then
+    has_operations = true
+  end
+  if append_csv_flag(args, "--remove-assignee", operations.remove_assignees) then
+    has_operations = true
+  end
+
+  if not has_operations then
+    return false, "No edit operations provided"
+  end
+
+  local _, err = gh.run(args)
+  if err then
+    return false, err
+  end
+
+  return true, nil
+end
+
+function M.change_state(number, target_state)
+  local normalized = normalize_string(target_state, ""):lower()
+  local args
+  if normalized == "open" then
+    args = { "pr", "reopen", tostring(number) }
+  elseif normalized == "closed" then
+    args = { "pr", "close", tostring(number) }
+  else
+    return false, "Unsupported target state"
+  end
+
+  local _, err = gh.run(args)
+  if err then
+    return false, err
+  end
+
+  return true, nil
+end
+
+function M.change_draft(number, target_mode)
+  local normalized = normalize_string(target_mode, ""):lower()
+  local args = { "pr", "ready", tostring(number) }
+  if normalized == "draft" then
+    table.insert(args, "--undo")
+  elseif normalized ~= "ready" then
+    return false, "Unsupported draft target"
+  end
+
+  local _, err = gh.run(args)
+  if err then
+    return false, err
+  end
+
+  return true, nil
+end
+
 function M.checkout(number)
   local _, err = gh.run({ "pr", "checkout", tostring(number) })
   if err then

@@ -82,15 +82,15 @@ end, { desc = "Jump to previous diff change" })
 
 vim.api.nvim_create_user_command("GhPrApprove", function()
   require("gh-pr").approve()
-end, { desc = "Approve active pull request" })
+end, { desc = "Approve active pull request (message + confirm)" })
 
 vim.api.nvim_create_user_command("GhPrRequestChanges", function()
   require("gh-pr").request_changes()
-end, { desc = "Request changes on active pull request" })
+end, { desc = "Request changes on active pull request (message + confirm)" })
 
 vim.api.nvim_create_user_command("GhPrComment", function()
   require("gh-pr").comment()
-end, { desc = "Submit general comment review" })
+end, { desc = "Submit general comment review (message + confirm)" })
 
 vim.api.nvim_create_user_command("GhPrMerge", function(command)
   local method = command.args ~= "" and command.args or "merge"

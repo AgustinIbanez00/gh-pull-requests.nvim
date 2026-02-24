@@ -5,6 +5,7 @@ local M = {
 
 local cache_store = require("gh-pr.cache_store")
 local config = require("gh-pr.config")
+local path_tree = require("gh-pr.path_tree")
 local pr_service = require("gh-pr.pr_service")
 local repo = require("gh-pr.repo")
 local runtime_state = require("gh-pr.state")
@@ -279,136 +280,74 @@ local function status_prefix(status)
   return "M"
 end
 
-local function add_file_node(list, id_prefix, path, file, pr, details)
+local function file_display_name(path, file, options)
+  local base_name = path:match("[^/\\]+$") or path
+  local include_status = options.show_status_prefix ~= false
+  if include_status then
+    return string.format("[%s] %s", status_prefix(file.status), base_name)
+  end
+
+  return base_name
+end
+
+local function collect_file_entries(pr, details)
+  local entries = {}
   local repo_full_name = repository_full_name(details)
-  if config.get().hide_viewed_files and runtime_state.is_viewed(repo_full_name, pr.number, path) then
-    return
-  end
-
-  table.insert(list, {
-    id = string.format("%s:file:%s", id_prefix, path),
-    name = string.format("[%s] %s", status_prefix(file.status), (path:match("[^/\\]+$") or path)),
-    type = "file",
-    path = path,
-    extra = {
-      kind = "file",
-      file = file,
-      pr = pr,
-      details = details,
-      repo = repo_full_name,
-    },
-  })
-end
-
-local function build_flat_file_nodes(id_prefix, pr, details)
-  local nodes = {}
+  local hide_viewed = config.get().hide_viewed_files
 
   for _, file in ipairs(details.files or {}) do
     local path = file.path or file.filename
     if path and path ~= "" then
-      add_file_node(nodes, id_prefix, path, file, pr, details)
-    end
-  end
-
-  table.sort(nodes, function(a, b)
-    return a.path < b.path
-  end)
-
-  return nodes
-end
-
-local function ensure_directory(parent, id_prefix, prefix, name, pr, details)
-  parent._dir_index = parent._dir_index or {}
-
-  if parent._dir_index[name] then
-    return parent._dir_index[name]
-  end
-
-  local directory = {
-    id = string.format("%s:dir:%s%s", id_prefix, prefix, name),
-    name = name,
-    type = "directory",
-    children = {},
-    extra = {
-      kind = "directory",
-      pr = pr,
-      details = details,
-    },
-  }
-
-  table.insert(parent.children, directory)
-  parent._dir_index[name] = directory
-  return directory
-end
-
-local function finalize_directories(node)
-  node._dir_index = nil
-  for _, child in ipairs(node.children or {}) do
-    if child.type == "directory" then
-      finalize_directories(child)
-    end
-  end
-
-  table.sort(node.children, function(left, right)
-    if left.type ~= right.type then
-      return left.type == "directory"
-    end
-    return left.name < right.name
-  end)
-end
-
-local function build_tree_file_nodes(id_prefix, pr, details)
-  local root = {
-    id = string.format("%s:files-root", id_prefix),
-    name = "files-root",
-    type = "directory",
-    children = {},
-  }
-
-  for _, file in ipairs(details.files or {}) do
-    local path = file.path or file.filename
-    if path and path ~= "" then
-      local repo_full_name = repository_full_name(details)
-      if not (config.get().hide_viewed_files and runtime_state.is_viewed(repo_full_name, pr.number, path)) then
-        local parts = vim.split(path, "/", { plain = true })
-        local current = root
-        local prefix = ""
-
-        for index, part in ipairs(parts) do
-          if index == #parts then
-            local node = {
-              id = string.format("%s:file:%s", id_prefix, path),
-              name = string.format("[%s] %s", status_prefix(file.status), part),
-              type = "file",
-              path = path,
-              extra = {
-                kind = "file",
-                file = file,
-                pr = pr,
-                details = details,
-                repo = repo_full_name,
-              },
-            }
-            table.insert(current.children, node)
-          else
-            current = ensure_directory(current, id_prefix, prefix, part, pr, details)
-            prefix = prefix .. part .. "/"
-          end
-        end
+      if not (hide_viewed and runtime_state.is_viewed(repo_full_name, pr.number, path)) then
+        entries[#entries + 1] = {
+          path = path,
+          payload = file,
+        }
       end
     end
   end
 
-  finalize_directories(root)
-  return root.children
+  return entries, repo_full_name
 end
 
 local function build_file_nodes(id_prefix, pr, details)
-  if config.get().file_list_layout == "flat" then
-    return build_flat_file_nodes(id_prefix, pr, details)
-  end
+  local render_options = config.get_path_render("gh_pr")
+  local entries, repo_full_name = collect_file_entries(pr, details)
 
-  return build_tree_file_nodes(id_prefix, pr, details)
+  return path_tree.build_nodes(entries, {
+    mode = render_options.mode,
+    separator = render_options.separator,
+    create_directory_node = function(display_name, full_path)
+      return {
+        id = string.format("%s:dir:%s", id_prefix, full_path),
+        name = display_name,
+        type = "directory",
+        children = {},
+        extra = {
+          kind = "directory",
+          pr = pr,
+          details = details,
+        },
+      }
+    end,
+    create_file_node = function(file_item)
+      local path = file_item.path
+      local file = file_item.payload
+      return {
+        id = string.format("%s:file:%s", id_prefix, path),
+        name = file_display_name(path, file, render_options),
+        type = "file",
+        path = path,
+        extra = {
+          kind = "file",
+          file = file,
+          pr = pr,
+          details = details,
+          repo = repo_full_name,
+        },
+      }
+    end,
+  })
 end
 
 local function get_query_node(query, results, session, opts)
@@ -899,7 +838,7 @@ M.setup = function(source_config, _)
     ["s"] = "noop",
     ["t"] = "noop",
     ["w"] = "noop",
-    ["e"] = "noop",
+    ["e"] = "toggle_auto_expand_width",
     ["q"] = "close_window",
     ["?"] = "show_help",
     ["<"] = "prev_source",
