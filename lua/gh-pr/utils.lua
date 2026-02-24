@@ -1,20 +1,13 @@
 local M = {}
 
----Check if the current working directory is inside a git repository.
----@return boolean
+local repo = require("gh-pr.repo")
+
 function M.in_git_repo()
-	local output = vim.fn.system({ "git", "rev-parse", "--is-inside-work-tree" })
-	return vim.v.shell_error == 0 and vim.trim(output) == "true"
+  return repo.in_git_repo()
 end
 
----Ensure the plugin is executed inside a git repository.
----@return boolean ok
 function M.ensure_git_repo()
-	if M.in_git_repo() then
-		return true
-	end
-	vim.notify("gh-pr requires a git repository", vim.log.levels.ERROR)
-	return false
+  return repo.ensure_git_repo()
 end
 
 return M

@@ -1,39 +1,165 @@
 *gh-pr.txt*    gh-pr plugin
 
-GH-PR is a Neovim plugin to review GitHub pull requests inside the editor.
+GH-PR is a Neovim plugin to review GitHub pull requests in-editor using the
+GitHub CLI as backend.
 
-The functionality is under active development. It requires the GitHub CLI and
-must be used from inside a git repository.
+Requirements
+============
+
+- `gh` installed and authenticated
+- inside a git repository
+
+Optional UI backends:
+
+- `neo-tree.nvim` (primary)
+- `telescope.nvim` (fallback)
+- `snacks.nvim` (required for interactive overview)
 
 Commands
 ========
 
+:GhPrOpen
+    Opens the pull request UI. Uses Neo-tree source `gh_pr` when available,
+    otherwise falls back to Telescope if enabled.
+
 :GhPrList
-    Displays open pull requests for the authenticated user in a Telescope
-    picker. Each entry shows the pull request number, title, review state,
-    and reviewer statuses. Selecting a pull request opens another picker with
-    the files changed in that pull request. Choosing a file will download the
-    base and head versions and display them side-by-side in diff mode. Buffers
-    retain the original filetype so syntax highlighting and plugins are loaded.
+    Opens Telescope query and pull request picker.
+
+:GhPrComments [number]
+    Opens a comments tree (Problems-like) for the active PR or provided
+    PR number. Selecting a line/comment node navigates to file + line.
+    In `gh_pr_comments`: `p` previews in right split, `<CR>` opens.
+
+:GhPrRefresh
+    Refreshes PR data in active views.
+
+:GhPrOverview
+    Opens an interactive tabs overview for the active pull request.
+    Requires `snacks.nvim`; if missing, an explicit error is shown.
+
+:GhPrOverviewRefresh
+    Refreshes the current overview buffer in place.
+
+:GhPrOverviewMore {section} [count]
+    Loads more items in a section (`checks`, `commits`, `timeline`).
+
+Overview buffer keymaps:
+    `a` approve review
+    `d` request changes
+    `c` comment review
+    `m` merge PR
+    `k` checkout PR branch
+    `R` refresh overview
+    `o` open PR URL in browser
+    `q` close buffer
+    `H`/`L` previous/next tab
+    `1..9` jump to tab
+    `<CR>` open selected row action
+    `<CR>` on `Commits` opens commit diff details in virtual patch buffer
+    `gr` load more for current section tab
+    `D` open diff for selected row (file/commit)
+    `O` open original for selected file row
+    `M` open modified for selected file row
+
+:GhPrCheckout [number]
+    Runs `gh pr checkout` for the active PR or provided number.
+
+:GhPrOpenDiff
+    Opens active file as virtual base/head side-by-side diff.
+    In virtual PR buffers, `K` opens a floating window with comments for
+    the current line.
+    Additional virtual-buffer shortcuts:
+      `,n` next change
+      `,p` previous change
+      `,f` next file
+      `,F` previous file
+      `,v` next reviewed file
+      `,V` previous reviewed file
+
+:GhPrOpenOriginal
+    Opens virtual readonly base version for active PR file.
+
+:GhPrOpenModified
+    Opens virtual readonly head version for active PR file.
 
 :GhPrToggleReviewed
-    Toggles a marker in the statusline of the current buffer indicating whether
-    the file has been reviewed.
+    Toggles local viewed state for the current PR file.
 
 :GhPrNextChange
-    When viewing a pull request file in diff mode, jump to the next change hunk.
+    Jump to next diff hunk.
 
 :GhPrPrevChange
-    When viewing a pull request file in diff mode, jump to the previous change
-    hunk.
+    Jump to previous diff hunk.
+
+:GhPrApprove
+    Submit approve review for active PR.
+
+:GhPrRequestChanges
+    Submit request-changes review for active PR.
+
+:GhPrComment
+    Submit general comment review for active PR.
+
+:GhPrMerge [merge|squash|rebase]
+    Merge active PR with selected strategy.
+
+:GhPrQueryAdd
+    Add query definition (folder/label/query).
+
+:GhPrQueryEdit
+    Edit existing query definition.
+
+:GhPrQueryDelete
+    Delete existing query definition.
 
 Keymaps
 =======
 
-The plugin defines default mappings that begin with `<leader>gh`:
+<leader>gho       Open PR UI (:GhPrOpen)
+<leader>ghl       Open Telescope list (:GhPrList)
+<leader>ghm       Open comments tree (:GhPrComments)
+<leader>ghr       Refresh (:GhPrRefresh)
+<leader>ghv       Open PR overview (:GhPrOverview)
+<leader>ghc       Checkout PR (:GhPrCheckout)
+<leader>ghd       Open diff (:GhPrOpenDiff)
+<leader>ght       Toggle viewed (:GhPrToggleReviewed)
+<leader>ghn       Next diff hunk (:GhPrNextChange)
+<leader>ghp       Previous diff hunk (:GhPrPrevChange)
+`C` (gh_pr)      Open comments tree (:GhPrComments)
 
-    <leader>ghl       List pull requests (:GhPrList)
-    <leader>ght       Toggle reviewed flag (:GhPrToggleReviewed)
-    <leader>ghn       Next change hunk (:GhPrNextChange)
-    <leader>ghp       Previous change hunk (:GhPrPrevChange)
+Configuration
+=============
 
+Call `require("gh-pr").setup({ ... })` with:
+
+- `remotes` (`{ "origin", "upstream" }` by default)
+- `max_results` (`30`)
+- `file_list_layout` (`"tree"` or `"flat"`)
+- `hide_viewed_files` (`false`)
+- `line_comments.enabled` (`true`)
+- `line_comments.keymap` (`"K"`)
+- `line_comments.indicator_style` (`"sign_and_highlight"`)
+- `line_comments.show_resolved` (`true`)
+- `line_comments.show_outdated` (`true`)
+- `line_comments.max_popup_width` (`90`)
+- `line_comments.max_popup_height` (`18`)
+- `line_comments.signs.open|resolved|outdated` (`"C>"`, `"C="`, `"C~"`)
+- `line_comments.comments_tree.preview.keymap` (`"p"`)
+- `line_comments.comments_tree.preview.position` (`"right"`)
+- `line_comments.comments_tree.preview.keep_focus` (`true`)
+- `overview.ui` (`"snacks"`)
+- `overview.layout` (`"tabs"`)
+- `overview.tabs` (`summary/checks/commits/timeline/files`)
+- `overview.expand_step` (`20`)
+- `overview.date_format` (`"%Y-%m-%d %H:%M"`)
+- `overview.max_items` (checks/commits/timeline)
+- `overview.show` (toggle sections)
+- `queries` list: `{ folder, label, query }`
+- `ui.use_neotree` (`true`)
+- `ui.telescope_fallback` (`true`)
+
+Persistence
+===========
+
+- Queries: `stdpath("state")/gh-pr/queries.json`
+- Viewed files: `stdpath("state")/gh-pr/state.json`

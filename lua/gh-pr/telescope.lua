@@ -1,128 +1,198 @@
--- luacheck: max_line_length 200
 local M = {}
 
-local pulls = require("gh-pr.pulls")
+local actions = require("gh-pr.actions")
+local pr_service = require("gh-pr.pr_service")
 
-local function build_tree(files)
-        local root = { name = "", type = "dir", children = {} }
-        for _, f in ipairs(files) do
-                local path = f.path or f.filename or ""
-                local parts = vim.split(path, "/", { plain = true })
-                local node = root
-                for i, part in ipairs(parts) do
-                        if i == #parts then
-                                table.insert(node.children, { name = part, type = "file", file = f })
-                        else
-                                local found
-                                for _, child in ipairs(node.children) do
-                                        if child.type == "dir" and child.name == part then
-                                                found = child
-                                                break
-                                        end
-                                end
-                                if not found then
-                                        found = { name = part, type = "dir", children = {} }
-                                        table.insert(node.children, found)
-                                end
-                                node = found
-                        end
-                end
-        end
-        return root
+local function telescope_modules()
+  local ok, pickers = pcall(require, "telescope.pickers")
+  if not ok then
+    vim.notify("telescope.nvim is required for :GhPrList", vim.log.levels.ERROR)
+    return nil
+  end
+
+  return {
+    pickers = pickers,
+    finders = require("telescope.finders"),
+    conf = require("telescope.config").values,
+    actions = require("telescope.actions"),
+    action_state = require("telescope.actions.state"),
+  }
 end
-local function make_display(pr)
-	local reviewers = pulls.reviewer_summary(pr)
-	local decision = pr.reviewDecision or "UNKNOWN"
-	return string.format("#%d %s [%s] %s", pr.number, pr.title, decision, reviewers)
+
+local function select_file_picker(modules, details)
+  local files = details.files or {}
+  if vim.tbl_isempty(files) then
+    vim.notify("No files in pull request", vim.log.levels.WARN)
+    return
+  end
+
+  modules.pickers
+    .new({}, {
+      prompt_title = string.format("PR #%d Files", details.number),
+      finder = modules.finders.new_table({
+        results = files,
+        entry_maker = function(file)
+          local path = file.path or file.filename
+          local status = file.status or "modified"
+          return {
+            value = file,
+            display = string.format("[%s] %s", status, path),
+            ordinal = path,
+          }
+        end,
+      }),
+      sorter = modules.conf.generic_sorter({}),
+      attach_mappings = function(prompt_bufnr, map)
+        local function open_file()
+          local selection = modules.action_state.get_selected_entry()
+          modules.actions.close(prompt_bufnr)
+          if selection and selection.value then
+            actions.open_diff(selection.value)
+          end
+        end
+
+        map("i", "<CR>", open_file)
+        map("n", "<CR>", open_file)
+        return true
+      end,
+    })
+    :find()
+end
+
+local function select_pr_action_picker(modules, pr)
+  local details, err = pr_service.fetch_details(pr.number)
+  if not details then
+    vim.notify(err, vim.log.levels.ERROR)
+    return
+  end
+
+  actions.set_active_pr(details, details)
+
+  local pr_actions = {
+    { id = "overview", label = "Open overview" },
+    { id = "files", label = "Browse files" },
+    { id = "checkout", label = "Checkout branch" },
+  }
+
+  modules.pickers
+    .new({}, {
+      prompt_title = string.format("PR #%d Actions", pr.number),
+      finder = modules.finders.new_table({
+        results = pr_actions,
+        entry_maker = function(item)
+          return {
+            value = item,
+            display = item.label,
+            ordinal = item.label,
+          }
+        end,
+      }),
+      sorter = modules.conf.generic_sorter({}),
+      attach_mappings = function(prompt_bufnr, map)
+        local function run_action()
+          local selection = modules.action_state.get_selected_entry()
+          modules.actions.close(prompt_bufnr)
+          if not selection or not selection.value then
+            return
+          end
+
+          if selection.value.id == "overview" then
+            actions.open_overview(pr.number)
+          elseif selection.value.id == "files" then
+            select_file_picker(modules, details)
+          elseif selection.value.id == "checkout" then
+            actions.checkout(pr.number)
+          end
+        end
+
+        map("i", "<CR>", run_action)
+        map("n", "<CR>", run_action)
+        return true
+      end,
+    })
+    :find()
+end
+
+local function select_pr_picker(modules, query_result)
+  modules.pickers
+    .new({}, {
+      prompt_title = query_result.query.label,
+      finder = modules.finders.new_table({
+        results = query_result.prs,
+        entry_maker = function(pr)
+          local decision = pr.reviewDecision or "REVIEW_REQUIRED"
+          return {
+            value = pr,
+            display = string.format("#%d [%s] %s", pr.number, decision, pr.title),
+            ordinal = pr.title,
+          }
+        end,
+      }),
+      sorter = modules.conf.generic_sorter({}),
+      attach_mappings = function(prompt_bufnr, map)
+        local function open_pr_actions()
+          local selection = modules.action_state.get_selected_entry()
+          modules.actions.close(prompt_bufnr)
+          if selection and selection.value then
+            select_pr_action_picker(modules, selection.value)
+          end
+        end
+
+        map("i", "<CR>", open_pr_actions)
+        map("n", "<CR>", open_pr_actions)
+        return true
+      end,
+    })
+    :find()
 end
 
 function M.pull_requests()
-	local ok, pickers = pcall(require, "telescope.pickers")
-	if not ok then
-		vim.notify("telescope.nvim is required", vim.log.levels.ERROR)
-		return
-	end
-	local finders = require("telescope.finders")
-	local conf = require("telescope.config").values
-	local pulls_data = pulls.fetch()
-	if vim.tbl_isempty(pulls_data) then
-		return
-	end
-	pickers
-		.new({}, {
-			prompt_title = "My Pull Requests",
-			finder = finders.new_table({
-				results = pulls_data,
-				entry_maker = function(pr)
-					return {
-						value = pr,
-						display = make_display(pr),
-						ordinal = pr.title,
-					}
-				end,
-			}),
-			sorter = conf.generic_sorter({}),
-			attach_mappings = function(prompt_bufnr, map)
-				local actions = require("telescope.actions")
-				local action_state = require("telescope.actions.state")
-				local function select_pr()
-					local selection = action_state.get_selected_entry()
-					actions.close(prompt_bufnr)
-					if not (selection and selection.value) then
-						return
-					end
-					local details = pulls.fetch_details(selection.value.number)
-                                        local files = details.files or {}
-                                        if vim.tbl_isempty(files) then
-                                                vim.notify("no files in pull request", vim.log.levels.WARN)
-                                                return
-                                        end
-                                        local tree = build_tree(files)
-                                        local function browse(node, prefix)
-                                                prefix = prefix or ""
-                                                pickers
-                                                        .new({}, {
-                                                                prompt_title = prefix == "" and "Changed Files" or prefix,
-                                                                finder = finders.new_table({
-                                                                        results = node.children,
-                                                                        entry_maker = function(item)
-                                                                                local display = item.name
-                                                                                if item.type == "dir" then
-                                                                                        display = item.name .. "/"
-                                                                                end
-                                                                                return { value = item, display = display, ordinal = item.name }
-                                                                        end,
-                                                                }),
-                                                                sorter = conf.generic_sorter({}),
-                                                                attach_mappings = function(fbuf, fmap)
-                                                                        local function select_entry()
-                                                                                local sel = action_state.get_selected_entry()
-                                                                                actions.close(fbuf)
-                                                                                if not sel or not sel.value then
-                                                                                        return
-                                                                                end
-                                                                                local item = sel.value
-                                                                                if item.type == "dir" then
-                                                                                        browse(item, prefix .. item.name .. "/")
-                                                                                else
-                                                                                        pulls.open_file_diff(details, item.file)
-                                                                                end
-                                                                        end
-                                                                        fmap("i", "<CR>", select_entry)
-                                                                        fmap("n", "<CR>", select_entry)
-                                                                        return true
-                                                                end,
-                                                        })
-                                                        :find()
-                                        end
-                                        browse(tree, "")
-                                end
-                                map("i", "<CR>", select_pr)
-                                map("n", "<CR>", select_pr)
-                                return true
-                        end,
-		})
-		:find()
+  local modules = telescope_modules()
+  if not modules then
+    return
+  end
+
+  local query_results = pr_service.list_queries_with_results()
+
+  modules.pickers
+    .new({}, {
+      prompt_title = "PR Queries",
+      finder = modules.finders.new_table({
+        results = query_results,
+        entry_maker = function(result)
+          local count = #(result.prs or {})
+          local suffix = result.error and " [error]" or ""
+          local label = string.format("%s/%s (%d)%s", result.query.folder, result.query.label, count, suffix)
+          return {
+            value = result,
+            display = label,
+            ordinal = label,
+          }
+        end,
+      }),
+      sorter = modules.conf.generic_sorter({}),
+      attach_mappings = function(prompt_bufnr, map)
+        local function select_query()
+          local selection = modules.action_state.get_selected_entry()
+          modules.actions.close(prompt_bufnr)
+          if not selection or not selection.value then
+            return
+          end
+
+          if selection.value.error then
+            vim.notify(selection.value.error, vim.log.levels.ERROR)
+            return
+          end
+
+          select_pr_picker(modules, selection.value)
+        end
+
+        map("i", "<CR>", select_query)
+        map("n", "<CR>", select_query)
+        return true
+      end,
+    })
+    :find()
 end
 
 return M
