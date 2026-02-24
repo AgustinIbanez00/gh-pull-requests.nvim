@@ -80,6 +80,29 @@ local function get_user_login()
   return user_cache.login, nil
 end
 
+local function get_user_login_async(callback)
+  callback = callback or function() end
+  if user_cache.login then
+    callback(user_cache.login, nil)
+    return
+  end
+
+  gh.run_json_async({ "api", "user" }, nil, function(user, err)
+    if not user then
+      callback(nil, err)
+      return
+    end
+
+    if type(user.login) ~= "string" or user.login == "" then
+      callback(nil, "Unable to resolve current GitHub user")
+      return
+    end
+
+    user_cache.login = user.login
+    callback(user_cache.login, nil)
+  end)
+end
+
 local function append_repo_filter(query, repository)
   if query:find("repo:", 1, true) then
     return query
@@ -107,6 +130,28 @@ local function expand_query(raw_query, repository)
   return query, nil
 end
 
+local function expand_query_async(raw_query, repository, callback)
+  callback = callback or function() end
+  if raw_query == "default" then
+    callback("is:open repo:" .. repository.full_name, nil)
+    return
+  end
+
+  get_user_login_async(function(user, user_err)
+    if not user then
+      callback(nil, user_err)
+      return
+    end
+
+    local query = raw_query
+    query = query:gsub("%${user}", user)
+    query = query:gsub("%${owner}", repository.owner)
+    query = query:gsub("%${repository}", repository.name)
+    query = append_repo_filter(query, repository)
+    callback(query, nil)
+  end)
+end
+
 function M.resolve_repository()
   local plugin_config = config.get()
   local repository, err = repo.resolve_repository(plugin_config.remotes)
@@ -115,6 +160,39 @@ function M.resolve_repository()
   end
 
   return repository, nil
+end
+
+local function normalize_repository_filter(input)
+  if type(input) == "table" then
+    if type(input.owner) == "string" and input.owner ~= "" and type(input.name) == "string" and input.name ~= "" then
+      input.full_name = input.full_name or (input.owner .. "/" .. input.name)
+      return input
+    end
+
+    if type(input.full_name) == "string" and input.full_name ~= "" then
+      local owner, name = input.full_name:match("^([^/]+)/(.+)$")
+      if owner and name then
+        return {
+          owner = owner,
+          name = name,
+          full_name = input.full_name,
+        }
+      end
+    end
+  end
+
+  if type(input) == "string" and input ~= "" then
+    local owner, name = input:match("^([^/]+)/(.+)$")
+    if owner and name then
+      return {
+        owner = owner,
+        name = name,
+        full_name = input,
+      }
+    end
+  end
+
+  return nil
 end
 
 local function normalize_repo(owner, name)
@@ -423,6 +501,50 @@ function M.list_for_query(query)
   return prs, nil
 end
 
+function M.list_for_query_async(query, callback, opts)
+  callback = callback or function() end
+  opts = opts or {}
+
+  local repository = normalize_repository_filter(opts.repository)
+  if not repository then
+    local resolved, repo_err = M.resolve_repository()
+    if not resolved then
+      callback(nil, repo_err)
+      return
+    end
+    repository = resolved
+  end
+
+  expand_query_async(query, repository, function(search, query_err)
+    if not search then
+      callback(nil, query_err)
+      return
+    end
+
+    local plugin_config = config.get()
+    local args = {
+      "pr",
+      "list",
+      "--limit",
+      tostring(plugin_config.max_results),
+      "--state",
+      "all",
+      "--search",
+      search,
+      "--json",
+      default_pr_fields,
+    }
+
+    gh.run_json_async(args, nil, function(prs, err)
+      if not prs then
+        callback(nil, err)
+        return
+      end
+      callback(prs, nil)
+    end)
+  end)
+end
+
 function M.list_queries_with_results()
   local results = {}
 
@@ -446,6 +568,56 @@ function M.list_queries_with_results()
   return results
 end
 
+function M.list_queries_with_results_async(callback, opts)
+  callback = callback or function() end
+  opts = opts or {}
+
+  local repository = normalize_repository_filter(opts.repository)
+  if not repository then
+    local resolved, repo_err = M.resolve_repository()
+    if not resolved then
+      callback(nil, repo_err)
+      return
+    end
+    repository = resolved
+  end
+
+  local configured_queries = config.get_queries()
+  local results = {}
+  local index = 1
+
+  local function load_next()
+    local query = configured_queries[index]
+    if not query then
+      callback(results, nil)
+      return
+    end
+
+    M.list_for_query_async(query.query, function(prs, err)
+      if not prs then
+        results[#results + 1] = {
+          query = query,
+          error = err,
+          prs = {},
+        }
+      else
+        results[#results + 1] = {
+          query = query,
+          error = nil,
+          prs = prs,
+        }
+      end
+
+      index = index + 1
+      load_next()
+    end, {
+      repository = repository,
+    })
+  end
+
+  load_next()
+end
+
 function M.fetch_details(number)
   local details, err = gh.run_json({
     "pr",
@@ -460,6 +632,24 @@ function M.fetch_details(number)
   end
 
   return enrich_details_with_repositories(details), nil
+end
+
+function M.fetch_details_async(number, callback)
+  callback = callback or function() end
+  gh.run_json_async({
+    "pr",
+    "view",
+    tostring(number),
+    "--json",
+    detail_fields,
+  }, nil, function(details, err)
+    if not details then
+      callback(nil, err)
+      return
+    end
+
+    callback(enrich_details_with_repositories(details), nil)
+  end)
 end
 
 function M.fetch_review_threads(number, opts)

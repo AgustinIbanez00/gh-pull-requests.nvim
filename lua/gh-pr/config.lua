@@ -56,6 +56,16 @@ local defaults = {
       labels = true,
     },
   },
+  cache = {
+    gh_pr = {
+      enabled = true,
+      ttl_seconds = 60,
+      auto_refresh_when_focused = true,
+      max_cache_age_seconds = 900,
+      show_stale_badge = true,
+      sync_visible_buffers = true,
+    },
+  },
   ui = {
     use_neotree = true,
     telescope_fallback = true,
@@ -239,6 +249,39 @@ local function sanitize_overview(overview)
   return result
 end
 
+local function sanitize_cache(cache_options)
+  if type(cache_options) ~= "table" then
+    return vim.deepcopy(defaults.cache)
+  end
+
+  local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.cache), cache_options)
+  result.gh_pr = type(result.gh_pr) == "table" and result.gh_pr or {}
+
+  if type(result.gh_pr.enabled) ~= "boolean" then
+    result.gh_pr.enabled = defaults.cache.gh_pr.enabled
+  end
+
+  result.gh_pr.ttl_seconds = sanitize_positive_integer(result.gh_pr.ttl_seconds, defaults.cache.gh_pr.ttl_seconds)
+  result.gh_pr.max_cache_age_seconds = sanitize_positive_integer(
+    result.gh_pr.max_cache_age_seconds,
+    defaults.cache.gh_pr.max_cache_age_seconds
+  )
+
+  if type(result.gh_pr.auto_refresh_when_focused) ~= "boolean" then
+    result.gh_pr.auto_refresh_when_focused = defaults.cache.gh_pr.auto_refresh_when_focused
+  end
+
+  if type(result.gh_pr.show_stale_badge) ~= "boolean" then
+    result.gh_pr.show_stale_badge = defaults.cache.gh_pr.show_stale_badge
+  end
+
+  if type(result.gh_pr.sync_visible_buffers) ~= "boolean" then
+    result.gh_pr.sync_visible_buffers = defaults.cache.gh_pr.sync_visible_buffers
+  end
+
+  return result
+end
+
 local function sanitize_line_comments(line_comments)
   if type(line_comments) ~= "table" then
     return vim.deepcopy(defaults.line_comments)
@@ -304,6 +347,7 @@ function M.setup(opts)
 
   state.line_comments = sanitize_line_comments(state.line_comments)
   state.overview = sanitize_overview(state.overview)
+  state.cache = sanitize_cache(state.cache)
 
   if type(state.ui) ~= "table" then
     state.ui = vim.deepcopy(defaults.ui)

@@ -1,4 +1,5 @@
 local M = {}
+local unpack_fn = table.unpack or unpack
 
 local function run_with_vim_system(args, opts)
   local object = vim.system(args, {
@@ -45,6 +46,17 @@ local function format_error(args, stderr, stdout)
   return string.format("%s failed: %s", command, message)
 end
 
+local function schedule_callback(callback, ...)
+  if type(callback) ~= "function" then
+    return
+  end
+
+  local args = { ... }
+  vim.schedule(function()
+    callback(unpack_fn(args))
+  end)
+end
+
 function M.run_command(args, opts)
   opts = opts or {}
   local command = vim.deepcopy(args)
@@ -57,6 +69,41 @@ function M.run_command(args, opts)
   return stdout, nil
 end
 
+function M.run_command_async(args, opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  local command = vim.deepcopy(args)
+
+  if vim.system then
+    local ok, async_err = pcall(function()
+      vim.system(command, {
+        text = true,
+        cwd = opts.cwd,
+        stdin = opts.stdin,
+      }, function(object)
+        local code = object.code or 1
+        local stdout = object.stdout or ""
+        local stderr = object.stderr or ""
+        if code ~= 0 then
+          schedule_callback(callback, nil, format_error(command, stderr, stdout))
+          return
+        end
+        schedule_callback(callback, stdout, nil)
+      end)
+    end)
+
+    if not ok then
+      schedule_callback(callback, nil, tostring(async_err))
+    end
+    return
+  end
+
+  vim.schedule(function()
+    local output, err = M.run_command(command, opts)
+    callback(output, err)
+  end)
+end
+
 function M.run(args, opts)
   local command = vim.deepcopy(args)
   if command[1] ~= "gh" then
@@ -64,6 +111,15 @@ function M.run(args, opts)
   end
 
   return M.run_command(command, opts)
+end
+
+function M.run_async(args, opts, callback)
+  local command = vim.deepcopy(args)
+  if command[1] ~= "gh" then
+    table.insert(command, 1, "gh")
+  end
+
+  return M.run_command_async(command, opts, callback)
 end
 
 function M.run_json(args, opts)
@@ -80,6 +136,24 @@ function M.run_json(args, opts)
   return decoded, nil
 end
 
+function M.run_json_async(args, opts, callback)
+  callback = callback or function() end
+  M.run_async(args, opts, function(output, err)
+    if not output then
+      callback(nil, err)
+      return
+    end
+
+    local ok, decoded = pcall(vim.json.decode, output)
+    if not ok then
+      callback(nil, "Failed to decode gh output as JSON")
+      return
+    end
+
+    callback(decoded, nil)
+  end)
+end
+
 function M.run_json_command(args, opts)
   local output, err = M.run_command(args, opts)
   if not output then
@@ -92,6 +166,24 @@ function M.run_json_command(args, opts)
   end
 
   return decoded, nil
+end
+
+function M.run_json_command_async(args, opts, callback)
+  callback = callback or function() end
+  M.run_command_async(args, opts, function(output, err)
+    if not output then
+      callback(nil, err)
+      return
+    end
+
+    local ok, decoded = pcall(vim.json.decode, output)
+    if not ok then
+      callback(nil, "Failed to decode command output as JSON")
+      return
+    end
+
+    callback(decoded, nil)
+  end)
 end
 
 return M

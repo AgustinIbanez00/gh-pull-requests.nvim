@@ -3,16 +3,18 @@ local M = {
   display_name = "GH PR",
 }
 
+local cache_store = require("gh-pr.cache_store")
 local config = require("gh-pr.config")
 local pr_service = require("gh-pr.pr_service")
 local repo = require("gh-pr.repo")
 local runtime_state = require("gh-pr.state")
+local virtual_files = require("gh-pr.virtual_files")
 
 local renderer = require("neo-tree.ui.renderer")
-local manager = require("neo-tree.sources.manager")
 
-local cache = {
-  details_by_pr = {},
+local runtime_cache = {
+  repos = {},
+  last_prune_at = 0,
 }
 
 local DEFAULT_RENDERERS = {
@@ -58,6 +60,162 @@ local DEFAULT_RENDERERS = {
   },
 }
 
+local function now_seconds()
+  return os.time()
+end
+
+local function cache_options()
+  local options = (config.get() or {}).cache or {}
+  local gh_pr_options = type(options.gh_pr) == "table" and options.gh_pr or {}
+  return gh_pr_options
+end
+
+local function cache_enabled()
+  return cache_options().enabled ~= false
+end
+
+local function make_repo_key(repository, git_root)
+  if type(repository) ~= "table" or type(repository.full_name) ~= "string" then
+    return nil
+  end
+
+  local root = type(git_root) == "string" and git_root or ""
+  return repository.full_name .. "::" .. root
+end
+
+local function resolve_repo_context()
+  local repository, repository_err = pr_service.resolve_repository()
+  if not repository then
+    return nil, repository_err
+  end
+
+  local git_root, git_root_err = repo.git_root()
+  if not git_root then
+    git_root = vim.fn.getcwd()
+    if git_root_err then
+      vim.schedule(function()
+        vim.notify("gh-pr cache root fallback: " .. tostring(git_root_err), vim.log.levels.DEBUG)
+      end)
+    end
+  end
+
+  local key = make_repo_key(repository, git_root)
+  if not key then
+    return nil, "Unable to build cache key for repository"
+  end
+
+  return {
+    key = key,
+    repository = repository,
+    git_root = git_root,
+  }, nil
+end
+
+local function session_is_stale(session)
+  local options = cache_options()
+  local max_cache_age = tonumber(options.max_cache_age_seconds) or 0
+  local updated_at = tonumber(session.updated_at) or 0
+
+  if session.last_error and not vim.tbl_isempty(session.query_results or {}) then
+    return true
+  end
+
+  if updated_at <= 0 then
+    return not vim.tbl_isempty(session.query_results or {})
+  end
+
+  if max_cache_age > 0 and (now_seconds() - updated_at) > max_cache_age then
+    return true
+  end
+
+  return false
+end
+
+local function maybe_prune_persisted_cache()
+  if not cache_enabled() then
+    return
+  end
+
+  local options = cache_options()
+  local max_age = tonumber(options.max_cache_age_seconds) or 0
+  if max_age < 1 then
+    return
+  end
+
+  local now = now_seconds()
+  if runtime_cache.last_prune_at > 0 and (now - runtime_cache.last_prune_at) < 60 then
+    return
+  end
+
+  runtime_cache.last_prune_at = now
+  cache_store.prune(max_age, now)
+end
+
+local function new_repo_session(repo_context)
+  return {
+    key = repo_context.key,
+    repository = repo_context.repository,
+    git_root = repo_context.git_root,
+    query_results = {},
+    details_by_pr = {},
+    detail_errors = {},
+    updated_at = 0,
+    loading = false,
+    inflight = false,
+    pending_refresh = false,
+    last_error = nil,
+    stale = false,
+    states = {},
+    loaded_from_disk = false,
+  }
+end
+
+local function ensure_repo_session(repo_context)
+  runtime_cache.repos[repo_context.key] = runtime_cache.repos[repo_context.key] or new_repo_session(repo_context)
+  local session = runtime_cache.repos[repo_context.key]
+
+  session.repository = repo_context.repository
+  session.git_root = repo_context.git_root
+
+  if cache_enabled() and not session.loaded_from_disk then
+    maybe_prune_persisted_cache()
+    local persisted = cache_store.get_repo(repo_context.key)
+    if type(persisted) == "table" then
+      session.query_results = type(persisted.query_results) == "table" and persisted.query_results or {}
+      session.details_by_pr = type(persisted.details_by_pr) == "table" and persisted.details_by_pr or {}
+      session.updated_at = tonumber(persisted.updated_at) or 0
+      session.stale = session_is_stale(session)
+    end
+    session.loaded_from_disk = true
+  end
+
+  return session
+end
+
+local function persist_session(repo_context, session)
+  if not cache_enabled() then
+    return
+  end
+
+  cache_store.set_repo(repo_context.key, {
+    repository_full_name = repo_context.repository.full_name,
+    git_root = repo_context.git_root,
+    updated_at = session.updated_at,
+    query_results = session.query_results,
+    details_by_pr = session.details_by_pr,
+  })
+end
+
+local function register_state(session, state)
+  if type(state) ~= "table" then
+    return
+  end
+
+  local key = tostring(state)
+  session.states[key] = state
+  state.gh_pr_repo_key = session.key
+end
+
 local function repository_full_name(details)
   local repository = details.baseRepository or details.headRepository
   if not repository then
@@ -84,6 +242,24 @@ local function repository_full_name(details)
   end
 
   return owner .. "/" .. name
+end
+
+local function apply_runtime_cache(session)
+  local active_pr, active_details = runtime_state.get_active_pr()
+  if not active_pr or not active_details then
+    return
+  end
+
+  local active_repo = repository_full_name(active_details)
+  if active_repo == "" then
+    return
+  end
+
+  if active_repo ~= session.repository.full_name then
+    return
+  end
+
+  session.details_by_pr[tostring(active_pr.number)] = active_details
 end
 
 local function status_prefix(status)
@@ -235,35 +411,21 @@ local function build_file_nodes(id_prefix, pr, details)
   return build_tree_file_nodes(id_prefix, pr, details)
 end
 
-local function get_details(pr)
-  local key = tostring(pr.number)
-  if cache.details_by_pr[key] then
-    return cache.details_by_pr[key], nil
-  end
-
-  local details, err = pr_service.fetch_details(pr.number)
-  if not details then
-    return nil, err
-  end
-
-  cache.details_by_pr[key] = details
-  return details, nil
-end
-
-local function get_query_node(query, results)
-  local query_prefix = string.format("query:%s", query.id or query.label)
+local function get_query_node(query, results, session, opts)
+  local query_id = tostring(query.id or query.label or "query")
+  local query_prefix = string.format("query:%s", query_id)
   local children = {}
 
   if results.error then
     table.insert(children, {
-      id = "query-error:" .. query.id,
+      id = "query-error:" .. query_id,
       name = "Error: " .. results.error,
       type = "message",
       extra = { kind = "message" },
     })
   elseif vim.tbl_isempty(results.prs) then
     table.insert(children, {
-      id = "query-empty:" .. query.id,
+      id = "query-empty:" .. query_id,
       name = "No pull requests",
       type = "message",
       extra = { kind = "message" },
@@ -271,7 +433,8 @@ local function get_query_node(query, results)
   else
     for _, pr in ipairs(results.prs) do
       local pr_prefix = string.format("%s:pr:%d", query_prefix, pr.number)
-      local details, err = get_details(pr)
+      local details = session.details_by_pr[tostring(pr.number)]
+      local detail_err = session.detail_errors[tostring(pr.number)]
       local pr_children = {
         {
           id = string.format("%s:overview", pr_prefix),
@@ -299,9 +462,16 @@ local function get_query_node(query, results)
           },
         })
       else
+        local message = "Loading files..."
+        if detail_err then
+          message = "Unable to load files: " .. detail_err
+        elseif not session.loading then
+          message = "Files are not available yet"
+        end
+
         table.insert(pr_children, {
           id = string.format("%s:error", pr_prefix),
-          name = "Unable to load files: " .. (err or "unknown error"),
+          name = message,
           type = "message",
           extra = {
             kind = "message",
@@ -325,9 +495,14 @@ local function get_query_node(query, results)
     end
   end
 
+  local stale_suffix = ""
+  if opts.show_stale_badge and session.stale then
+    stale_suffix = " [cached]"
+  end
+
   return {
-    id = "query:" .. query.id,
-    name = string.format("%s (%d)", query.label, #(results.prs or {})),
+    id = "query:" .. query_id,
+    name = string.format("%s (%d)%s", query.label, #(results.prs or {}), stale_suffix),
     type = "query",
     children = children,
     extra = {
@@ -337,9 +512,39 @@ local function get_query_node(query, results)
   }
 end
 
-local function build_nodes()
-  local query_results = pr_service.list_queries_with_results()
+local function build_nodes(session)
+  local query_results = type(session.query_results) == "table" and session.query_results or {}
   local folder_map = {}
+  local nodes = {}
+  local show_stale_badge = cache_options().show_stale_badge ~= false
+
+  if session.last_error then
+    table.insert(nodes, {
+      id = "source-error:" .. session.key,
+      name = "Refresh error: " .. tostring(session.last_error),
+      type = "message",
+      extra = { kind = "message" },
+    })
+  end
+
+  if session.loading and vim.tbl_isempty(query_results) then
+    table.insert(nodes, {
+      id = "source-loading:" .. session.key,
+      name = "Loading pull requests...",
+      type = "message",
+      extra = { kind = "message" },
+    })
+    return nodes
+  end
+
+  if session.stale and show_stale_badge then
+    table.insert(nodes, {
+      id = "source-stale:" .. session.key,
+      name = "Showing cached pull requests while refreshing...",
+      type = "message",
+      extra = { kind = "message" },
+    })
+  end
 
   for _, result in ipairs(query_results) do
     local folder_name = result.query.folder or "General"
@@ -350,20 +555,26 @@ local function build_nodes()
   local folders = vim.tbl_keys(folder_map)
   table.sort(folders)
 
-  local nodes = {}
   for _, folder_name in ipairs(folders) do
     local query_nodes = {}
     for _, result in ipairs(folder_map[folder_name]) do
-      table.insert(query_nodes, get_query_node(result.query, result))
+      table.insert(query_nodes, get_query_node(result.query, result, session, {
+        show_stale_badge = show_stale_badge,
+      }))
     end
 
     table.sort(query_nodes, function(left, right)
       return left.name < right.name
     end)
 
+    local folder_label = folder_name
+    if show_stale_badge and session.stale then
+      folder_label = folder_name .. " [cached]"
+    end
+
     table.insert(nodes, {
       id = "folder:" .. folder_name,
-      name = folder_name,
+      name = folder_label,
       type = "folder",
       children = query_nodes,
       extra = { kind = "folder" },
@@ -384,29 +595,274 @@ local function build_nodes()
   return nodes
 end
 
-local function apply_runtime_cache()
-  local active_pr, active_details = runtime_state.get_active_pr()
-  if active_pr and active_details then
-    cache.details_by_pr[tostring(active_pr.number)] = active_details
+local function render_state(state, session)
+  if type(state) ~= "table" then
+    return false
   end
+
+  local ok = pcall(renderer.show_nodes, build_nodes(session), state)
+  return ok
+end
+
+local function render_repo_states(repo_key)
+  local session = runtime_cache.repos[repo_key]
+  if not session then
+    return
+  end
+
+  for state_key, state in pairs(session.states) do
+    if type(state) ~= "table" or state.gh_pr_repo_key ~= repo_key then
+      session.states[state_key] = nil
+      goto continue
+    end
+
+    local ok = render_state(state, session)
+    if not ok then
+      session.states[state_key] = nil
+    end
+    ::continue::
+  end
+end
+
+local function collect_pr_numbers(query_results)
+  local set = {}
+  local ordered = {}
+
+  for _, result in ipairs(type(query_results) == "table" and query_results or {}) do
+    for _, pr in ipairs(type(result.prs) == "table" and result.prs or {}) do
+      local number = tonumber(pr.number)
+      if number and not set[number] then
+        set[number] = true
+        ordered[#ordered + 1] = number
+      end
+    end
+  end
+
+  table.sort(ordered)
+  return ordered
+end
+
+local function allowed_numbers_from_results(query_results)
+  local allowed = {}
+  for _, result in ipairs(type(query_results) == "table" and query_results or {}) do
+    for _, pr in ipairs(type(result.prs) == "table" and result.prs or {}) do
+      local number = tonumber(pr.number)
+      if number then
+        allowed[tostring(number)] = true
+      end
+    end
+  end
+  return allowed
+end
+
+local function filter_details_map(details_by_pr, allowed)
+  local filtered = {}
+  for number, details in pairs(type(details_by_pr) == "table" and details_by_pr or {}) do
+    local key = tostring(number)
+    if allowed[key] and type(details) == "table" then
+      filtered[key] = details
+    end
+  end
+  return filtered
+end
+
+local start_background_refresh
+
+local function finish_refresh(repo_context, payload)
+  local session = ensure_repo_session(repo_context)
+  session.inflight = false
+  session.loading = false
+
+  if payload.error then
+    session.last_error = payload.error
+    session.stale = session_is_stale(session)
+    render_repo_states(repo_context.key)
+    if session.pending_refresh then
+      session.pending_refresh = false
+      start_background_refresh(repo_context, { force = true })
+    end
+    return
+  end
+
+  session.last_error = nil
+  session.query_results = payload.query_results
+
+  local allowed = allowed_numbers_from_results(payload.query_results)
+  session.details_by_pr = filter_details_map(payload.details_by_pr, allowed)
+  session.detail_errors = type(payload.detail_errors) == "table" and payload.detail_errors or {}
+  session.updated_at = now_seconds()
+
+  apply_runtime_cache(session)
+  session.stale = session_is_stale(session)
+  persist_session(repo_context, session)
+  render_repo_states(repo_context.key)
+
+  if cache_options().sync_visible_buffers ~= false then
+    virtual_files.sync_visible_pr_buffers(session.details_by_pr, {
+      repository = repo_context.repository.full_name,
+    })
+  end
+
+  if session.pending_refresh then
+    session.pending_refresh = false
+    start_background_refresh(repo_context, { force = true })
+  end
+end
+
+start_background_refresh = function(repo_context, opts)
+  opts = opts or {}
+  local session = ensure_repo_session(repo_context)
+
+  if session.inflight then
+    if opts.force then
+      session.pending_refresh = true
+    end
+    return false
+  end
+
+  local ttl = tonumber(cache_options().ttl_seconds) or 60
+  local age = now_seconds() - (tonumber(session.updated_at) or 0)
+  if not opts.force and session.updated_at > 0 and age < ttl and not session_is_stale(session) then
+    return false
+  end
+
+  session.inflight = true
+  session.loading = true
+  session.stale = session_is_stale(session)
+  render_repo_states(repo_context.key)
+
+  pr_service.list_queries_with_results_async(function(query_results, query_err)
+    if not query_results then
+      finish_refresh(repo_context, { error = query_err or "Unable to fetch pull requests" })
+      return
+    end
+
+    local numbers = collect_pr_numbers(query_results)
+    local details_by_pr = vim.deepcopy(session.details_by_pr)
+    local detail_errors = {}
+    local index = 1
+
+    local function next_detail()
+      local number = numbers[index]
+      if not number then
+        finish_refresh(repo_context, {
+          query_results = query_results,
+          details_by_pr = details_by_pr,
+          detail_errors = detail_errors,
+        })
+        return
+      end
+
+      pr_service.fetch_details_async(number, function(details, details_err)
+        local key = tostring(number)
+        if details then
+          details_by_pr[key] = details
+          detail_errors[key] = nil
+        else
+          detail_errors[key] = details_err or "Unable to fetch PR details"
+        end
+
+        index = index + 1
+        next_detail()
+      end)
+    end
+
+    next_detail()
+  end, {
+    repository = repo_context.repository,
+  })
+
+  return true
+end
+
+local function show_message(state, id, message)
+  renderer.show_nodes({
+    {
+      id = id,
+      name = message,
+      type = "message",
+      extra = { kind = "message" },
+    },
+  }, state)
 end
 
 M.navigate = function(state, path)
   if not repo.ensure_git_repo() then
-    renderer.show_nodes({
-      {
-        id = "not-git",
-        name = "Open a git repository to use gh-pr",
-        type = "message",
-        extra = { kind = "message" },
-      },
-    }, state)
+    show_message(state, "not-git", "Open a git repository to use gh-pr")
+    return
+  end
+
+  local repo_context, context_err = resolve_repo_context()
+  if not repo_context then
+    show_message(state, "repo-error", "Unable to resolve repository: " .. tostring(context_err))
     return
   end
 
   state.path = path or vim.fn.getcwd()
-  apply_runtime_cache()
-  renderer.show_nodes(build_nodes(), state)
+  local session = ensure_repo_session(repo_context)
+  register_state(session, state)
+  apply_runtime_cache(session)
+  session.stale = session_is_stale(session)
+
+  start_background_refresh(repo_context, { force = false })
+  render_state(state, session)
+end
+
+function M.request_refresh(state, opts)
+  opts = opts or {}
+  if not repo.in_git_repo() then
+    return false
+  end
+
+  local repo_context, context_err = resolve_repo_context()
+  if not repo_context then
+    if opts.notify_error ~= false then
+      vim.notify("Unable to resolve repository: " .. tostring(context_err), vim.log.levels.ERROR)
+    end
+    return false
+  end
+
+  local session = ensure_repo_session(repo_context)
+  if state then
+    register_state(session, state)
+  end
+
+  return start_background_refresh(repo_context, {
+    force = opts.force == true,
+  })
+end
+
+function M.refresh_if_focused()
+  local options = cache_options()
+  if options.auto_refresh_when_focused == false then
+    return
+  end
+
+  local winid = vim.api.nvim_get_current_win()
+  if not winid or not vim.api.nvim_win_is_valid(winid) then
+    return
+  end
+
+  local bufnr = vim.api.nvim_win_get_buf(winid)
+  local filetype = vim.api.nvim_get_option_value("filetype", { buf = bufnr })
+  if filetype ~= "neo-tree" then
+    return
+  end
+
+  if vim.b[bufnr].neo_tree_source ~= "gh_pr" then
+    return
+  end
+
+  local state = nil
+  local manager_ok, manager = pcall(require, "neo-tree.sources.manager")
+  if manager_ok and type(manager.get_state_for_window) == "function" then
+    local ok, resolved_state = pcall(manager.get_state_for_window, winid)
+    if ok then
+      state = resolved_state
+    end
+  end
+
+  M.request_refresh(state, { force = false, notify_error = false })
 end
 
 M.setup = function(source_config, _)

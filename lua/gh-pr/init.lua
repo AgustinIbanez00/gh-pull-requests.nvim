@@ -5,6 +5,9 @@ local config = require("gh-pr.config")
 local queries = require("gh-pr.queries")
 local repo = require("gh-pr.repo")
 local runtime_state = require("gh-pr.state")
+local uv = vim.uv or vim.loop
+
+local auto_refresh_timer = nil
 
 local function notify_error(message)
   vim.notify(message, vim.log.levels.ERROR)
@@ -158,11 +161,52 @@ local function open_comments_view(number)
 end
 
 local function refresh_views()
+  local source_ok, source = pcall(require, "gh-pr.neotree.source")
+  if source_ok and type(source.request_refresh) == "function" then
+    pcall(source.request_refresh, nil, { force = true, notify_error = false })
+  end
+
   local manager_ok, manager = pcall(require, "neo-tree.sources.manager")
   if manager_ok then
-    pcall(manager.refresh, "gh_pr")
     pcall(manager.refresh, "gh_pr_comments")
   end
+end
+
+local function stop_auto_refresh_timer()
+  if auto_refresh_timer then
+    auto_refresh_timer:stop()
+    auto_refresh_timer:close()
+    auto_refresh_timer = nil
+  end
+end
+
+local function start_auto_refresh_timer()
+  stop_auto_refresh_timer()
+
+  local cache_options = (((config.get() or {}).cache or {}).gh_pr or {})
+  if cache_options.auto_refresh_when_focused == false then
+    return
+  end
+
+  local interval = tonumber(cache_options.ttl_seconds) or 60
+  interval = math.max(1, math.floor(interval))
+
+  if not uv or type(uv.new_timer) ~= "function" then
+    return
+  end
+
+  auto_refresh_timer = uv.new_timer()
+  if not auto_refresh_timer then
+    return
+  end
+
+  local interval_ms = interval * 1000
+  auto_refresh_timer:start(interval_ms, interval_ms, vim.schedule_wrap(function()
+    local source_ok, source = pcall(require, "gh-pr.neotree.source")
+    if source_ok and type(source.refresh_if_focused) == "function" then
+      source.refresh_if_focused()
+    end
+  end))
 end
 
 local function prompt(text, default)
@@ -253,6 +297,13 @@ function M.setup(opts)
   config.setup(opts or {})
   runtime_state.setup()
   queries.setup((opts or {}).queries ~= nil)
+  start_auto_refresh_timer()
+
+  local group = vim.api.nvim_create_augroup("GhPrAutoRefresh", { clear = true })
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = group,
+    callback = stop_auto_refresh_timer,
+  })
 end
 
 function M.open_pull_requests()

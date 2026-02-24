@@ -536,4 +536,133 @@ function M.open_commit_patch(details, pr, commit, opts)
   return patch_buf, nil
 end
 
+local function find_file_in_details(details, path)
+  if type(path) ~= "string" or path == "" then
+    return nil
+  end
+
+  for _, file in ipairs(type(details.files) == "table" and details.files or {}) do
+    if file.path == path
+      or file.filename == path
+      or file.previousFilename == path
+      or file.previous_filename == path then
+      return file
+    end
+  end
+
+  return nil
+end
+
+local function safe_set_buffer_name(bufnr, name)
+  if type(name) ~= "string" or name == "" then
+    return false
+  end
+
+  local current_name = vim.api.nvim_buf_get_name(bufnr)
+  if current_name == name then
+    return true
+  end
+
+  local existing = vim.fn.bufnr(name)
+  if type(existing) == "number" and existing > 0 and existing ~= bufnr and vim.api.nvim_buf_is_valid(existing) then
+    return false
+  end
+
+  local ok = pcall(vim.api.nvim_buf_set_name, bufnr, name)
+  return ok
+end
+
+local function update_virtual_buffer(bufnr, details, number, kind, path)
+  local file = find_file_in_details(details, path)
+  if not file then
+    return false, "missing-file"
+  end
+
+  local pr = { number = number }
+  local data, err = read_base_and_head(details, pr, file)
+  if not data then
+    return false, err
+  end
+
+  if data.patch_only then
+    return false, "patch-only"
+  end
+
+  local repository = data.repo or resolve_base_repository(details)
+  local next_path
+  local content
+  if kind == "base" then
+    next_path = data.base_path
+    content = data.base_content or ""
+  else
+    next_path = data.head_path
+    content = data.head_content or ""
+  end
+
+  if type(next_path) ~= "string" or next_path == "" then
+    return false, "missing-file"
+  end
+
+  local lines = vim.split(content, "\n", { plain = true })
+  set_buffer_content(bufnr, lines)
+
+  local filetype = vim.filetype.match({ filename = next_path }) or ""
+  vim.api.nvim_buf_set_option(bufnr, "filetype", filetype)
+  vim.b[bufnr].gh_pr_path = next_path
+
+  if repository then
+    vim.b[bufnr].gh_pr_repo = repository.full_name
+    local uri = virtual_uri(kind, repository, number, next_path)
+    safe_set_buffer_name(bufnr, uri)
+  end
+
+  return true, nil
+end
+
+local function remove_buffer(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+end
+
+function M.sync_visible_pr_buffers(details_by_pr, opts)
+  opts = opts or {}
+  local repository_filter = type(opts.repository) == "string" and opts.repository or nil
+  local removed = {}
+
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
+      local number = vim.b[bufnr].gh_pr_number
+      local kind = vim.b[bufnr].gh_pr_file_kind
+      local path = vim.b[bufnr].gh_pr_path
+      local repository = vim.b[bufnr].gh_pr_repo
+
+      if type(number) == "number"
+        and (kind == "base" or kind == "head")
+        and type(path) == "string"
+        and path ~= "" then
+        if not repository_filter or repository_filter == repository then
+          local details = details_by_pr[tostring(number)]
+          if type(details) == "table" then
+            local updated, update_err = update_virtual_buffer(bufnr, details, number, kind, path)
+            if not updated and update_err == "missing-file" then
+              removed[#removed + 1] = string.format("PR #%d %s", number, path)
+              remove_buffer(bufnr)
+            end
+          end
+        end
+      end
+    end
+  end
+
+  if #removed > 0 then
+    vim.notify(
+      string.format("gh-pr: closed %d virtual buffer(s) because files were removed from the PR", #removed),
+      vim.log.levels.INFO
+    )
+  end
+end
+
 return M

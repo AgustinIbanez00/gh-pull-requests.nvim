@@ -199,6 +199,26 @@ local function resolve_pr_number(number)
   return nil
 end
 
+local function has_full_pr_details(details)
+  if type(details) ~= "table" then
+    return false
+  end
+
+  if type(details.files) == "table" then
+    return true
+  end
+
+  if type(details.baseRepository) == "table" or type(details.headRepository) == "table" then
+    return true
+  end
+
+  if type(details.body) == "string" then
+    return true
+  end
+
+  return false
+end
+
 local function resolve_active_pr(number, opts)
   opts = opts or {}
   local target = resolve_pr_number(number)
@@ -207,7 +227,11 @@ local function resolve_active_pr(number, opts)
   end
 
   local active_pr, active_details = state.get_active_pr()
-  if active_pr and active_pr.number == target and active_details and opts.refresh ~= true then
+  if active_pr
+    and active_pr.number == target
+    and active_details
+    and opts.refresh ~= true
+    and has_full_pr_details(active_details) then
     return active_pr, active_details, nil
   end
 

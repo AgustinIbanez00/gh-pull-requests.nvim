@@ -1,6 +1,6 @@
 local actions = require("gh-pr.actions")
 local cc = require("neo-tree.sources.common.commands")
-local manager = require("neo-tree.sources.manager")
+local source = require("gh-pr.neotree.source")
 
 local M = {}
 
@@ -17,8 +17,8 @@ local function apply_context(node)
     return
   end
 
-  if node.extra.pr and node.extra.details then
-    actions.set_active_pr(node.extra.pr, node.extra.details)
+  if node.extra.pr then
+    actions.set_active_pr(node.extra.pr, node.extra.details or node.extra.pr)
   end
 
   if node.extra.file then
@@ -37,7 +37,7 @@ end
 M.noop = function() end
 
 M.refresh = function(state)
-  manager.refresh("gh_pr", state)
+  source.request_refresh(state, { force = true })
 end
 
 M.gh_pr_open = function(state)
