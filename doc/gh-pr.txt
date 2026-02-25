@@ -117,6 +117,7 @@ Overview buffer keymaps:
       `q` quick close
       `Q` close diff view(s) and open PR Review
       `,dw` toggle whitespace diff mode (ignored/strict)
+      `,dt` toggle whitespace/tab symbol rendering
       `,dm` cycle diff mode
       `,dv` force vertical split mode
       `,dh` force horizontal split mode
@@ -135,6 +136,8 @@ Overview buffer keymaps:
       `,F` previous file
       `,v` next reviewed file
       `,V` previous reviewed file
+      file navigation always reopens full diff view using current render mode
+      (`vertical`/`horizontal`/`unified`)
       `,rs` submit pending review as comment
       `,ra` submit pending review as approve
       `,rr` submit pending review as request changes
@@ -277,7 +280,15 @@ Call `require("gh-pr").setup({ ... })` with:
 - `cache.gh_pr_review.sync_visible_buffers` (`true`)
 - `diff_view.mode` (`"vertical"`, also `"horizontal"` / `"unified"`)
 - `diff_view.ignore_whitespace` (`false`)
+- `diff_view.render_whitespace` (`true`)
+- `diff_view.whitespace.tab` (`">-"`, tab marker in `listchars`)
+- `diff_view.whitespace.space` (`"."`, space marker in `listchars`)
+- `diff_view.whitespace.trail` (`"~"`, trailing space marker)
+- `diff_view.whitespace.nbsp` (`"+"`, non-breaking space marker)
+- `diff_view.whitespace.color` (`nil`, optional highlight color e.g. `#7f8ea3`)
+- `diff_view.whitespace.highlight_group` (`"GhPrDiffWhitespace"`)
 - `diff_view.shortcuts.toggle_whitespace` (`",dw"`)
+- `diff_view.shortcuts.toggle_render_whitespace` (`",dt"`)
 - `diff_view.shortcuts.cycle_mode` (`",dm"`)
 - `diff_view.shortcuts.set_vertical` (`",dv"`)
 - `diff_view.shortcuts.set_horizontal` (`",dh"`)
@@ -291,6 +302,6 @@ Persistence
 
 - Queries: `stdpath("state")/gh-pr/queries.json`
 - Viewed files: `stdpath("state")/gh-pr/state.json`
-- Diff view prefs (`mode`, `ignore_whitespace`): `stdpath("state")/gh-pr/state.json`
+- Diff view prefs (`mode`, `ignore_whitespace`, `render_whitespace`): `stdpath("state")/gh-pr/state.json`
 - PR cache: `stdpath("state")/gh-pr/pr_cache.json`
 - Cache is stored per source/repo key (`gh_pr` and `gh_pr_review`).

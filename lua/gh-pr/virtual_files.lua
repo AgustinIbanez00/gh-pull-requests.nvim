@@ -7,6 +7,7 @@ local state = require("gh-pr.state")
 
 local base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 local unified_highlight_ns = vim.api.nvim_create_namespace("gh-pr-unified-diff")
+local unified_syntax_ns = vim.api.nvim_create_namespace("gh-pr-unified-syntax")
 
 local function decode_base64_fallback(data)
   data = data:gsub("[^" .. base64_chars .. "=]", "")
@@ -343,9 +344,21 @@ end
 
 local function resolve_configured_diff_view()
   local options = (config.get() or {}).diff_view or {}
+  local whitespace = type(options.whitespace) == "table" and options.whitespace or {}
   return {
     mode = normalize_diff_mode(options.mode, "vertical"),
     ignore_whitespace = options.ignore_whitespace == true,
+    render_whitespace = options.render_whitespace ~= false,
+    whitespace = {
+      tab = type(whitespace.tab) == "string" and whitespace.tab ~= "" and whitespace.tab or ">-",
+      space = type(whitespace.space) == "string" and whitespace.space ~= "" and whitespace.space or ".",
+      trail = type(whitespace.trail) == "string" and whitespace.trail ~= "" and whitespace.trail or "~",
+      nbsp = type(whitespace.nbsp) == "string" and whitespace.nbsp ~= "" and whitespace.nbsp or "+",
+      color = type(whitespace.color) == "string" and whitespace.color ~= "" and whitespace.color or nil,
+      highlight_group = type(whitespace.highlight_group) == "string" and whitespace.highlight_group ~= ""
+          and whitespace.highlight_group
+        or "GhPrDiffWhitespace",
+    },
     shortcuts = type(options.shortcuts) == "table" and options.shortcuts or {},
   }
 end
@@ -355,6 +368,9 @@ local function resolve_diff_view_shortcuts()
   local shortcuts = configured.shortcuts
   return {
     toggle_whitespace = type(shortcuts.toggle_whitespace) == "string" and shortcuts.toggle_whitespace or ",dw",
+    toggle_render_whitespace = type(shortcuts.toggle_render_whitespace) == "string"
+        and shortcuts.toggle_render_whitespace
+      or ",dt",
     cycle_mode = type(shortcuts.cycle_mode) == "string" and shortcuts.cycle_mode or ",dm",
     set_vertical = type(shortcuts.set_vertical) == "string" and shortcuts.set_vertical or ",dv",
     set_horizontal = type(shortcuts.set_horizontal) == "string" and shortcuts.set_horizontal or ",dh",
@@ -368,6 +384,8 @@ function M.resolve_diff_view_options(overrides)
   local options = vim.tbl_deep_extend("force", configured, type(persisted) == "table" and persisted or {})
   options.mode = normalize_diff_mode(options.mode, configured.mode)
   options.ignore_whitespace = options.ignore_whitespace == true
+  options.render_whitespace = options.render_whitespace ~= false
+  options.whitespace = type(options.whitespace) == "table" and options.whitespace or configured.whitespace
 
   if type(overrides) == "table" then
     if overrides.view_mode ~= nil then
@@ -375,6 +393,9 @@ function M.resolve_diff_view_options(overrides)
     end
     if type(overrides.ignore_whitespace) == "boolean" then
       options.ignore_whitespace = overrides.ignore_whitespace
+    end
+    if type(overrides.render_whitespace) == "boolean" then
+      options.render_whitespace = overrides.render_whitespace
     end
   end
 
@@ -423,6 +444,14 @@ local function set_pr_buffer_keymaps(bufnr)
       diff_shortcuts.toggle_whitespace,
       call_action("toggle_diff_whitespace"),
       vim.tbl_extend("force", opts, { desc = "Toggle whitespace diff mode" })
+    )
+  end
+  if diff_shortcuts.toggle_render_whitespace ~= "" then
+    vim.keymap.set(
+      "n",
+      diff_shortcuts.toggle_render_whitespace,
+      call_action("toggle_diff_render_whitespace"),
+      vim.tbl_extend("force", opts, { desc = "Toggle whitespace/tab rendering" })
     )
   end
   if diff_shortcuts.cycle_mode ~= "" then
@@ -504,6 +533,139 @@ local function apply_line_highlights(bufnr, highlights)
   end
 end
 
+local function resolve_path_filetype(path)
+  if type(path) ~= "string" or path == "" then
+    return ""
+  end
+
+  return vim.filetype.match({ filename = path }) or ""
+end
+
+local function resolve_treesitter_lang(filetype)
+  if type(filetype) ~= "string" or filetype == "" then
+    return nil
+  end
+
+  if vim.treesitter
+    and vim.treesitter.language
+    and type(vim.treesitter.language.get_lang) == "function" then
+    local ok, mapped = pcall(vim.treesitter.language.get_lang, filetype)
+    if ok and type(mapped) == "string" and mapped ~= "" then
+      return mapped
+    end
+  end
+
+  return filetype
+end
+
+local function resolve_capture_group(capture_name, lang)
+  if type(capture_name) ~= "string" or capture_name == "" then
+    return nil
+  end
+
+  local candidates = {}
+  if type(lang) == "string" and lang ~= "" then
+    candidates[#candidates + 1] = "@" .. capture_name .. "." .. lang
+  end
+  candidates[#candidates + 1] = "@" .. capture_name
+
+  for _, group in ipairs(candidates) do
+    if vim.fn.hlexists(group) == 1 then
+      return group
+    end
+  end
+
+  return nil
+end
+
+local function apply_unified_syntax_highlights(bufnr, path, line_map)
+  vim.api.nvim_buf_clear_namespace(bufnr, unified_syntax_ns, 0, -1)
+
+  if type(line_map) ~= "table" then
+    return
+  end
+  if not vim.treesitter or type(vim.treesitter.get_string_parser) ~= "function" then
+    return
+  end
+  if not vim.treesitter.query or type(vim.treesitter.query.get) ~= "function" then
+    return
+  end
+
+  local filetype = resolve_path_filetype(path)
+  if filetype == "" then
+    return
+  end
+
+  local lang = resolve_treesitter_lang(filetype)
+  if not lang then
+    return
+  end
+
+  local ok_query, query = pcall(vim.treesitter.query.get, lang, "highlights")
+  if not ok_query or not query then
+    return
+  end
+
+  local rendered_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local source_lines = {}
+  local source_to_buffer_line = {}
+  for rendered_index = 1, #rendered_lines do
+    local meta = line_map[rendered_index]
+    if type(meta) == "table" and (meta.kind == "context" or meta.kind == "add") then
+      local text = rendered_lines[rendered_index] or ""
+      source_lines[#source_lines + 1] = #text >= 2 and text:sub(3) or ""
+      source_to_buffer_line[#source_lines] = rendered_index
+    end
+  end
+
+  if #source_lines == 0 then
+    return
+  end
+  if #source_lines > 5000 then
+    return
+  end
+
+  local source_text = table.concat(source_lines, "\n")
+  local ok_parser, parser = pcall(vim.treesitter.get_string_parser, source_text, lang)
+  if not ok_parser or not parser then
+    return
+  end
+
+  local ok_parse, trees = pcall(parser.parse, parser)
+  if not ok_parse or type(trees) ~= "table" then
+    return
+  end
+
+  for _, tree in ipairs(trees) do
+    local root = tree and tree:root() or nil
+    if root then
+      for capture_id, node in query:iter_captures(root, source_text, 0, -1) do
+        local capture_name = query.captures[capture_id]
+        local group = resolve_capture_group(capture_name, lang)
+        if group then
+          local row_start, col_start, row_end, col_end = node:range()
+          for source_row = row_start, row_end do
+            local buffer_line = source_to_buffer_line[source_row + 1]
+            if buffer_line then
+              local start_col = source_row == row_start and col_start or 0
+              local end_col = source_row == row_end and col_end or -1
+              pcall(
+                vim.api.nvim_buf_add_highlight,
+                bufnr,
+                unified_syntax_ns,
+                group,
+                buffer_line - 1,
+                math.max(0, start_col + 2),
+                end_col >= 0 and (end_col + 2) or -1
+              )
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
 local function open_buffer(content, path, kind, details, pr, repo_override, comment_ctx, canonical_path, buffer_opts)
   buffer_opts = type(buffer_opts) == "table" and buffer_opts or {}
   local repository = repo_override or resolve_base_repository(details)
@@ -533,7 +695,7 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
   local bufnr = existing or vim.api.nvim_create_buf(true, true)
   local lines = vim.split(content, "\n", { plain = true })
   local ft = type(buffer_opts.filetype) == "string" and buffer_opts.filetype
-    or ((kind == "patch" or kind == "unified") and "diff" or (vim.filetype.match({ filename = path }) or ""))
+    or ((kind == "patch" or kind == "unified") and "diff" or resolve_path_filetype(path))
 
   set_buffer_content(bufnr, lines)
 
@@ -585,6 +747,11 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
 
   if type(buffer_opts.unified_line_map) == "table" then
     vim.b[bufnr].gh_pr_unified_line_map = buffer_opts.unified_line_map
+  end
+  if kind == "unified" then
+    apply_unified_syntax_highlights(bufnr, canonical ~= "" and canonical or path, vim.b[bufnr].gh_pr_unified_line_map)
+  else
+    vim.api.nvim_buf_clear_namespace(bufnr, unified_syntax_ns, 0, -1)
   end
 
   set_pr_buffer_keymaps(bufnr)
@@ -929,6 +1096,82 @@ local function apply_window_diffopt(winid, ignore_whitespace)
   pcall(vim.api.nvim_set_option_value, "diffopt", table.concat(entries, ","), { win = winid })
 end
 
+local function apply_window_whitespace_render(winid, enabled)
+  if type(winid) ~= "number" or winid < 1 or not vim.api.nvim_win_is_valid(winid) then
+    return
+  end
+
+  local diff_view = resolve_configured_diff_view()
+  local whitespace = diff_view.whitespace or {}
+  local token_tab = whitespace.tab or ">-"
+  local token_space = whitespace.space or "."
+  local token_trail = whitespace.trail or "~"
+  local token_nbsp = whitespace.nbsp or "+"
+
+  pcall(vim.api.nvim_set_option_value, "list", enabled == true, { win = winid })
+
+  local winvars = vim.w[winid]
+  local previous_winhl = winvars.gh_pr_whitespace_prev_winhl
+  local group = type(whitespace.highlight_group) == "string" and whitespace.highlight_group ~= ""
+      and whitespace.highlight_group
+    or nil
+  local color = type(whitespace.color) == "string" and whitespace.color ~= "" and whitespace.color or nil
+
+  if enabled then
+    local listchars = string.format("tab:%s,trail:%s,nbsp:%s,space:%s", token_tab, token_trail, token_nbsp, token_space)
+    pcall(vim.api.nvim_set_option_value, "listchars", listchars, { win = winid })
+
+    if group then
+      if color then
+        pcall(vim.api.nvim_set_hl, 0, group, { fg = color, nocombine = true })
+      elseif group ~= "Whitespace" and vim.fn.hlexists(group) == 0 then
+        pcall(vim.api.nvim_set_hl, 0, group, { link = "Whitespace", default = true })
+      end
+
+      local current_winhl = vim.api.nvim_get_option_value("winhl", { win = winid }) or ""
+      if winvars.gh_pr_whitespace_prev_winhl == nil then
+        winvars.gh_pr_whitespace_prev_winhl = current_winhl
+      end
+
+      local entries = {}
+      local has_mapping = false
+      for item in tostring(current_winhl):gmatch("[^,]+") do
+        if not item:match("^Whitespace:") then
+          entries[#entries + 1] = item
+        else
+          has_mapping = true
+        end
+      end
+      entries[#entries + 1] = "Whitespace:" .. group
+      if has_mapping or current_winhl == "" or not current_winhl:find("Whitespace:", 1, true) then
+        pcall(vim.api.nvim_set_option_value, "winhl", table.concat(entries, ","), { win = winid })
+      end
+    end
+  elseif previous_winhl ~= nil then
+    pcall(vim.api.nvim_set_option_value, "winhl", previous_winhl, { win = winid })
+    winvars.gh_pr_whitespace_prev_winhl = nil
+  end
+end
+
+local function clear_diff_window_state(winid)
+  if type(winid) ~= "number" or winid < 1 or not vim.api.nvim_win_is_valid(winid) then
+    return
+  end
+
+  pcall(vim.api.nvim_set_option_value, "diff", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "scrollbind", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "cursorbind", false, { win = winid })
+end
+
+local function apply_diff_window_sync(base_win, head_win)
+  for _, winid in ipairs({ base_win, head_win }) do
+    if type(winid) == "number" and winid > 0 and vim.api.nvim_win_is_valid(winid) then
+      pcall(vim.api.nvim_set_option_value, "scrollbind", true, { win = winid })
+      pcall(vim.api.nvim_set_option_value, "cursorbind", true, { win = winid })
+    end
+  end
+end
+
 function M.open_original(details, pr, file, opts)
   opts = opts or {}
   local data, err = read_base_and_head(details, pr, file)
@@ -1047,8 +1290,9 @@ function M.open_diff(details, pr, file, opts)
       }
     )
 
-    pcall(vim.api.nvim_set_option_value, "diff", false, { win = target_win })
+    clear_diff_window_state(target_win)
     vim.api.nvim_win_set_buf(target_win, single_buf)
+    apply_window_whitespace_render(target_win, diff_view.render_whitespace)
     pcall(vim.api.nvim_set_current_win, target_win)
     return {
       single_buf = single_buf,
@@ -1093,8 +1337,9 @@ function M.open_diff(details, pr, file, opts)
         file_mode = "unified",
       }
     )
-    pcall(vim.api.nvim_set_option_value, "diff", false, { win = target_win })
+    clear_diff_window_state(target_win)
     vim.api.nvim_win_set_buf(target_win, unified_buf)
+    apply_window_whitespace_render(target_win, diff_view.render_whitespace)
     pcall(vim.api.nvim_set_current_win, target_win)
     return { unified_buf = unified_buf, mode = mode }, nil
   end
@@ -1189,6 +1434,9 @@ function M.open_diff(details, pr, file, opts)
   vim.cmd("diffthis")
   apply_window_diffopt(target_win, diff_view.ignore_whitespace)
   apply_window_diffopt(head_win, diff_view.ignore_whitespace)
+  apply_window_whitespace_render(target_win, diff_view.render_whitespace)
+  apply_window_whitespace_render(head_win, diff_view.render_whitespace)
+  apply_diff_window_sync(target_win, head_win)
   pcall(vim.api.nvim_set_current_win, target_win)
 
   return { base_buf = base_buf, head_buf = head_buf, mode = mode, file_mode = "diff_pair" }, nil
@@ -1309,7 +1557,7 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
   set_buffer_content(bufnr, lines)
   apply_line_highlights(bufnr, line_highlights)
 
-  local filetype = kind == "unified" and "diff" or (vim.filetype.match({ filename = next_path }) or "")
+  local filetype = kind == "unified" and "diff" or resolve_path_filetype(next_path)
   vim.api.nvim_buf_set_option(bufnr, "filetype", filetype)
   vim.b[bufnr].gh_pr_path = next_path
   local canonical_path = normalize_path(file.path or file.filename)
@@ -1318,6 +1566,9 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
   vim.b[bufnr].gh_pr_unified_line_map = nil
   if kind == "unified" and type(unified_line_map) == "table" then
     vim.b[bufnr].gh_pr_unified_line_map = unified_line_map
+    apply_unified_syntax_highlights(bufnr, canonical_path ~= "" and canonical_path or next_path, unified_line_map)
+  else
+    vim.api.nvim_buf_clear_namespace(bufnr, unified_syntax_ns, 0, -1)
   end
 
   if repository then

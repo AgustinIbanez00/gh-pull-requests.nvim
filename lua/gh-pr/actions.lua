@@ -213,6 +213,9 @@ local function diff_view_shortcuts()
   local shortcuts = type(diff_view.shortcuts) == "table" and diff_view.shortcuts or {}
   return {
     toggle_whitespace = type(shortcuts.toggle_whitespace) == "string" and shortcuts.toggle_whitespace or ",dw",
+    toggle_render_whitespace = type(shortcuts.toggle_render_whitespace) == "string"
+        and shortcuts.toggle_render_whitespace
+      or ",dt",
     cycle_mode = type(shortcuts.cycle_mode) == "string" and shortcuts.cycle_mode or ",dm",
     set_vertical = type(shortcuts.set_vertical) == "string" and shortcuts.set_vertical or ",dv",
     set_horizontal = type(shortcuts.set_horizontal) == "string" and shortcuts.set_horizontal or ",dh",
@@ -226,10 +229,12 @@ local function current_diff_view_preferences(overrides)
   local prefs = vim.tbl_deep_extend("force", {
     mode = normalize_diff_view_mode(config_defaults.mode),
     ignore_whitespace = config_defaults.ignore_whitespace == true,
+    render_whitespace = config_defaults.render_whitespace ~= false,
   }, type(persisted) == "table" and persisted or {})
 
   prefs.mode = normalize_diff_view_mode(prefs.mode)
   prefs.ignore_whitespace = prefs.ignore_whitespace == true
+  prefs.render_whitespace = prefs.render_whitespace ~= false
 
   if type(overrides) == "table" then
     if overrides.mode ~= nil then
@@ -237,6 +242,9 @@ local function current_diff_view_preferences(overrides)
     end
     if type(overrides.ignore_whitespace) == "boolean" then
       prefs.ignore_whitespace = overrides.ignore_whitespace
+    end
+    if type(overrides.render_whitespace) == "boolean" then
+      prefs.render_whitespace = overrides.render_whitespace
     end
   end
 
@@ -247,6 +255,7 @@ local function persist_diff_view_preferences(prefs)
   local sanitized = {
     mode = normalize_diff_view_mode(prefs and prefs.mode),
     ignore_whitespace = prefs and prefs.ignore_whitespace == true,
+    render_whitespace = not (prefs and prefs.render_whitespace == false),
   }
   if type(state.set_diff_view_prefs) == "function" then
     state.set_diff_view_prefs(sanitized)
@@ -1911,12 +1920,14 @@ function M.open_diff(file, opts)
   local diff_view = current_diff_view_preferences({
     mode = opts.view_mode,
     ignore_whitespace = opts.ignore_whitespace,
+    render_whitespace = opts.render_whitespace,
   })
 
   local diff_result, diff_err = virtual_files.open_diff(details, pr, selected_file, {
     line_comments = comments_ctx,
     view_mode = diff_view.mode,
     ignore_whitespace = diff_view.ignore_whitespace,
+    render_whitespace = diff_view.render_whitespace,
     new_tab = opts.new_tab,
   })
   if diff_err then
@@ -2005,12 +2016,14 @@ local function reopen_current_diff_with_preferences_impl(opts)
   local diff_view = current_diff_view_preferences({
     mode = opts.view_mode,
     ignore_whitespace = opts.ignore_whitespace,
+    render_whitespace = opts.render_whitespace,
   })
 
   local _, open_err = virtual_files.open_diff(details, pr, selected_file, {
     line_comments = comments_ctx,
     view_mode = diff_view.mode,
     ignore_whitespace = diff_view.ignore_whitespace,
+    render_whitespace = diff_view.render_whitespace,
     new_tab = opts.new_tab,
   })
   if open_err then
@@ -2161,46 +2174,6 @@ local function ordered_pr_files(details)
   return entries
 end
 
-local function current_navigation_mode()
-  local kind = vim.b.gh_pr_file_kind
-  if kind == "unified" then
-    return "unified"
-  end
-
-  if vim.wo.diff then
-    return "diff"
-  end
-
-  if kind == "base" then
-    return "base"
-  end
-  if kind == "head" then
-    return "head"
-  end
-
-  return "head"
-end
-
-local function find_diff_pair_windows()
-  local tab = vim.api.nvim_get_current_tabpage()
-  local base_win, head_win
-
-  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
-    local ok_diff, is_diff = pcall(vim.api.nvim_get_option_value, "diff", { win = winid })
-    if ok_diff and is_diff then
-      local bufnr = vim.api.nvim_win_get_buf(winid)
-      local kind = vim.b[bufnr].gh_pr_file_kind
-      if kind == "base" and not base_win then
-        base_win = winid
-      elseif kind == "head" and not head_win then
-        head_win = winid
-      end
-    end
-  end
-
-  return base_win, head_win
-end
-
 find_diff_pair_windows_for_current_file = function()
   local tab = vim.api.nvim_get_current_tabpage()
   local base_win, head_win
@@ -2269,32 +2242,6 @@ open_review_tree_after_close = function()
   end
 end
 
-local function open_diff_in_place(file)
-  local base_win, head_win = find_diff_pair_windows()
-  if not valid_window(base_win) or not valid_window(head_win) then
-    return false
-  end
-
-  local origin = vim.api.nvim_get_current_win()
-  if not pcall(vim.api.nvim_set_current_win, base_win) then
-    return false
-  end
-  M.open_original(file)
-
-  if not pcall(vim.api.nvim_set_current_win, head_win) then
-    if valid_window(origin) then
-      pcall(vim.api.nvim_set_current_win, origin)
-    end
-    return false
-  end
-  M.open_modified(file)
-
-  if valid_window(origin) then
-    pcall(vim.api.nvim_set_current_win, origin)
-  end
-  return true
-end
-
 local function file_matches_filter(entry, repository, pr_number, reviewed_only)
   if not reviewed_only then
     return true
@@ -2349,26 +2296,14 @@ local function pick_next_file(details, pr, step, reviewed_only)
   return nil, "Unable to resolve next file in PR"
 end
 
-local function open_file_for_navigation(file, mode)
-  if mode == "base" then
-    M.open_original(file)
-    return
-  end
-
-  if mode == "diff" then
-    if open_diff_in_place(file) then
-      return
-    end
-    M.open_diff(file)
-    return
-  end
-
-  if mode == "unified" then
-    M.open_diff(file, { new_tab = false, view_mode = "unified" })
-    return
-  end
-
-  M.open_modified(file)
+local function open_file_for_navigation(file)
+  local diff_view = current_diff_view_preferences()
+  M.open_diff(file, {
+    new_tab = false,
+    view_mode = diff_view.mode,
+    ignore_whitespace = diff_view.ignore_whitespace,
+    render_whitespace = diff_view.render_whitespace,
+  })
 end
 
 local function navigate_files(step, reviewed_only)
@@ -2382,7 +2317,7 @@ local function navigate_files(step, reviewed_only)
     return notify_error(target_err)
   end
 
-  open_file_for_navigation(target, current_navigation_mode())
+  open_file_for_navigation(target)
 end
 
 function M.next_file()
@@ -3326,6 +3261,21 @@ function M.toggle_diff_whitespace()
   notify_info(string.format("Diff whitespace: %s", prefs.ignore_whitespace and "ignored" or "strict"))
 end
 
+function M.toggle_diff_render_whitespace()
+  local prefs = current_diff_view_preferences()
+  prefs.render_whitespace = not prefs.render_whitespace
+  prefs = persist_diff_view_preferences(prefs)
+
+  local reopened = M.reopen_current_diff_with_preferences({
+    new_tab = false,
+  })
+  if not reopened then
+    return
+  end
+
+  notify_info(string.format("Whitespace/tab rendering: %s", prefs.render_whitespace and "enabled" or "disabled"))
+end
+
 function M.cycle_diff_view_mode()
   local order = { "vertical", "horizontal", "unified" }
   local prefs = current_diff_view_preferences()
@@ -3387,6 +3337,14 @@ local function diff_shortcut_lines(bufnr)
   local file_mode = type(vim.b[bufnr].gh_pr_file_mode) == "string" and vim.b[bufnr].gh_pr_file_mode or ""
   local prefs = current_diff_view_preferences()
   local shortcuts = diff_view_shortcuts()
+  local configured_diff = (config.get() or {}).diff_view or {}
+  local configured_whitespace = type(configured_diff.whitespace) == "table" and configured_diff.whitespace or {}
+  local whitespace_tab = type(configured_whitespace.tab) == "string" and configured_whitespace.tab ~= ""
+      and configured_whitespace.tab
+    or ">-"
+  local whitespace_space = type(configured_whitespace.space) == "string" and configured_whitespace.space ~= ""
+      and configured_whitespace.space
+    or "."
 
   local mode_label = prefs.mode
   if file_mode == "added_single" then
@@ -3413,6 +3371,9 @@ local function diff_shortcut_lines(bufnr)
     "Diff render state",
     shortcut_line("mode", mode_label),
     shortcut_line("spaces", prefs.ignore_whitespace and "ignored" or "strict"),
+    shortcut_line("render", prefs.render_whitespace and "visible" or "hidden"),
+    shortcut_line("tab", whitespace_tab),
+    shortcut_line("space", whitespace_space),
     "",
     "General",
     shortcut_line("K", kind == "unified" and "Not available in unified mode" or "Show line comments popup"),
@@ -3421,6 +3382,8 @@ local function diff_shortcut_lines(bufnr)
     shortcut_line("q", "Quick close (or close head in 2-way diff)"),
     shortcut_line("Q", "Close view(s) and open PR Review"),
   }
+
+  add_shortcut(lines, shortcuts.toggle_render_whitespace, "Toggle space/tab symbols")
 
   if file_mode ~= "added_single" and file_mode ~= "removed_single" then
     add_shortcut(lines, shortcuts.toggle_whitespace, "Toggle whitespace changes")

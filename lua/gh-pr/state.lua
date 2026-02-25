@@ -12,6 +12,7 @@ local state = {
     diff_view = {
       mode = "vertical",
       ignore_whitespace = false,
+      render_whitespace = true,
     },
   },
 }
@@ -136,6 +137,7 @@ local function sanitize_diff_view_prefs(input)
   local result = {
     mode = "vertical",
     ignore_whitespace = false,
+    render_whitespace = true,
   }
 
   if type(input) ~= "table" then
@@ -144,6 +146,7 @@ local function sanitize_diff_view_prefs(input)
 
   result.mode = normalize_diff_mode(input.mode)
   result.ignore_whitespace = input.ignore_whitespace == true
+  result.render_whitespace = input.render_whitespace ~= false
   return result
 end
 

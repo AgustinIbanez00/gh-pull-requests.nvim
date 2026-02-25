@@ -164,8 +164,18 @@ Optional:
     diff_view = {
       mode = "vertical", -- "vertical" | "horizontal" | "unified"
       ignore_whitespace = false,
+      render_whitespace = true,
+      whitespace = {
+        tab = ">-", -- symbol for tabs in listchars
+        space = ".", -- symbol for spaces in listchars
+        trail = "~", -- optional: trailing spaces symbol
+        nbsp = "+", -- optional: non-breaking space symbol
+        color = nil, -- optional: e.g. "#7f8ea3"
+        highlight_group = "GhPrDiffWhitespace", -- optional: custom highlight group
+      },
       shortcuts = {
         toggle_whitespace = ",dw",
+        toggle_render_whitespace = ",dt",
         cycle_mode = ",dm",
         set_vertical = ",dv",
         set_horizontal = ",dh",
@@ -269,6 +279,7 @@ Inside PR virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenMod
 - `q` quick close: in 2-way diff closes `modified/head`; in single-buffer view closes and opens `PR Review`
 - `Q` close current diff view(s) and open/focus `PR Review`
 - `,dw` toggle whitespace diff mode (ignored/strict)
+- `,dt` toggle whitespace/tab symbol rendering
 - `,dm` cycle diff mode (`vertical` -> `horizontal` -> `unified`)
 - `,dv` force vertical split mode
 - `,dh` force horizontal split mode
@@ -287,6 +298,7 @@ Inside PR virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenMod
 - `,F` previous file in PR
 - `,v` next reviewed file in PR
 - `,V` previous reviewed file in PR
+- file navigation shortcuts always reopen the full diff view using the active render mode (`vertical`/`horizontal`/`unified`)
 - `,rs` submit pending review as comment
 - `,ra` submit pending review as approve
 - `,rr` submit pending review as request changes
@@ -329,7 +341,7 @@ The plugin exposes source modules:
 
 - Query definitions are persisted in `stdpath("state")/gh-pr/queries.json`.
 - Viewed file state is persisted in `stdpath("state")/gh-pr/state.json`.
-- Diff view preferences (`mode`, `ignore_whitespace`) are persisted in `stdpath("state")/gh-pr/state.json`.
+- Diff view preferences (`mode`, `ignore_whitespace`, `render_whitespace`) are persisted in `stdpath("state")/gh-pr/state.json`.
 - PR cache is persisted in `stdpath("state")/gh-pr/pr_cache.json`.
 - Cache entries are scoped per source and repository key (`gh_pr` and `gh_pr_review`).
 - File content is fetched from GitHub API through `gh api` and opened in readonly buffers.

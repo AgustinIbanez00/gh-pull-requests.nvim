@@ -145,8 +145,18 @@ local defaults = {
   diff_view = {
     mode = "vertical",
     ignore_whitespace = false,
+    render_whitespace = true,
+    whitespace = {
+      tab = ">-",
+      space = ".",
+      trail = "~",
+      nbsp = "+",
+      color = nil,
+      highlight_group = "GhPrDiffWhitespace",
+    },
     shortcuts = {
       toggle_whitespace = ",dw",
+      toggle_render_whitespace = ",dt",
       cycle_mode = ",dm",
       set_vertical = ",dv",
       set_horizontal = ",dh",
@@ -705,6 +715,16 @@ local function sanitize_diff_view(diff_view)
     return vim.deepcopy(defaults.diff_view)
   end
 
+  local function sanitize_listchars_token(value, fallback)
+    if type(value) ~= "string" or value == "" then
+      return fallback
+    end
+    if value:find(",", 1, true) or value:find(":", 1, true) then
+      return fallback
+    end
+    return value
+  end
+
   local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.diff_view), diff_view)
   if result.mode ~= "vertical" and result.mode ~= "horizontal" and result.mode ~= "unified" then
     result.mode = defaults.diff_view.mode
@@ -714,10 +734,31 @@ local function sanitize_diff_view(diff_view)
     result.ignore_whitespace = defaults.diff_view.ignore_whitespace
   end
 
+  if type(result.render_whitespace) ~= "boolean" then
+    result.render_whitespace = defaults.diff_view.render_whitespace
+  end
+
+  result.whitespace = type(result.whitespace) == "table" and result.whitespace or {}
+  result.whitespace.tab = sanitize_listchars_token(result.whitespace.tab, defaults.diff_view.whitespace.tab)
+  result.whitespace.space = sanitize_listchars_token(result.whitespace.space, defaults.diff_view.whitespace.space)
+  result.whitespace.trail = sanitize_listchars_token(result.whitespace.trail, defaults.diff_view.whitespace.trail)
+  result.whitespace.nbsp = sanitize_listchars_token(result.whitespace.nbsp, defaults.diff_view.whitespace.nbsp)
+
+  if type(result.whitespace.color) ~= "string" or result.whitespace.color == "" then
+    result.whitespace.color = defaults.diff_view.whitespace.color
+  end
+
+  if type(result.whitespace.highlight_group) ~= "string" or result.whitespace.highlight_group == "" then
+    result.whitespace.highlight_group = defaults.diff_view.whitespace.highlight_group
+  end
+
   result.shortcuts = type(result.shortcuts) == "table" and result.shortcuts or {}
   result.shortcuts.toggle_whitespace = type(result.shortcuts.toggle_whitespace) == "string"
       and result.shortcuts.toggle_whitespace
     or defaults.diff_view.shortcuts.toggle_whitespace
+  result.shortcuts.toggle_render_whitespace = type(result.shortcuts.toggle_render_whitespace) == "string"
+      and result.shortcuts.toggle_render_whitespace
+    or defaults.diff_view.shortcuts.toggle_render_whitespace
   result.shortcuts.cycle_mode = type(result.shortcuts.cycle_mode) == "string" and result.shortcuts.cycle_mode
     or defaults.diff_view.shortcuts.cycle_mode
   result.shortcuts.set_vertical = type(result.shortcuts.set_vertical) == "string" and result.shortcuts.set_vertical
