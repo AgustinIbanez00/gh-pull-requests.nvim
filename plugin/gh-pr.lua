@@ -15,7 +15,15 @@ end, { desc = "List pull requests using Telescope" })
 
 vim.api.nvim_create_user_command("GhPrComments", function(command)
   require("gh-pr").open_comments(command.args ~= "" and command.args or nil)
-end, { nargs = "?", desc = "Open pull request comments tree" })
+end, { nargs = "?", desc = "Open PR Review source (Comments section)" })
+
+vim.api.nvim_create_user_command("GhPrStartReview", function(command)
+  require("gh-pr").start_review(command.args ~= "" and command.args or nil)
+end, { nargs = "?", desc = "Start PR review flow and open PR Review source" })
+
+vim.api.nvim_create_user_command("GhPrReviewTree", function()
+  require("gh-pr").open_review_tree({ toggle = true })
+end, { desc = "Toggle PR Review source" })
 
 vim.api.nvim_create_user_command("GhPrRefresh", function()
   require("gh-pr").refresh()
@@ -92,6 +100,22 @@ vim.api.nvim_create_user_command("GhPrComment", function()
   require("gh-pr").comment()
 end, { desc = "Submit general comment review (message + confirm)" })
 
+vim.api.nvim_create_user_command("GhPrReviewSubmit", function()
+  require("gh-pr").review_submit_pending()
+end, { desc = "Submit pending review as comment (message + confirm)" })
+
+vim.api.nvim_create_user_command("GhPrReviewApprove", function()
+  require("gh-pr").review_approve_pending()
+end, { desc = "Submit pending review as approve (message + confirm)" })
+
+vim.api.nvim_create_user_command("GhPrReviewRequestChanges", function()
+  require("gh-pr").review_request_changes_pending()
+end, { desc = "Submit pending review as request changes (message + confirm)" })
+
+vim.api.nvim_create_user_command("GhPrReviewDiscard", function()
+  require("gh-pr").review_discard_pending()
+end, { desc = "Discard current pending review (confirm)" })
+
 vim.api.nvim_create_user_command("GhPrMerge", function(command)
   local method = command.args ~= "" and command.args or "merge"
   require("gh-pr").merge(method)
@@ -123,6 +147,7 @@ map("n", "<leader>ghr", "<cmd>GhPrRefresh<cr>", { desc = "Refresh PR data" })
 map("n", "<leader>ghv", "<cmd>GhPrOverview<cr>", { desc = "Open PR overview" })
 map("n", "<leader>ghc", "<cmd>GhPrCheckout<cr>", { desc = "Checkout PR" })
 map("n", "<leader>ghd", "<cmd>GhPrOpenDiff<cr>", { desc = "Open PR file diff" })
+map("n", "<leader>ghx", "<cmd>GhPrReviewTree<cr>", { desc = "Toggle PR Review source" })
 map("n", "<leader>ght", "<cmd>GhPrToggleReviewed<cr>", { desc = "Toggle viewed" })
 map("n", "<leader>ghn", "<cmd>GhPrNextChange<cr>", { desc = "Next diff change" })
 map("n", "<leader>ghp", "<cmd>GhPrPrevChange<cr>", { desc = "Previous diff change" })

@@ -26,11 +26,29 @@ Commands
     Opens Telescope query and pull request picker.
 
 :GhPrComments [number]
-    Opens a comments tree (Problems-like) for the active PR or provided
-    PR number. Selecting a line/comment node navigates to file + line.
-    In `gh_pr_comments`: `p` previews in right split, `<CR>` opens.
-    Long threads open a focused floating buffer; navigate with normal
-    motions and close with `q`/`<Esc>`.
+    Opens the PR Review source with comments integrated for the active PR
+    or provided PR number.
+
+:GhPrStartReview [number]
+    Starts review flow for active/provided PR. Prompts whether to notify
+    GitHub (creates/ensures pending review) and opens PR Review source.
+
+:GhPrReviewTree
+    Toggles PR Review source (`gh_pr_review`).
+    PR Review source sections: Overview, Labels, Files, Reviewers,
+    Commits, Checks, Comments.
+    `Comments` is rendered as tree sections: `By File` and `Global`.
+    `By File` groups threads by path/file and uses status badges:
+    `[UNRESOLVED]`, `[RESOLVED]`, `[CLOSED]`.
+    `Global` includes review events and general PR comments.
+    Inside `gh_pr_review`, `R` forces refresh from GitHub for active PR.
+    `l` opens labels multi-select edit dialog.
+    `r` opens reviewers multi-select edit dialog.
+    `S` submit pending review as comment.
+    `A` submit pending review as approve.
+    `C` submit pending review as request changes.
+    `D` discard pending review.
+    `s` re-runs start-review flow for selected PR context.
 
 :GhPrRefresh
     Refreshes PR data in active views.
@@ -59,8 +77,8 @@ Overview buffer keymaps:
     `1..9` jump to tab
     `et` edit title
     `eb` edit description
-    `el` edit labels (comma-separated, replacement mode)
-    `er` edit reviewers (comma-separated, replacement mode)
+    `el` edit labels (multi-select, replacement mode)
+    `er` edit reviewers (multi-select, replacement mode; users + teams)
     `ea` edit assignees (comma-separated, replacement mode)
     `em` edit milestone (empty input removes milestone)
     `es` change state (`open`/`closed`)
@@ -71,24 +89,57 @@ Overview buffer keymaps:
     `D` open diff for selected row (file/commit)
     `O` open original for selected file row
     `M` open modified for selected file row
+    `,x` toggle PR Review source
     Every overview edit asks confirmation before execution and refreshes
     the overview on success.
+    In multi-select edits (`labels`/`reviewers`), deselected current items
+    are interpreted as removals.
     PR description is rendered inline as markdown in `Summary`.
 
 :GhPrCheckout [number]
     Runs `gh pr checkout` for the active PR or provided number.
 
 :GhPrOpenDiff
-    Opens active file as virtual base/head side-by-side diff.
+    Opens active file as virtual PR diff using configured render mode:
+    vertical split, horizontal split, or unified inline.
+    If GitHub file content cannot be loaded, command fails with an explicit
+    error (no implicit patch fallback buffer).
     In virtual PR buffers, `K` opens a modal floating window with comments
     for the current line.
+    Press `R` to refresh current diff buffer from GitHub.
+    Press `?` to open a floating shortcuts help dialog for this buffer.
+    Press `q` for quick close:
+      - in 2-way diff closes head/modified window and keeps base/original
+      - in single-buffer views closes current buffer and opens PR Review
+    Press `Q` to close current diff view(s) and open/focus PR Review.
     Additional virtual-buffer shortcuts:
+      `R` refresh current diff from GitHub
+      `q` quick close
+      `Q` close diff view(s) and open PR Review
+      `,dw` toggle whitespace diff mode (ignored/strict)
+      `,dm` cycle diff mode
+      `,dv` force vertical split mode
+      `,dh` force horizontal split mode
+      `,du` force unified mode
+      `gc` add inline comment at cursor (`MODIFIED`/head or `unified`)
+      visual `gc` add inline comment for selected range (`v`/`V`, head or `unified`)
+      for `ADDED` files, opens single MODIFIED buffer (no split/unified layout)
+      in `ADDED` single mode, `gc` is allowed on any line/range
+      inline comments are validated before opening composer:
+      - head: only inside diff hunks
+      - unified: only on added (`+`) lines
+      composer: `<C-s>` submit draft, `q`/`<Esc>` cancel
       `,n` next change
       `,p` previous change
       `,f` next file
       `,F` previous file
       `,v` next reviewed file
       `,V` previous reviewed file
+      `,rs` submit pending review as comment
+      `,ra` submit pending review as approve
+      `,rr` submit pending review as request changes
+      `,rd` discard pending review
+      `,x` toggle PR Review source
 
 :GhPrOpenOriginal
     Opens virtual readonly base version for active PR file.
@@ -114,6 +165,18 @@ Overview buffer keymaps:
 :GhPrComment
     Prompt review message and confirm before submitting general comment review.
 
+:GhPrReviewSubmit
+    Submit current pending review as comment (message + confirm).
+
+:GhPrReviewApprove
+    Submit current pending review as approve (message + confirm).
+
+:GhPrReviewRequestChanges
+    Submit current pending review as request changes (message + confirm).
+
+:GhPrReviewDiscard
+    Discard current pending review (confirm).
+
 :GhPrMerge [merge|squash|rebase]
     Merge active PR with selected strategy.
 
@@ -132,6 +195,7 @@ Keymaps
 <leader>gho       Open PR UI (:GhPrOpen)
 <leader>ghl       Open Telescope list (:GhPrList)
 <leader>ghm       Open comments tree (:GhPrComments)
+<leader>ghx       Toggle PR Review source (:GhPrReviewTree)
 <leader>ghr       Refresh (:GhPrRefresh)
 <leader>ghv       Open PR overview (:GhPrOverview)
 <leader>ghc       Checkout PR (:GhPrCheckout)
@@ -140,6 +204,7 @@ Keymaps
 <leader>ghn       Next diff hunk (:GhPrNextChange)
 <leader>ghp       Previous diff hunk (:GhPrPrevChange)
 `C` (gh_pr)      Open comments tree (:GhPrComments)
+`S` (gh_pr)      Start review flow for selected PR
 
 Configuration
 =============
@@ -198,6 +263,25 @@ Call `require("gh-pr").setup({ ... })` with:
 - `overview.markdown.code_block_border` (`false`)
 - `overview.max_items` (checks/commits/timeline)
 - `overview.show` (toggle sections)
+- `cache.gh_pr.enabled` (`true`)
+- `cache.gh_pr.ttl_seconds` (`60`)
+- `cache.gh_pr.auto_refresh_when_focused` (`true`)
+- `cache.gh_pr.max_cache_age_seconds` (`900`)
+- `cache.gh_pr.show_stale_badge` (`true`)
+- `cache.gh_pr.sync_visible_buffers` (`true`)
+- `cache.gh_pr_review.enabled` (`true`)
+- `cache.gh_pr_review.ttl_seconds` (`60`)
+- `cache.gh_pr_review.auto_refresh_when_focused` (`true`)
+- `cache.gh_pr_review.max_cache_age_seconds` (`900`)
+- `cache.gh_pr_review.show_stale_badge` (`true`)
+- `cache.gh_pr_review.sync_visible_buffers` (`true`)
+- `diff_view.mode` (`"vertical"`, also `"horizontal"` / `"unified"`)
+- `diff_view.ignore_whitespace` (`false`)
+- `diff_view.shortcuts.toggle_whitespace` (`",dw"`)
+- `diff_view.shortcuts.cycle_mode` (`",dm"`)
+- `diff_view.shortcuts.set_vertical` (`",dv"`)
+- `diff_view.shortcuts.set_horizontal` (`",dh"`)
+- `diff_view.shortcuts.set_unified` (`",du"`)
 - `queries` list: `{ folder, label, query }`
 - `ui.use_neotree` (`true`)
 - `ui.telescope_fallback` (`true`)
@@ -207,4 +291,6 @@ Persistence
 
 - Queries: `stdpath("state")/gh-pr/queries.json`
 - Viewed files: `stdpath("state")/gh-pr/state.json`
+- Diff view prefs (`mode`, `ignore_whitespace`): `stdpath("state")/gh-pr/state.json`
 - PR cache: `stdpath("state")/gh-pr/pr_cache.json`
+- Cache is stored per source/repo key (`gh_pr` and `gh_pr_review`).

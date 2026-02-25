@@ -231,6 +231,12 @@ local function ensure_keymaps(view)
     end
   end, "GH PR Overview: open comments tree")
 
+  map(bufnr, ",x", function()
+    if type(view.callbacks.toggle_review_tree) == "function" then
+      view.callbacks.toggle_review_tree()
+    end
+  end, "GH PR Overview: toggle PR Review source")
+
   map(bufnr, "q", with_view(function(current)
     if type(current.callbacks.close) == "function" then
       current.callbacks.close()

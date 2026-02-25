@@ -35,10 +35,37 @@ local DEFAULT_RENDERERS = {
 }
 
 local cache = {
-  pr_number = nil,
+  key = nil,
   details = nil,
   threads = nil,
 }
+
+local function repository_name(details)
+  local repository = type(details) == "table" and (details.baseRepository or details.headRepository) or nil
+  if type(repository) ~= "table" then
+    return ""
+  end
+
+  if type(repository.nameWithOwner) == "string" and repository.nameWithOwner ~= "" then
+    return repository.nameWithOwner
+  end
+
+  local owner = type(repository.owner) == "table" and repository.owner.login or repository.owner
+  local name = repository.name
+  if type(owner) == "string" and owner ~= "" and type(name) == "string" and name ~= "" then
+    return owner .. "/" .. name
+  end
+
+  return ""
+end
+
+local function cache_key(pr, details)
+  local repo_name = repository_name(details)
+  if repo_name == "" then
+    return tostring(pr.number)
+  end
+  return string.format("%s:%s", repo_name, tostring(pr.number))
+end
 
 local function first_positive_line(...)
   for index = 1, select("#", ...) do
@@ -119,9 +146,22 @@ local function active_pr_context()
   return nil, nil, "No active pull request. Open a PR file/overview first or run :GhPrComments <number>."
 end
 
-local function load_threads(pr, options)
-  if cache.pr_number == pr.number and type(cache.threads) == "table" then
+local function load_threads(pr, details, options)
+  options = type(options) == "table" and options or {}
+  local key = cache_key(pr, details)
+
+  if type(options.threads) == "table" then
+    cache.key = key
+    cache.threads = options.threads
+    return options.threads, nil
+  end
+
+  if key ~= "" and cache.key == key and type(cache.threads) == "table" then
     return cache.threads, nil
+  end
+
+  if options.allow_fetch == false then
+    return {}, nil
   end
 
   local threads, err = pr_service.fetch_review_threads(pr.number, {
@@ -132,7 +172,7 @@ local function load_threads(pr, options)
     return nil, err
   end
 
-  cache.pr_number = pr.number
+  cache.key = cache_key(pr, details)
   cache.threads = threads
   return threads, nil
 end
@@ -337,6 +377,7 @@ local function build_nodes(pr, details, threads, options)
               side = side,
               line = line,
               comments = {},
+              comment_keys = {},
               has_open = false,
               has_outdated = false,
             }
@@ -348,7 +389,19 @@ local function build_nodes(pr, details, threads, options)
             if thread_is_outdated then
               line_bucket.has_outdated = true
             end
-            line_bucket.comments[#line_bucket.comments + 1] = {
+            local dedupe_key = type(comment.id) == "string" and comment.id ~= ""
+                and ("id:" .. comment.id)
+              or table.concat({
+                type(thread.id) == "string" and thread.id or "",
+                type(comment.createdAt) == "string" and comment.createdAt or "",
+                tostring(index),
+                path,
+                tostring(line),
+              }, ":")
+
+            if not line_bucket.comment_keys[dedupe_key] then
+              line_bucket.comment_keys[dedupe_key] = true
+              line_bucket.comments[#line_bucket.comments + 1] = {
               id = comment.id,
               author = type(comment.author) == "table" and comment.author.login or "unknown",
               body = comment.body,
@@ -376,6 +429,7 @@ local function build_nodes(pr, details, threads, options)
               },
               fallback_index = index,
             }
+            end
           end
         end
       end
@@ -486,7 +540,7 @@ M.navigate = function(state, path)
     return
   end
 
-  local threads, threads_err = load_threads(pr, options)
+  local threads, threads_err = load_threads(pr, details, options)
   if not threads then
     renderer.show_nodes({
       {
@@ -545,9 +599,31 @@ M.setup = function(source_config, _)
 end
 
 M.invalidate_cache = function()
-  cache.pr_number = nil
+  cache.key = nil
   cache.threads = nil
   cache.details = nil
+end
+
+function M.build_section_nodes(pr, details, opts)
+  opts = opts or {}
+  local options = (config.get() or {}).line_comments or {}
+  cache.details = details
+  local threads, threads_err = load_threads(pr, details, options)
+  if not threads then
+    return nil, threads_err
+  end
+
+  local nodes = build_nodes(pr, details, threads, options)
+  if opts.with_root == true then
+    return nodes, nil
+  end
+
+  local root = nodes[1]
+  if type(root) ~= "table" or type(root.children) ~= "table" then
+    return {}, nil
+  end
+
+  return vim.deepcopy(root.children), nil
 end
 
 return M

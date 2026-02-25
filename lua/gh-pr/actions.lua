@@ -1,6 +1,10 @@
 local M = {}
 
+local comment_composer = require("gh-pr.comment_composer")
+local comment_popup = require("gh-pr.comment_popup")
 local config = require("gh-pr.config")
+local line_comments = require("gh-pr.line_comments")
+local multi_select = require("gh-pr.multi_select")
 local overview = require("gh-pr.overview")
 local pr_service = require("gh-pr.pr_service")
 local state = require("gh-pr.state")
@@ -51,6 +55,20 @@ end
 
 local function notify_warn(message)
   vim.notify(message, vim.log.levels.WARN)
+end
+
+local function open_review_tree_from_plugin(opts)
+  local ok, gh_pr = pcall(require, "gh-pr")
+  if not ok or type(gh_pr.open_review_tree) ~= "function" then
+    return false, "Unable to open PR Review source (gh-pr.open_review_tree not available)"
+  end
+
+  local status, err = pcall(gh_pr.open_review_tree, opts or {})
+  if not status then
+    return false, tostring(err)
+  end
+
+  return err ~= false, nil
 end
 
 local function is_valid_buf(bufnr)
@@ -151,18 +169,209 @@ local function build_line_comment_context(pr_number)
   }
 end
 
+local function refresh_pr_sources_after_state_change(opts)
+  opts = opts or {}
+  local force = opts.force == true
+
+  local source_ok, source = pcall(require, "gh-pr.neotree.source")
+  if source_ok then
+    if type(source.render_cached_states) == "function" then
+      pcall(source.render_cached_states)
+    end
+    if type(source.request_refresh) == "function" then
+      pcall(source.request_refresh, nil, { force = force, notify_error = false })
+    end
+  end
+
+  local review_ok, review_source = pcall(require, "gh-pr.neotree.review_source")
+  if review_ok then
+    if type(review_source.render_cached_states) == "function" then
+      pcall(review_source.render_cached_states)
+    end
+    if type(review_source.request_refresh) == "function" then
+      pcall(review_source.request_refresh, nil, { force = force, notify_error = false })
+    end
+  end
+
+  local manager_ok, manager = pcall(require, "neo-tree.sources.manager")
+  if manager_ok then
+    pcall(manager.refresh, "gh_pr")
+    pcall(manager.refresh, "gh_pr_review")
+  end
+end
+
+local function normalize_diff_view_mode(mode)
+  if mode == "vertical" or mode == "horizontal" or mode == "unified" then
+    return mode
+  end
+
+  return "vertical"
+end
+
+local function diff_view_shortcuts()
+  local diff_view = (config.get() or {}).diff_view or {}
+  local shortcuts = type(diff_view.shortcuts) == "table" and diff_view.shortcuts or {}
+  return {
+    toggle_whitespace = type(shortcuts.toggle_whitespace) == "string" and shortcuts.toggle_whitespace or ",dw",
+    cycle_mode = type(shortcuts.cycle_mode) == "string" and shortcuts.cycle_mode or ",dm",
+    set_vertical = type(shortcuts.set_vertical) == "string" and shortcuts.set_vertical or ",dv",
+    set_horizontal = type(shortcuts.set_horizontal) == "string" and shortcuts.set_horizontal or ",dh",
+    set_unified = type(shortcuts.set_unified) == "string" and shortcuts.set_unified or ",du",
+  }
+end
+
+local function current_diff_view_preferences(overrides)
+  local config_defaults = ((config.get() or {}).diff_view or {})
+  local persisted = type(state.get_diff_view_prefs) == "function" and state.get_diff_view_prefs() or {}
+  local prefs = vim.tbl_deep_extend("force", {
+    mode = normalize_diff_view_mode(config_defaults.mode),
+    ignore_whitespace = config_defaults.ignore_whitespace == true,
+  }, type(persisted) == "table" and persisted or {})
+
+  prefs.mode = normalize_diff_view_mode(prefs.mode)
+  prefs.ignore_whitespace = prefs.ignore_whitespace == true
+
+  if type(overrides) == "table" then
+    if overrides.mode ~= nil then
+      prefs.mode = normalize_diff_view_mode(overrides.mode)
+    end
+    if type(overrides.ignore_whitespace) == "boolean" then
+      prefs.ignore_whitespace = overrides.ignore_whitespace
+    end
+  end
+
+  return prefs
+end
+
+local function persist_diff_view_preferences(prefs)
+  local sanitized = {
+    mode = normalize_diff_view_mode(prefs and prefs.mode),
+    ignore_whitespace = prefs and prefs.ignore_whitespace == true,
+  }
+  if type(state.set_diff_view_prefs) == "function" then
+    state.set_diff_view_prefs(sanitized)
+  end
+  return sanitized
+end
+
+local function normalize_path(path)
+  if type(path) ~= "string" then
+    return ""
+  end
+
+  return path:gsub("\\", "/")
+end
+
 local function find_file_in_details(details, path)
   if not details or type(details.files) ~= "table" then
     return nil
   end
 
+  local normalized_path = normalize_path(path)
+  if normalized_path == "" then
+    return nil
+  end
+
   for _, file in ipairs(details.files) do
-    if file.path == path or file.filename == path then
-      return file
+    local candidates = {
+      file.path,
+      file.filename,
+      file.previousFilename,
+      file.previous_filename,
+    }
+    for _, candidate in ipairs(candidates) do
+      if normalize_path(candidate) == normalized_path then
+        return file
+      end
     end
   end
 
   return nil
+end
+
+local function resolve_file_in_details(details, ...)
+  local count = select("#", ...)
+  for index = 1, count do
+    local path = select(index, ...)
+    if type(path) == "string" and path ~= "" then
+      local selected = find_file_in_details(details, path)
+      if selected then
+        return selected
+      end
+    end
+  end
+
+  return nil
+end
+
+local function restore_cursor_line(winid, line)
+  if not is_valid_win(winid) then
+    return
+  end
+
+  local bufnr = vim.api.nvim_win_get_buf(winid)
+  if not is_valid_buf(bufnr) then
+    return
+  end
+
+  local max_line = vim.api.nvim_buf_line_count(bufnr)
+  local target = math.max(1, math.min(max_line, tonumber(line) or 1))
+  pcall(vim.api.nvim_win_set_cursor, winid, { target, 0 })
+end
+
+local function resolve_current_diff_file(details, bufnr)
+  local canonical_path = vim.b[bufnr].gh_pr_file_path
+  local current_path = vim.b[bufnr].gh_pr_path
+
+  local selected = resolve_file_in_details(details, canonical_path, current_path)
+  if selected then
+    return selected
+  end
+
+  local active_file = state.get_active_file()
+  if type(active_file) == "table" then
+    selected = resolve_file_in_details(
+      details,
+      active_file.path,
+      active_file.filename,
+      active_file.previousFilename,
+      active_file.previous_filename
+    )
+    if selected then
+      return selected
+    end
+  end
+
+  return nil
+end
+
+local function resolve_canonical_file_path(details, path)
+  local normalized = normalize_path(path)
+  if normalized == "" then
+    return ""
+  end
+
+  if type(details) ~= "table" or type(details.files) ~= "table" then
+    return normalized
+  end
+
+  for _, file in ipairs(details.files) do
+    local canonical = normalize_path(file.path or file.filename)
+    local candidates = {
+      file.path,
+      file.filename,
+      file.previousFilename,
+      file.previous_filename,
+    }
+
+    for _, candidate in ipairs(candidates) do
+      if normalize_path(candidate) == normalized then
+        return canonical ~= "" and canonical or normalized
+      end
+    end
+  end
+
+  return normalized
 end
 
 local function resolve_file(file)
@@ -175,7 +384,7 @@ local function resolve_file(file)
     return active_file
   end
 
-  local path = vim.b.gh_pr_path
+  local path = vim.b.gh_pr_file_path or vim.b.gh_pr_path
   if type(path) == "string" and path ~= "" then
     local _, details = state.get_active_pr()
     return find_file_in_details(details, path)
@@ -538,6 +747,110 @@ function M.preview_comment_location(target, opts)
   end
 end
 
+local function timeline_kind_label(item)
+  if type(item) ~= "table" then
+    return "COMMENT"
+  end
+
+  if item.kind == "thread_comment" then
+    return "THREAD COMMENT"
+  end
+  if item.kind == "review" then
+    local state = type(item.state) == "string" and item.state:upper() or "COMMENTED"
+    return "REVIEW " .. state
+  end
+
+  return "COMMENT"
+end
+
+local function timeline_item_location(item)
+  local path = type(item.path) == "string" and item.path or ""
+  if path == "" then
+    return ""
+  end
+
+  local line = tonumber(item.line) or tonumber(item.original_line)
+  if line and line > 0 then
+    return string.format("%s:%d", path, line)
+  end
+  return path
+end
+
+local function timeline_item_lines(item)
+  local author = type(item.author) == "string" and item.author ~= "" and item.author or "unknown"
+  local created_at = type(item.created_at) == "string" and item.created_at or ""
+  local url = type(item.url) == "string" and item.url or ""
+  local body = type(item.body) == "string" and item.body or ""
+  local lines = {
+    string.format("Type: %s", timeline_kind_label(item)),
+    string.format("Author: @%s", author),
+  }
+
+  if created_at ~= "" then
+    lines[#lines + 1] = "Date: " .. created_at:gsub("T", " "):gsub("Z", "")
+  end
+
+  local location = timeline_item_location(item)
+  if location ~= "" then
+    lines[#lines + 1] = "Location: " .. location
+  end
+
+  lines[#lines + 1] = string.rep("-", 60)
+
+  local body_lines = vim.split(body, "\n", { plain = true })
+  if vim.tbl_isempty(body_lines) then
+    body_lines = { "(empty comment)" }
+  end
+  for _, body_line in ipairs(body_lines) do
+    lines[#lines + 1] = body_line
+  end
+
+  if url ~= "" then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = url
+  end
+
+  return lines
+end
+
+function M.open_timeline_item(item, opts)
+  if type(item) ~= "table" then
+    return
+  end
+
+  opts = opts or {}
+
+  local pr = type(opts.pr) == "table" and opts.pr or nil
+  local details = type(opts.details) == "table" and opts.details or nil
+  if pr and details then
+    state.set_active_pr(pr, details)
+  end
+
+  local origin_bufnr = is_valid_buf(opts.origin_bufnr) and opts.origin_bufnr or vim.api.nvim_get_current_buf()
+  local ok, popup_err = comment_popup.open({
+    origin_bufnr = origin_bufnr,
+    tag = "timeline",
+    title = "PR timeline",
+    location = timeline_item_location(item),
+    lines = timeline_item_lines(item),
+    mode = "open",
+    enter = true,
+    position = "editor",
+    border = "rounded",
+    wrap = true,
+    min_width = 68,
+    min_height = 12,
+    max_width = 150,
+    max_height = 48,
+    close_on_origin_move = false,
+    filetype = "markdown",
+  })
+
+  if not ok and popup_err then
+    notify_warn("Unable to open timeline item: " .. tostring(popup_err))
+  end
+end
+
 local function build_overview_callbacks(pr_number)
   return {
     approve = function()
@@ -584,6 +897,9 @@ local function build_overview_callbacks(pr_number)
     end,
     open_file_modified = function(file)
       M.open_modified(file)
+    end,
+    toggle_review_tree = function()
+      M.toggle_review_tree()
     end,
   }
 end
@@ -806,15 +1122,15 @@ local function extract_name(item)
     return normalize_string(item.login)
   end
 
-  if type(item.name) == "string" and item.name ~= "" then
-    return normalize_string(item.name)
-  end
-
   if type(item.slug) == "string" and item.slug ~= "" then
     if type(item.organization) == "table" and type(item.organization.login) == "string" and item.organization.login ~= "" then
       return normalize_string(item.organization.login .. "/" .. item.slug)
     end
     return normalize_string(item.slug)
+  end
+
+  if type(item.name) == "string" and item.name ~= "" then
+    return normalize_string(item.name)
   end
 
   if type(item.requestedReviewer) == "table" then
@@ -900,6 +1216,47 @@ end
 
 local function current_assignees(details)
   return normalize_items(details.assignees)
+end
+
+local function normalize_values_list(values)
+  local result = {}
+  local seen = {}
+  for _, value in ipairs(type(values) == "table" and values or {}) do
+    local text = normalize_string(value)
+    local key = normalize_key(text)
+    if text ~= "" and key ~= "" and not seen[key] then
+      seen[key] = true
+      result[#result + 1] = text
+    end
+  end
+  return result
+end
+
+local function normalize_reviewer_identity(value)
+  local text = normalize_string(value)
+  if text == "" then
+    return ""
+  end
+
+  text = text:gsub("^%s+", ""):gsub("%s+$", "")
+  text = text:gsub("^@", "")
+  text = text:gsub("%s+%([Tt][Ee][Aa][Mm]%)$", "")
+  text = text:gsub("^%s+", ""):gsub("%s+$", "")
+  return text
+end
+
+local function normalize_reviewer_values(values)
+  local result = {}
+  local seen = {}
+  for _, value in ipairs(type(values) == "table" and values or {}) do
+    local normalized = normalize_reviewer_identity(value)
+    local key = normalize_key(normalized)
+    if normalized ~= "" and key ~= "" and not seen[key] then
+      seen[key] = true
+      result[#result + 1] = normalized
+    end
+  end
+  return result
 end
 
 local function confirm_overview_edit(pr_number, action_label, summary, callback)
@@ -989,9 +1346,15 @@ local function build_milestone_edit(choice, details)
   }, nil, false
 end
 
-local function build_list_edit(kind, choice, current_values)
-  local desired = parse_csv_items(type(choice) == "string" and choice or "")
-  local add, remove = compute_replacement_diff(current_values, desired)
+local function build_list_edit_from_values(kind, desired_values, current_values)
+  local desired = normalize_values_list(desired_values)
+  local current = normalize_values_list(current_values)
+  if kind == "edit_reviewers" then
+    desired = normalize_reviewer_values(desired)
+    current = normalize_reviewer_values(current)
+  end
+
+  local add, remove = compute_replacement_diff(current, desired)
 
   if vim.tbl_isempty(add) and vim.tbl_isempty(remove) then
     return nil, "No changes detected", true
@@ -1030,6 +1393,224 @@ local function build_list_edit(kind, choice, current_values)
       return pr_service.edit(pr_number, operations)
     end,
   }, nil, false
+end
+
+local function build_list_edit(kind, choice, current_values)
+  local desired = parse_csv_items(type(choice) == "string" and choice or "")
+  return build_list_edit_from_values(kind, desired, current_values)
+end
+
+local selector_cache = {
+  labels = {},
+  reviewers = {},
+}
+
+local function cache_now()
+  return os.time()
+end
+
+local function cache_key_for_repo(details)
+  local repository = normalize_repository(details)
+  return type(repository) == "string" and repository ~= "" and repository or "__unknown__"
+end
+
+local function cache_get(bucket, key, ttl_seconds)
+  local entry = selector_cache[bucket] and selector_cache[bucket][key] or nil
+  if type(entry) ~= "table" then
+    return nil
+  end
+  local age = cache_now() - (tonumber(entry.timestamp) or 0)
+  if age > ttl_seconds then
+    selector_cache[bucket][key] = nil
+    return nil
+  end
+  return vim.deepcopy(entry.value)
+end
+
+local function cache_put(bucket, key, value)
+  selector_cache[bucket] = selector_cache[bucket] or {}
+  selector_cache[bucket][key] = {
+    timestamp = cache_now(),
+    value = vim.deepcopy(value),
+  }
+end
+
+local function load_label_candidates(details)
+  local key = cache_key_for_repo(details)
+  local cached = cache_get("labels", key, 120)
+  if cached then
+    return cached, nil
+  end
+
+  local labels, labels_err = pr_service.fetch_repo_labels({
+    repository = key ~= "__unknown__" and key or nil,
+    per_page = 100,
+    max_pages = 20,
+  })
+  if not labels then
+    return nil, labels_err
+  end
+
+  cache_put("labels", key, labels)
+  return labels, nil
+end
+
+local function load_reviewer_candidates(details)
+  local key = cache_key_for_repo(details)
+  local cached = cache_get("reviewers", key, 120)
+  if cached then
+    return cached, nil
+  end
+
+  local candidates, candidates_err = pr_service.fetch_reviewer_candidates({
+    repository = key ~= "__unknown__" and key or nil,
+    per_page = 100,
+    max_pages = 20,
+  })
+  if not candidates then
+    return nil, candidates_err
+  end
+
+  cache_put("reviewers", key, candidates)
+  return candidates, nil
+end
+
+local function open_label_multi_select(pr, details, callback)
+  local labels, labels_err = load_label_candidates(details)
+  if not labels then
+    notify_error("Unable to load repository labels: " .. tostring(labels_err))
+    callback(false)
+    return
+  end
+
+  local current = current_labels(details)
+  local selected = {}
+  for _, value in ipairs(current) do
+    selected[normalize_key(value)] = true
+  end
+
+  local items = {}
+  local seen = {}
+  for _, label in ipairs(labels) do
+    local name = normalize_string(label.name)
+    local key = normalize_key(name)
+    if name ~= "" and key ~= "" and not seen[key] then
+      seen[key] = true
+      items[#items + 1] = {
+        id = name,
+        value = name,
+        label = name,
+        description = normalize_string(label.description),
+        color = normalize_string(label.color),
+        kind = "label",
+        selected = selected[key] == true,
+      }
+    end
+  end
+
+  for _, current_name in ipairs(current) do
+    local key = normalize_key(current_name)
+    if key ~= "" and not seen[key] then
+      seen[key] = true
+      items[#items + 1] = {
+        id = current_name,
+        value = current_name,
+        label = current_name,
+        description = "",
+        color = "",
+        kind = "label",
+        selected = true,
+      }
+    end
+  end
+
+  table.sort(items, function(left, right)
+    return normalize_key(left.label) < normalize_key(right.label)
+  end)
+
+  multi_select.open({
+    title = string.format("PR #%d - Edit labels", pr.number),
+    items = items,
+    on_confirm = function(values)
+      callback(values)
+    end,
+    on_cancel = function()
+      callback(nil)
+    end,
+  })
+end
+
+local function open_reviewer_multi_select(pr, details, callback)
+  local candidates, candidates_err = load_reviewer_candidates(details)
+  if not candidates then
+    notify_error("Unable to load reviewer candidates: " .. tostring(candidates_err))
+    callback(false)
+    return
+  end
+
+  for _, warning in ipairs(type(candidates.warnings) == "table" and candidates.warnings or {}) do
+    notify_warn(warning)
+  end
+
+  local current = current_reviewers(details)
+  local selected = {}
+  for _, value in ipairs(current) do
+    selected[normalize_key(value)] = true
+  end
+
+  local items = {}
+  local seen = {}
+  for _, candidate in ipairs(type(candidates.merged) == "table" and candidates.merged or {}) do
+    local value = normalize_string(candidate.value)
+    local key = normalize_key(value)
+    if value ~= "" and key ~= "" and not seen[key] then
+      seen[key] = true
+      items[#items + 1] = {
+        id = value,
+        value = value,
+        label = normalize_string(candidate.display) ~= "" and normalize_string(candidate.display) or value,
+        description = "",
+        kind = normalize_string(candidate.kind) == "team" and "team" or "user",
+        selected = selected[key] == true,
+      }
+    end
+  end
+
+  for _, current_value in ipairs(current) do
+    local key = normalize_key(current_value)
+    if key ~= "" and not seen[key] then
+      seen[key] = true
+      local is_team = current_value:find("/", 1, true) ~= nil
+      items[#items + 1] = {
+        id = current_value,
+        value = current_value,
+        label = "@" .. current_value,
+        description = "",
+        kind = is_team and "team" or "user",
+        selected = true,
+      }
+    end
+  end
+
+  table.sort(items, function(left, right)
+    if left.kind ~= right.kind then
+      local left_order = left.kind == "user" and 1 or 2
+      local right_order = right.kind == "user" and 1 or 2
+      return left_order < right_order
+    end
+    return normalize_key(left.value) < normalize_key(right.value)
+  end)
+
+  multi_select.open({
+    title = string.format("PR #%d - Edit reviewers", pr.number),
+    items = items,
+    on_confirm = function(values)
+      callback(values)
+    end,
+    on_cancel = function()
+      callback(nil)
+    end,
+  })
 end
 
 local function build_state_change(choice, details)
@@ -1085,9 +1666,15 @@ local function build_overview_edit_operation(kind, choice, details)
     return build_milestone_edit(choice, details)
   end
   if kind == "edit_labels" then
+    if type(choice) == "table" then
+      return build_list_edit_from_values(kind, choice, current_labels(details))
+    end
     return build_list_edit(kind, choice, current_labels(details))
   end
   if kind == "edit_reviewers" then
+    if type(choice) == "table" then
+      return build_list_edit_from_values(kind, choice, current_reviewers(details))
+    end
     return build_list_edit(kind, choice, current_reviewers(details))
   end
   if kind == "edit_assignees" then
@@ -1162,8 +1749,16 @@ local function refresh_overview_after_edit(pr_number, context)
   end
 end
 
-local function overview_edit_picker(kind, payload, callback)
+local function overview_edit_picker(kind, payload, pr, details, callback)
   payload = type(payload) == "table" and payload or {}
+
+  if kind == "edit_labels" then
+    return open_label_multi_select(pr, details, callback)
+  end
+
+  if kind == "edit_reviewers" then
+    return open_reviewer_multi_select(pr, details, callback)
+  end
 
   if kind == "change_state" then
     vim.ui.select({ "open", "closed" }, {
@@ -1210,7 +1805,11 @@ function M.overview_edit_stub(kind, payload)
     return notify_error(err)
   end
 
-  overview_edit_picker(kind, payload, function(choice)
+  overview_edit_picker(kind, payload, pr, details, function(choice)
+    if choice == false then
+      return
+    end
+
     if choice == nil then
       notify_info(label .. " cancelled")
       return
@@ -1240,6 +1839,7 @@ function M.overview_edit_stub(kind, payload)
 
       notify_info(operation.success or (label .. " completed"))
       refresh_overview_after_edit(pr.number, overview_context)
+      refresh_pr_sources_after_state_change({ force = true })
     end)
   end)
 end
@@ -1294,7 +1894,8 @@ function M.open_commit_diff(commit)
   end
 end
 
-function M.open_diff(file)
+function M.open_diff(file, opts)
+  opts = opts or {}
   local pr, details, err = resolve_active_pr()
   if not pr then
     return notify_error(err)
@@ -1307,12 +1908,25 @@ function M.open_diff(file)
 
   state.set_active_file(selected_file)
   local comments_ctx = build_line_comment_context(pr.number)
+  local diff_view = current_diff_view_preferences({
+    mode = opts.view_mode,
+    ignore_whitespace = opts.ignore_whitespace,
+  })
 
-  local _, diff_err = virtual_files.open_diff(details, pr, selected_file, {
+  local diff_result, diff_err = virtual_files.open_diff(details, pr, selected_file, {
     line_comments = comments_ctx,
+    view_mode = diff_view.mode,
+    ignore_whitespace = diff_view.ignore_whitespace,
+    new_tab = opts.new_tab,
   })
   if diff_err then
     return notify_error(diff_err)
+  end
+
+  if type(diff_result) == "table" and diff_result.file_mode == "added_single" then
+    notify_info("File is new in this PR. Opened single MODIFIED buffer (diff layouts disabled).")
+  elseif type(diff_result) == "table" and diff_result.file_mode == "removed_single" then
+    notify_info("File was removed in this PR. Opened single ORIGINAL buffer (diff layouts disabled).")
   end
 end
 
@@ -1360,6 +1974,158 @@ function M.open_modified(file)
   end
 end
 
+local function reopen_current_diff_with_preferences_impl(opts)
+  opts = opts or {}
+  local bufnr = vim.api.nvim_get_current_buf()
+  local kind = vim.b[bufnr].gh_pr_file_kind
+  if kind ~= "base" and kind ~= "head" and kind ~= "unified" then
+    return false, "Current buffer is not a gh-pr file diff buffer"
+  end
+
+  local number = vim.b[bufnr].gh_pr_number
+  if type(number) ~= "number" then
+    return false, "Unable to resolve pull request number for current buffer"
+  end
+
+  local current_win = vim.api.nvim_get_current_win()
+  local cursor = vim.api.nvim_win_get_cursor(current_win)
+
+  local pr, details, err = resolve_active_pr(number, { refresh = opts.refresh == true })
+  if not pr then
+    return false, err
+  end
+
+  local selected_file = resolve_current_diff_file(details, bufnr)
+  if not selected_file then
+    return false, "Current file is no longer available in this pull request"
+  end
+
+  state.set_active_file(selected_file)
+  local comments_ctx = build_line_comment_context(pr.number)
+  local diff_view = current_diff_view_preferences({
+    mode = opts.view_mode,
+    ignore_whitespace = opts.ignore_whitespace,
+  })
+
+  local _, open_err = virtual_files.open_diff(details, pr, selected_file, {
+    line_comments = comments_ctx,
+    view_mode = diff_view.mode,
+    ignore_whitespace = diff_view.ignore_whitespace,
+    new_tab = opts.new_tab,
+  })
+  if open_err then
+    return false, open_err
+  end
+
+  local active_win = vim.api.nvim_get_current_win()
+  if is_valid_win(current_win) then
+    pcall(vim.api.nvim_set_current_win, current_win)
+    restore_cursor_line(current_win, cursor[1])
+  else
+    restore_cursor_line(active_win, cursor[1])
+  end
+
+  return true, nil
+end
+
+function M.reopen_current_diff_with_preferences(opts)
+  local ok, err = reopen_current_diff_with_preferences_impl(opts or {})
+  if not ok then
+    notify_error(err)
+    return false
+  end
+  return true
+end
+
+function M.refresh_current_diff_buffer()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local kind = vim.b[bufnr].gh_pr_file_kind
+  if kind ~= "base" and kind ~= "head" and kind ~= "unified" and kind ~= "patch" then
+    return notify_error("Current buffer is not a gh-pr diff buffer")
+  end
+
+  local display_path = vim.b[bufnr].gh_pr_file_path or vim.b[bufnr].gh_pr_path or "(unknown file)"
+
+  local number = vim.b[bufnr].gh_pr_number
+  if type(number) ~= "number" then
+    return notify_error("Unable to resolve pull request number for current buffer")
+  end
+
+  if kind == "patch" then
+    local current_win = vim.api.nvim_get_current_win()
+    local cursor = vim.api.nvim_win_get_cursor(current_win)
+    local commit = resolve_commit()
+    if commit then
+      M.open_commit_diff(commit)
+      local active_win = vim.api.nvim_get_current_win()
+      restore_cursor_line(active_win, cursor[1])
+      refresh_pr_sources_after_state_change({ force = true })
+      return
+    end
+    return notify_error("Patch buffer can only be refreshed for commit diffs")
+  end
+
+  local ok, reopen_err = reopen_current_diff_with_preferences_impl({
+    refresh = true,
+    new_tab = false,
+  })
+  if not ok then
+    refresh_pr_sources_after_state_change({ force = true })
+    return notify_error(reopen_err)
+  end
+
+  refresh_pr_sources_after_state_change({ force = true })
+  notify_info(string.format("Refreshed %s from GitHub", display_path))
+end
+
+-- Forward declarations used by quick-close actions defined below.
+local find_diff_pair_windows_for_current_file
+local close_current_diff_view
+local open_review_tree_after_close
+
+function M.close_quick()
+  local kind = vim.b.gh_pr_file_kind
+  if kind ~= "base" and kind ~= "head" and kind ~= "unified" and kind ~= "patch" then
+    return notify_error("Current buffer is not a gh-pr diff buffer")
+  end
+
+  local base_win, head_win = find_diff_pair_windows_for_current_file()
+  if valid_window(base_win) and valid_window(head_win) then
+    local head_buf = vim.api.nvim_win_get_buf(head_win)
+    close_window_if_valid(head_win)
+    delete_buffer_if_valid(head_buf)
+    if valid_window(base_win) then
+      pcall(vim.api.nvim_set_current_win, base_win)
+    end
+    return
+  end
+
+  close_current_diff_view()
+  open_review_tree_after_close()
+end
+
+function M.close_all_and_open_review()
+  local kind = vim.b.gh_pr_file_kind
+  if kind ~= "base" and kind ~= "head" and kind ~= "unified" and kind ~= "patch" then
+    return notify_error("Current buffer is not a gh-pr diff buffer")
+  end
+
+  local base_win, head_win = find_diff_pair_windows_for_current_file()
+  if valid_window(base_win) and valid_window(head_win) then
+    local base_buf = vim.api.nvim_win_get_buf(base_win)
+    local head_buf = vim.api.nvim_win_get_buf(head_win)
+
+    close_window_if_valid(head_win)
+    close_window_if_valid(base_win)
+    delete_buffer_if_valid(head_buf)
+    delete_buffer_if_valid(base_buf)
+  else
+    close_current_diff_view()
+  end
+
+  open_review_tree_after_close()
+end
+
 local function file_path(file)
   if type(file) ~= "table" then
     return nil
@@ -1396,11 +2162,15 @@ local function ordered_pr_files(details)
 end
 
 local function current_navigation_mode()
+  local kind = vim.b.gh_pr_file_kind
+  if kind == "unified" then
+    return "unified"
+  end
+
   if vim.wo.diff then
     return "diff"
   end
 
-  local kind = vim.b.gh_pr_file_kind
   if kind == "base" then
     return "base"
   end
@@ -1429,6 +2199,74 @@ local function find_diff_pair_windows()
   end
 
   return base_win, head_win
+end
+
+find_diff_pair_windows_for_current_file = function()
+  local tab = vim.api.nvim_get_current_tabpage()
+  local base_win, head_win
+  local current_number = vim.b.gh_pr_number
+  local current_path = normalize_path(vim.b.gh_pr_file_path or vim.b.gh_pr_path)
+
+  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+    if valid_window(winid) then
+      local bufnr = vim.api.nvim_win_get_buf(winid)
+      local kind = vim.b[bufnr].gh_pr_file_kind
+      if kind == "base" or kind == "head" then
+        local number = vim.b[bufnr].gh_pr_number
+        local path = normalize_path(vim.b[bufnr].gh_pr_file_path or vim.b[bufnr].gh_pr_path)
+        local same_number = type(current_number) ~= "number" or number == current_number
+        local same_path = current_path == "" or path == "" or path == current_path
+
+        if same_number and same_path then
+          if kind == "base" and not base_win then
+            base_win = winid
+          elseif kind == "head" and not head_win then
+            head_win = winid
+          end
+        end
+      end
+    end
+  end
+
+  return base_win, head_win
+end
+
+local function close_window_if_valid(winid)
+  if not valid_window(winid) then
+    return false
+  end
+
+  return pcall(vim.api.nvim_win_close, winid, true)
+end
+
+local function delete_buffer_if_valid(bufnr)
+  if not is_valid_buf(bufnr) then
+    return false
+  end
+
+  return pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+end
+
+close_current_diff_view = function()
+  local winid = vim.api.nvim_get_current_win()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local tab_wins = vim.api.nvim_tabpage_list_wins(vim.api.nvim_get_current_tabpage())
+
+  if #tab_wins > 1 then
+    if close_window_if_valid(winid) then
+      delete_buffer_if_valid(bufnr)
+      return
+    end
+  end
+
+  delete_buffer_if_valid(bufnr)
+end
+
+open_review_tree_after_close = function()
+  local opened, open_err = open_review_tree_from_plugin({ toggle = false })
+  if not opened and open_err then
+    notify_warn("Closed diff view but could not open PR Review: " .. tostring(open_err))
+  end
 end
 
 local function open_diff_in_place(file)
@@ -1525,6 +2363,11 @@ local function open_file_for_navigation(file, mode)
     return
   end
 
+  if mode == "unified" then
+    M.open_diff(file, { new_tab = false, view_mode = "unified" })
+    return
+  end
+
   M.open_modified(file)
 end
 
@@ -1588,8 +2431,8 @@ function M.mark_file_viewed(file, viewed)
     return notify_error("Unable to resolve repository for viewed state")
   end
 
-  local path = selected_file.path or selected_file.filename
-  if not path then
+  local path = resolve_canonical_file_path(details, selected_file.path or selected_file.filename)
+  if path == "" then
     return notify_error("Unable to resolve file path")
   end
 
@@ -1601,20 +2444,648 @@ function M.mark_file_viewed(file, viewed)
   state.set_active_file(selected_file)
 
   notify_info(string.format("Marked %s as %s", path, viewed and "viewed" or "unviewed"))
+  refresh_pr_sources_after_state_change()
 end
 
 function M.toggle_viewed()
-  local path = vim.b.gh_pr_path
+  local kind = vim.b.gh_pr_file_kind
+  local path = vim.b.gh_pr_file_path or vim.b.gh_pr_path
   local number = vim.b.gh_pr_number
   local repository = vim.b.gh_pr_repo
 
+  if kind == "patch" then
+    return notify_error("Viewed state is only available for file buffers")
+  end
+
   if type(path) == "string" and type(number) == "number" and type(repository) == "string" then
+    local _, details = state.get_active_pr()
+    if type(details) == "table" and tonumber(details.number) == number then
+      path = resolve_canonical_file_path(details, path)
+    else
+      path = normalize_path(path)
+    end
+
+    if path == "" then
+      return notify_error("Unable to resolve file path")
+    end
+
     local viewed = state.toggle_viewed(repository, number, path)
     notify_info(string.format("Marked %s as %s", path, viewed and "viewed" or "unviewed"))
+    refresh_pr_sources_after_state_change()
     return
   end
 
   M.mark_file_viewed(nil, nil)
+end
+
+function M.set_active_review(pr, details)
+  details = details or pr
+  local repository = normalize_repository(details)
+  if not repository then
+    return false, "Unable to resolve repository for active review"
+  end
+
+  local stored = state.set_active_review(repository, pr, details)
+  if not stored then
+    return false, "Unable to store active review state"
+  end
+
+  return true, nil
+end
+
+function M.activate_review(number, opts)
+  opts = opts or {}
+  local pr, details, err = resolve_active_pr(number, { refresh = opts.refresh == true })
+  if not pr then
+    return nil, nil, err
+  end
+
+  local ok, review_err = M.set_active_review(pr, details)
+  if not ok then
+    return nil, nil, review_err
+  end
+
+  return pr, details, nil
+end
+
+function M.toggle_review_tree()
+  local ok, err = open_review_tree_from_plugin({ toggle = true })
+  if not ok and err then
+    notify_error(err)
+  end
+end
+
+function M.start_review(number)
+  local pr, details, err = resolve_active_pr(number, { refresh = number ~= nil })
+  if not pr then
+    return notify_error(err)
+  end
+
+  local repository = normalize_repository(details)
+  if not repository then
+    return notify_error("Unable to resolve repository for PR review")
+  end
+
+  local current_pr = state.get_active_review(repository)
+
+  local function finalize_start()
+    local stored, store_err = M.set_active_review(pr, details)
+    if not stored then
+      notify_error(store_err)
+      return
+    end
+
+    state.set_active_pr(pr, details)
+    local opened, open_err = open_review_tree_from_plugin({ toggle = false })
+    if not opened and open_err then
+      notify_warn("Review started but PR Review source could not be opened: " .. tostring(open_err))
+      return
+    end
+    notify_info(string.format("Started review for PR #%d", pr.number))
+  end
+
+  local function prompt_remote_review()
+    vim.ui.select({ "yes", "no", "cancel" }, {
+      prompt = string.format("Notify GitHub that review started for PR #%d?", pr.number),
+    }, function(choice)
+      if choice == nil or choice == "cancel" then
+        notify_info("Start review cancelled")
+        return
+      end
+
+      if choice == "yes" then
+        local pending_ok, pending_err = pr_service.ensure_pending_review(pr.number)
+        if not pending_ok then
+          notify_error(pending_err)
+          return
+        end
+      end
+
+      finalize_start()
+    end)
+  end
+
+  if current_pr and tonumber(current_pr.number) and tonumber(current_pr.number) ~= tonumber(pr.number) then
+    vim.ui.select({ "replace", "cancel" }, {
+      prompt = string.format(
+        "Replace active review PR #%d with PR #%d for %s?",
+        tonumber(current_pr.number),
+        tonumber(pr.number),
+        repository
+      ),
+    }, function(choice)
+      if choice ~= "replace" then
+        notify_info("Start review cancelled")
+        return
+      end
+      prompt_remote_review()
+    end)
+    return
+  end
+
+  prompt_remote_review()
+end
+
+local function add_unique_path(target, seen, path)
+  if type(path) ~= "string" or path == "" then
+    return
+  end
+  if seen[path] then
+    return
+  end
+  seen[path] = true
+  target[#target + 1] = path
+end
+
+local function resolve_comment_path(file)
+  if type(file) ~= "table" then
+    return nil
+  end
+
+  local path = file.path or file.filename
+  if type(path) ~= "string" or path == "" then
+    return nil
+  end
+
+  return path
+end
+
+local function confirm_file_global_comment(pr_number, path, body, callback)
+  local summary = "(empty message)"
+  if type(body) == "string" and body ~= "" then
+    local first_line = vim.split(body, "\n", { plain = true })[1] or ""
+    first_line = vim.trim(first_line)
+    if first_line ~= "" then
+      summary = #first_line > 70 and (first_line:sub(1, 67) .. "...") or first_line
+    end
+  end
+  vim.ui.select({ "confirm", "cancel" }, {
+    prompt = string.format("Add pending file comment on PR #%d (%s)? Message: %s", pr_number, path, summary),
+  }, function(choice)
+    callback(choice == "confirm")
+  end)
+end
+
+local function alternate_paths_for_file(file, fallback_path)
+  local paths = {}
+  local seen = {}
+  add_unique_path(paths, seen, fallback_path)
+
+  if type(file) == "table" then
+    add_unique_path(paths, seen, file.path)
+    add_unique_path(paths, seen, file.filename)
+    add_unique_path(paths, seen, file.previousFilename)
+    add_unique_path(paths, seen, file.previous_filename)
+  end
+
+  return paths
+end
+
+function M.add_file_global_comment(file)
+  local pr, _, err = resolve_active_pr()
+  if not pr then
+    return notify_error(err)
+  end
+
+  local selected_file = resolve_file(file)
+  local path = resolve_comment_path(selected_file)
+  if type(path) ~= "string" or path == "" then
+    return notify_error("No file selected for global comment")
+  end
+
+  comment_composer.open({
+    title = string.format("PR #%d file comment (%s)", pr.number, path),
+    filetype = "markdown",
+    border = "rounded",
+    initial_lines = { "" },
+    enter = true,
+    on_cancel = function()
+      notify_info("Pending file comment cancelled")
+    end,
+    on_submit = function(text)
+      local trimmed = vim.trim(type(text) == "string" and text or "")
+      if trimmed == "" then
+        notify_info("Pending file comment cancelled (empty message)")
+        return
+      end
+
+      confirm_file_global_comment(pr.number, path, trimmed, function(confirmed)
+        if not confirmed then
+          notify_info("Pending file comment cancelled")
+          return
+        end
+
+        local payload = string.format("File `%s`\n\n%s", path, trimmed)
+        local ok, comment_err = pr_service.add_pending_review_comment(pr.number, payload, {
+          append = true,
+          separator = "\n\n---\n\n",
+        })
+        if not ok then
+          notify_error(comment_err)
+          return
+        end
+
+        notify_info(string.format("Pending file comment added for %s", path))
+        refresh_pr_sources_after_state_change({ force = true })
+      end)
+    end,
+  })
+end
+
+local function normalize_line_number(value)
+  local number = tonumber(value)
+  if not number then
+    return nil
+  end
+
+  number = math.floor(number)
+  if number < 1 then
+    return nil
+  end
+
+  return number
+end
+
+local function normalize_line_range(start_line, line)
+  local start_value = normalize_line_number(start_line)
+  local line_value = normalize_line_number(line)
+  if not line_value then
+    return nil, nil
+  end
+
+  if start_value and start_value > line_value then
+    start_value, line_value = line_value, start_value
+  end
+
+  if start_value == line_value then
+    start_value = nil
+  end
+
+  return start_value, line_value
+end
+
+local function parse_patch_head_line_map(patch)
+  if type(patch) ~= "string" or patch == "" then
+    return nil
+  end
+
+  local line_map = {}
+  local old_line = nil
+  local new_line = nil
+  local has_hunks = false
+
+  for _, raw in ipairs(vim.split(patch, "\n", { plain = true, trimempty = false })) do
+    local old_start, new_start = raw:match("^@@%s+%-(%d+),?%d*%s+%+(%d+),?%d*%s+@@")
+    if old_start and new_start then
+      old_line = tonumber(old_start)
+      new_line = tonumber(new_start)
+      has_hunks = true
+      goto continue
+    end
+
+    if old_line and new_line then
+      local prefix = raw:sub(1, 1)
+      if prefix == " " then
+        line_map[new_line] = line_map[new_line] or { kind = "context" }
+        old_line = old_line + 1
+        new_line = new_line + 1
+      elseif prefix == "+" then
+        line_map[new_line] = { kind = "add" }
+        new_line = new_line + 1
+      elseif prefix == "-" then
+        old_line = old_line + 1
+      elseif prefix == "\\" then
+        -- "\ No newline at end of file"
+      end
+    end
+
+    ::continue::
+  end
+
+  if not has_hunks then
+    return nil
+  end
+
+  return line_map
+end
+
+local function resolve_inline_patch(pr_number, file, path)
+  local patch = type(file) == "table" and type(file.patch) == "string" and file.patch or ""
+  if patch ~= "" then
+    return patch, nil
+  end
+
+  local fetched, patch_err = pr_service.fetch_patch_for_file(pr_number, path)
+  if fetched and fetched ~= "" then
+    return fetched, nil
+  end
+
+  return nil, patch_err or "No textual patch available"
+end
+
+local function resolve_inline_comment_path(details, selected_file)
+  local path = resolve_comment_path(selected_file) or vim.b.gh_pr_file_path or vim.b.gh_pr_path
+  if type(path) ~= "string" or path == "" then
+    return nil
+  end
+
+  local canonical = resolve_canonical_file_path(details, path)
+  if canonical == "" then
+    return path
+  end
+
+  return canonical
+end
+
+local function resolve_requested_inline_range(opts)
+  local start_line, line = normalize_line_range(opts.start_line, opts.line)
+  if not line then
+    line = normalize_line_number(vim.api.nvim_win_get_cursor(0)[1])
+  end
+  if not line then
+    return nil, nil
+  end
+
+  return normalize_line_range(start_line, line)
+end
+
+local function validate_head_inline_target(pr_number, selected_file, path, start_line, line)
+  local patch, patch_err = resolve_inline_patch(pr_number, selected_file, path)
+  if not patch then
+    local reason = patch_err and tostring(patch_err) or "No textual patch available"
+    return nil, "No se puede comentar esta ubicación: " .. reason
+  end
+
+  local head_line_map = parse_patch_head_line_map(patch)
+  if type(head_line_map) ~= "table" or vim.tbl_isempty(head_line_map) then
+    return nil, "No se puede comentar esta ubicación: el archivo no tiene hunks válidos en el diff."
+  end
+
+  local first = start_line or line
+  for current = first, line do
+    if not head_line_map[current] then
+      return nil, "No se puede comentar fuera del alcance de los cambios del archivo en el diff."
+    end
+  end
+
+  return {
+    path = path,
+    start_line = start_line,
+    line = line,
+    side = "RIGHT",
+    start_side = "RIGHT",
+  }, nil
+end
+
+local function validate_added_inline_target(path, start_line, line)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local max_line = vim.api.nvim_buf_line_count(bufnr)
+  if type(max_line) ~= "number" or max_line < 1 then
+    return nil, "No se pudo resolver el archivo para comentar."
+  end
+
+  local first = start_line or line
+  if first < 1 or line < 1 or first > max_line or line > max_line then
+    return nil, "El rango seleccionado está fuera del archivo."
+  end
+
+  return {
+    path = path,
+    start_line = start_line,
+    line = line,
+    side = "RIGHT",
+    start_side = "RIGHT",
+  }, nil
+end
+
+local function validate_unified_inline_target(path, start_render_line, end_render_line)
+  local unified_map = vim.b.gh_pr_unified_line_map
+  if type(unified_map) ~= "table" or vim.tbl_isempty(unified_map) then
+    return nil, "No se pudo validar la selección en modo unified. Refrescá el diff con R."
+  end
+
+  local first = start_render_line or end_render_line
+  local mapped_start = nil
+  local mapped_end = nil
+  local previous_head_line = nil
+
+  for render_line = first, end_render_line do
+    local entry = unified_map[render_line]
+    if type(entry) ~= "table" then
+      return nil, "No se puede comentar fuera del alcance de los cambios del archivo en el diff."
+    end
+
+    if entry.kind ~= "add" then
+      return nil, "En modo unified solo se puede comentar sobre líneas agregadas (+) del diff."
+    end
+
+    local head_line = normalize_line_number(entry.head_line)
+    if not head_line then
+      return nil, "No se pudo resolver la línea destino del comentario en el diff."
+    end
+
+    if previous_head_line and head_line ~= (previous_head_line + 1) then
+      return nil, "El rango seleccionado no es continuo en líneas agregadas (+) del diff."
+    end
+
+    previous_head_line = head_line
+    mapped_start = mapped_start or head_line
+    mapped_end = head_line
+  end
+
+  local start_line, line = normalize_line_range(mapped_start, mapped_end)
+  if not line then
+    return nil, "No se pudo resolver la línea destino del comentario en el diff."
+  end
+
+  return {
+    path = path,
+    start_line = start_line,
+    line = line,
+    side = "RIGHT",
+    start_side = "RIGHT",
+  }, nil
+end
+
+local function resolve_inline_comment_target(pr, details, selected_file, opts)
+  local kind = type(vim.b.gh_pr_file_kind) == "string" and vim.b.gh_pr_file_kind or ""
+  if kind ~= "head" and kind ~= "unified" then
+    return nil, "Inline comments solo están disponibles en MODIFIED (head) o unified."
+  end
+
+  local path = resolve_inline_comment_path(details, selected_file)
+  if type(path) ~= "string" or path == "" then
+    return nil, "Unable to resolve file path for inline comment"
+  end
+
+  local start_line, line = resolve_requested_inline_range(opts or {})
+  if not line then
+    return nil, "Unable to resolve target line for inline comment"
+  end
+
+  if kind == "unified" then
+    return validate_unified_inline_target(path, start_line, line)
+  end
+
+  local file_mode = type(vim.b.gh_pr_file_mode) == "string" and vim.b.gh_pr_file_mode or ""
+  if file_mode == "added_single" then
+    return validate_added_inline_target(path, start_line, line)
+  end
+
+  return validate_head_inline_target(pr.number, selected_file, path, start_line, line)
+end
+
+local function visual_line_range()
+  local start_pos = vim.fn.getpos("'<")
+  local end_pos = vim.fn.getpos("'>")
+  local start_line = normalize_line_number(start_pos[2])
+  local end_line = normalize_line_number(end_pos[2])
+  if not start_line or not end_line then
+    return nil, nil
+  end
+  return normalize_line_range(start_line, end_line)
+end
+
+local function leave_visual_mode()
+  local esc = vim.api.nvim_replace_termcodes("<Esc>", true, false, true)
+  vim.api.nvim_feedkeys(esc, "nx", false)
+end
+
+local function refresh_line_comments_for_pr(pr_number, details)
+  local context = build_line_comment_context(pr_number)
+  if not context then
+    return
+  end
+
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
+      local buffer_pr = vim.b[bufnr].gh_pr_number
+      local kind = vim.b[bufnr].gh_pr_file_kind
+      local file_path = vim.b[bufnr].gh_pr_path
+
+      if buffer_pr == pr_number and (kind == "base" or kind == "head") and type(file_path) == "string" and file_path ~= "" then
+        local side = kind == "base" and "base" or "head"
+        local file = find_file_in_details(details, file_path)
+        line_comments.attach_to_buffer(bufnr, {
+          index = context.index,
+          side = side,
+          file_path = file_path,
+          alternate_paths = alternate_paths_for_file(file, file_path),
+          keymap = context.keymap,
+          signs = context.signs,
+          max_popup_width = context.max_popup_width,
+          max_popup_height = context.max_popup_height,
+        })
+      end
+    end
+  end
+end
+
+local function summarize_review_body(body)
+  local raw = type(body) == "string" and body or ""
+  if raw == "" then
+    return "(empty message)"
+  end
+
+  local first_line = vim.split(raw, "\n", { plain = true })[1] or ""
+  first_line = vim.trim(first_line)
+  if first_line == "" then
+    return "(empty message)"
+  end
+  if #first_line > 70 then
+    return first_line:sub(1, 67) .. "..."
+  end
+  return first_line
+end
+
+local function confirm_inline_comment(pr_number, path, start_line, line, body, callback)
+  local location
+  if start_line then
+    location = string.format("%s:%d-%d", path, start_line, line)
+  else
+    location = string.format("%s:%d", path, line)
+  end
+
+  local prompt = string.format(
+    "Create inline comment on PR #%d at %s? Message: %s",
+    pr_number,
+    location,
+    summarize_review_body(body)
+  )
+
+  vim.ui.select({ "confirm", "cancel" }, {
+    prompt = prompt,
+  }, function(choice)
+    callback(choice == "confirm")
+  end)
+end
+
+function M.add_inline_comment(opts)
+  opts = type(opts) == "table" and opts or {}
+
+  local pr, details, err = resolve_active_pr()
+  if not pr then
+    return notify_error(err)
+  end
+
+  local selected_file = resolve_file(opts.file)
+  local target, target_err = resolve_inline_comment_target(pr, details, selected_file, opts)
+  if not target then
+    return notify_error(target_err)
+  end
+
+  comment_composer.open({
+    title = string.format("PR #%d inline comment", pr.number),
+    filetype = "markdown",
+    border = "rounded",
+    initial_lines = { "" },
+    enter = true,
+    on_cancel = function()
+      notify_info("Inline comment cancelled")
+    end,
+    on_submit = function(text)
+      if vim.trim(text) == "" then
+        notify_info("Inline comment cancelled (empty message)")
+        return
+      end
+
+      confirm_inline_comment(pr.number, target.path, target.start_line, target.line, text, function(confirmed)
+        if not confirmed then
+          notify_info("Inline comment cancelled")
+          return
+        end
+
+        local ok, comment_err = pr_service.add_pending_inline_comment(pr.number, {
+          path = target.path,
+          body = text,
+          line = target.line,
+          start_line = target.start_line,
+          side = target.side,
+          start_side = target.start_side,
+        })
+        if not ok then
+          notify_error(comment_err)
+          return
+        end
+
+        notify_info(string.format("Inline comment added to pending review on %s", target.path))
+        refresh_line_comments_for_pr(pr.number, details)
+      end)
+    end,
+  })
+end
+
+function M.add_inline_comment_visual()
+  local start_line, line = visual_line_range()
+  leave_visual_mode()
+  if not line then
+    return notify_error("Unable to resolve selected range for inline comment")
+  end
+
+  M.add_inline_comment({
+    start_line = start_line,
+    line = line,
+  })
 end
 
 local function prompt_review_body(default_body, callback)
@@ -1640,30 +3111,13 @@ local function review_event_label(event)
   return labels[event]
 end
 
-local function review_body_summary(body)
-  local raw = type(body) == "string" and body or ""
-  if raw == "" then
-    return "(empty message)"
-  end
-
-  local first_line = vim.split(raw, "\n", { plain = true })[1] or ""
-  first_line = vim.trim(first_line)
-  if first_line == "" then
-    return "(empty message)"
-  end
-  if #first_line > 70 then
-    return first_line:sub(1, 67) .. "..."
-  end
-  return first_line
-end
-
 local function confirm_review_submission(event, pr_number, body, callback)
   local label = review_event_label(event) or event
   local prompt = string.format(
     "Submit %s review for PR #%d? Message: %s",
     label,
     pr_number,
-    review_body_summary(body)
+    summarize_review_body(body)
   )
 
   vim.ui.select({ "confirm", "cancel" }, {
@@ -1713,6 +3167,83 @@ function M.review(event)
   end)
 end
 
+function M.submit_pending_review(event)
+  local pr, details, err = resolve_active_pr()
+  if not pr then
+    return notify_error(err)
+  end
+
+  local label = review_event_label(event)
+  if not label then
+    return notify_error("Unsupported review event")
+  end
+
+  local defaults = {
+    approve = "",
+    request_changes = "Requested changes from Neovim",
+    comment = "",
+  }
+
+  prompt_review_body(defaults[event] or "", function(body, input_cancelled)
+    if input_cancelled then
+      notify_info("Pending review submission cancelled")
+      return
+    end
+
+    confirm_review_submission(event, pr.number, body, function(confirmed)
+      if not confirmed then
+        notify_info("Pending review submission cancelled")
+        return
+      end
+
+      local ok, review_err = pr_service.submit_pending_review(pr.number, event, body)
+      if not ok then
+        notify_error(review_err)
+        return
+      end
+
+      notify_info(string.format("Pending %s review submitted for PR #%d", label, pr.number))
+      refresh_line_comments_for_pr(pr.number, details)
+    end)
+  end)
+end
+
+function M.submit_pending_comment_review()
+  M.submit_pending_review("comment")
+end
+
+function M.submit_pending_approve_review()
+  M.submit_pending_review("approve")
+end
+
+function M.submit_pending_request_changes_review()
+  M.submit_pending_review("request_changes")
+end
+
+function M.discard_pending_review()
+  local pr, _, err = resolve_active_pr()
+  if not pr then
+    return notify_error(err)
+  end
+
+  vim.ui.select({ "confirm", "cancel" }, {
+    prompt = string.format("Discard pending review for PR #%d?", pr.number),
+  }, function(choice)
+    if choice ~= "confirm" then
+      notify_info("Discard pending review cancelled")
+      return
+    end
+
+    local ok, discard_err = pr_service.discard_pending_review(pr.number)
+    if not ok then
+      notify_error(discard_err)
+      return
+    end
+
+    notify_info(string.format("Pending review discarded for PR #%d", pr.number))
+  end)
+end
+
 function M.merge(method)
   local pr, _, err = resolve_active_pr()
   if not pr then
@@ -1741,21 +3272,255 @@ end
 function M.next_change()
   if vim.wo.diff then
     vim.cmd("normal! ]c")
+    return
+  end
+
+  if vim.b.gh_pr_file_kind ~= "unified" then
+    return
+  end
+
+  local bufnr = vim.api.nvim_get_current_buf()
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  for line = cursor[1] + 1, line_count do
+    local text = (vim.api.nvim_buf_get_lines(bufnr, line - 1, line, false)[1] or "")
+    if vim.startswith(text, "+ ") or vim.startswith(text, "- ") then
+      vim.api.nvim_win_set_cursor(0, { line, 0 })
+      return
+    end
   end
 end
 
 function M.prev_change()
   if vim.wo.diff then
     vim.cmd("normal! [c")
+    return
+  end
+
+  if vim.b.gh_pr_file_kind ~= "unified" then
+    return
+  end
+
+  local bufnr = vim.api.nvim_get_current_buf()
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  for line = cursor[1] - 1, 1, -1 do
+    local text = (vim.api.nvim_buf_get_lines(bufnr, line - 1, line, false)[1] or "")
+    if vim.startswith(text, "+ ") or vim.startswith(text, "- ") then
+      vim.api.nvim_win_set_cursor(0, { line, 0 })
+      return
+    end
+  end
+end
+
+function M.toggle_diff_whitespace()
+  local prefs = current_diff_view_preferences()
+  prefs.ignore_whitespace = not prefs.ignore_whitespace
+  prefs = persist_diff_view_preferences(prefs)
+
+  local reopened = M.reopen_current_diff_with_preferences({
+    new_tab = false,
+  })
+  if not reopened then
+    return
+  end
+  notify_info(string.format("Diff whitespace: %s", prefs.ignore_whitespace and "ignored" or "strict"))
+end
+
+function M.cycle_diff_view_mode()
+  local order = { "vertical", "horizontal", "unified" }
+  local prefs = current_diff_view_preferences()
+  local index = 1
+  for i, mode in ipairs(order) do
+    if mode == prefs.mode then
+      index = i
+      break
+    end
+  end
+
+  prefs.mode = order[(index % #order) + 1]
+  prefs = persist_diff_view_preferences(prefs)
+
+  local reopened = M.reopen_current_diff_with_preferences({
+    view_mode = prefs.mode,
+    new_tab = false,
+  })
+  if not reopened then
+    return
+  end
+  notify_info(string.format("Diff mode: %s", prefs.mode))
+end
+
+function M.set_diff_view_mode(mode)
+  local prefs = current_diff_view_preferences({
+    mode = mode,
+  })
+  prefs = persist_diff_view_preferences(prefs)
+
+  local reopened = M.reopen_current_diff_with_preferences({
+    view_mode = prefs.mode,
+    new_tab = false,
+  })
+  if not reopened then
+    return
+  end
+  notify_info(string.format("Diff mode: %s", prefs.mode))
+end
+
+function M.set_diff_view_mode_vertical()
+  M.set_diff_view_mode("vertical")
+end
+
+function M.set_diff_view_mode_horizontal()
+  M.set_diff_view_mode("horizontal")
+end
+
+function M.set_diff_view_mode_unified()
+  M.set_diff_view_mode("unified")
+end
+
+local function shortcut_line(label, value)
+  return string.format("%-7s %s", label, value)
+end
+
+local function diff_shortcut_lines(bufnr)
+  local kind = type(vim.b[bufnr].gh_pr_file_kind) == "string" and vim.b[bufnr].gh_pr_file_kind or "head"
+  local file_mode = type(vim.b[bufnr].gh_pr_file_mode) == "string" and vim.b[bufnr].gh_pr_file_mode or ""
+  local prefs = current_diff_view_preferences()
+  local shortcuts = diff_view_shortcuts()
+
+  local mode_label = prefs.mode
+  if file_mode == "added_single" then
+    mode_label = "single (added file)"
+  elseif file_mode == "removed_single" then
+    mode_label = "single (removed file)"
+  elseif mode_label == "vertical" then
+    mode_label = "vertical split"
+  elseif mode_label == "horizontal" then
+    mode_label = "horizontal split"
+  else
+    mode_label = "unified"
+  end
+
+  local function add_shortcut(lines, key, description)
+    if type(key) == "string" and key ~= "" then
+      lines[#lines + 1] = shortcut_line(key, description)
+    end
+  end
+
+  local lines = {
+    "gh-pr diff shortcuts",
+    "",
+    "Diff render state",
+    shortcut_line("mode", mode_label),
+    shortcut_line("spaces", prefs.ignore_whitespace and "ignored" or "strict"),
+    "",
+    "General",
+    shortcut_line("K", kind == "unified" and "Not available in unified mode" or "Show line comments popup"),
+    shortcut_line("?", "Show this help"),
+    shortcut_line("R", "Refresh current diff from GitHub"),
+    shortcut_line("q", "Quick close (or close head in 2-way diff)"),
+    shortcut_line("Q", "Close view(s) and open PR Review"),
+  }
+
+  if file_mode ~= "added_single" and file_mode ~= "removed_single" then
+    add_shortcut(lines, shortcuts.toggle_whitespace, "Toggle whitespace changes")
+    add_shortcut(lines, shortcuts.cycle_mode, "Cycle diff mode")
+    add_shortcut(lines, shortcuts.set_vertical, "Set vertical split")
+    add_shortcut(lines, shortcuts.set_horizontal, "Set horizontal split")
+    add_shortcut(lines, shortcuts.set_unified, "Set unified mode")
+  else
+    lines[#lines + 1] = shortcut_line("-", "Diff layout toggles disabled for single-file mode")
+  end
+
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Navigation"
+  lines[#lines + 1] = shortcut_line(",n", "Next change")
+  lines[#lines + 1] = shortcut_line(",p", "Previous change")
+  lines[#lines + 1] = shortcut_line(",f", "Next file in PR")
+  lines[#lines + 1] = shortcut_line(",F", "Previous file in PR")
+  lines[#lines + 1] = shortcut_line(",v", "Next reviewed file")
+  lines[#lines + 1] = shortcut_line(",V", "Previous reviewed file")
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Pending review"
+  lines[#lines + 1] = shortcut_line(",rs", "Submit pending review as comment")
+  lines[#lines + 1] = shortcut_line(",ra", "Submit pending review as approve")
+  lines[#lines + 1] = shortcut_line(",rr", "Submit pending review as request changes")
+  lines[#lines + 1] = shortcut_line(",rd", "Discard pending review")
+  lines[#lines + 1] = shortcut_line(",x", "Toggle PR Review source")
+
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Inline comments"
+
+  if kind == "head" and file_mode == "added_single" then
+    lines[#lines + 1] = shortcut_line("gc", "Create inline comment at cursor (any line)")
+    lines[#lines + 1] = shortcut_line("v/V + gc", "Create inline comment on selected range")
+  elseif kind == "head" then
+    lines[#lines + 1] = shortcut_line("gc", "Create inline comment at cursor")
+    lines[#lines + 1] = shortcut_line("v/V + gc", "Create inline comment on selected range")
+  elseif kind == "unified" then
+    lines[#lines + 1] = shortcut_line("gc", "Create inline comment on added (+) line")
+    lines[#lines + 1] = shortcut_line("v/V + gc", "Create inline comment on added (+) range")
+  else
+    lines[#lines + 1] = shortcut_line("gc", "Only available on MODIFIED (head) or unified")
+  end
+
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Close help: q or <Esc>"
+  return lines
+end
+
+function M.show_diff_shortcuts()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local kind = type(vim.b[bufnr].gh_pr_file_kind) == "string" and vim.b[bufnr].gh_pr_file_kind or "unknown"
+  local pr_number = type(vim.b[bufnr].gh_pr_number) == "number" and vim.b[bufnr].gh_pr_number or nil
+  local path = type(vim.b[bufnr].gh_pr_path) == "string" and vim.b[bufnr].gh_pr_path or "?"
+
+  local title = "PR diff shortcuts"
+  if pr_number then
+    title = string.format("PR #%d diff shortcuts", pr_number)
+  end
+
+  local ok, popup_err = comment_popup.open({
+    origin_bufnr = bufnr,
+    tag = "shortcuts",
+    title = title,
+    location = string.format("%s (%s)", path, kind),
+    lines = diff_shortcut_lines(bufnr),
+    mode = "open",
+    enter = true,
+    position = "editor",
+    border = "rounded",
+    wrap = false,
+    min_width = 56,
+    min_height = 18,
+    max_width = 120,
+    max_height = 40,
+    close_on_origin_move = false,
+    filetype = "markdown",
+  })
+
+  if not ok and popup_err then
+    notify_warn("Unable to open shortcuts help: " .. tostring(popup_err))
   end
 end
 
 function M.current_viewed_state()
-  local path = vim.b.gh_pr_path
+  if vim.b.gh_pr_file_kind == "patch" then
+    return false
+  end
+
+  local path = vim.b.gh_pr_file_path or vim.b.gh_pr_path
   local number = vim.b.gh_pr_number
   local repository = vim.b.gh_pr_repo
 
   if type(path) == "string" and type(number) == "number" and type(repository) == "string" then
+    local _, details = state.get_active_pr()
+    if type(details) == "table" and tonumber(details.number) == number then
+      path = resolve_canonical_file_path(details, path)
+    else
+      path = normalize_path(path)
+    end
+
     return state.is_viewed(repository, number, path)
   end
 

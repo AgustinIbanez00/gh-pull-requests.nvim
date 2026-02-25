@@ -451,10 +451,41 @@ end
 
 local function normalize_files(files)
   local normalized = {}
+  local by_path = {}
+  local order = {}
+
+  local function upsert(entry)
+    local existing = by_path[entry.path]
+    if not existing then
+      by_path[entry.path] = entry
+      order[#order + 1] = entry.path
+      return
+    end
+
+    if existing.filename == "" and entry.filename ~= "" then
+      existing.filename = entry.filename
+    end
+    if existing.previous_filename == "" and entry.previous_filename ~= "" then
+      existing.previous_filename = entry.previous_filename
+    end
+    if existing.status == "" and entry.status ~= "" then
+      existing.status = entry.status
+    end
+    if existing.patch == "" and entry.patch ~= "" then
+      existing.patch = entry.patch
+    end
+    if tonumber(existing.additions) == 0 and tonumber(entry.additions) > 0 then
+      existing.additions = entry.additions
+    end
+    if tonumber(existing.deletions) == 0 and tonumber(entry.deletions) > 0 then
+      existing.deletions = entry.deletions
+    end
+  end
+
   for _, file in ipairs(type(files) == "table" and files or {}) do
     local path = normalize_string(file.path, normalize_string(file.filename, ""))
     if path ~= "" then
-      normalized[#normalized + 1] = {
+      upsert({
         path = path,
         filename = normalize_string(file.filename, path),
         previous_filename = normalize_string(file.previousFilename, normalize_string(file.previous_filename, "")),
@@ -462,10 +493,117 @@ local function normalize_files(files)
         additions = tonumber(file.additions) or 0,
         deletions = tonumber(file.deletions) or 0,
         patch = normalize_string(file.patch, ""),
+      })
+    end
+  end
+
+  for _, path in ipairs(order) do
+    normalized[#normalized + 1] = by_path[path]
+  end
+
+  return normalized
+end
+
+local function dedupe_prs(prs)
+  local result = {}
+  local seen = {}
+  for _, pr in ipairs(type(prs) == "table" and prs or {}) do
+    local number = tonumber(type(pr) == "table" and pr.number or nil)
+    local key = number and tostring(number) or nil
+    if key and not seen[key] then
+      seen[key] = true
+      result[#result + 1] = pr
+    end
+  end
+  return result
+end
+
+local function normalize_file_key(path)
+  if type(path) ~= "string" then
+    return nil
+  end
+
+  local normalized = path:gsub("\\", "/"):gsub("/+", "/"):gsub("^/", ""):gsub("/$", "")
+  if normalized == "" then
+    return nil
+  end
+  return normalized
+end
+
+local function details_files_need_enrichment(files)
+  for _, file in ipairs(type(files) == "table" and files or {}) do
+    if type(file) == "table" then
+      local status = normalize_string(file.status, "")
+      if status == "" then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function merge_file_metadata(details, rest_files)
+  if type(details) ~= "table" then
+    return details
+  end
+
+  local rest_map = {}
+  for _, item in ipairs(type(rest_files) == "table" and rest_files or {}) do
+    local key = normalize_file_key(item.filename or item.path)
+    if key then
+      rest_map[key] = {
+        filename = normalize_string(item.filename, key),
+        previous_filename = normalize_string(item.previous_filename, ""),
+        status = normalize_string(item.status, ""),
+        additions = tonumber(item.additions) or 0,
+        deletions = tonumber(item.deletions) or 0,
+        patch = normalize_string(item.patch, ""),
       }
     end
   end
-  return normalized
+
+  if vim.tbl_isempty(rest_map) then
+    return details
+  end
+
+  local merged = {}
+  local seen = {}
+  for _, file in ipairs(type(details.files) == "table" and details.files or {}) do
+    local key = normalize_file_key(file.path or file.filename)
+    if key then
+      local meta = rest_map[key] or {}
+      seen[key] = true
+      merged[#merged + 1] = {
+        path = normalize_string(file.path, normalize_string(file.filename, key)),
+        filename = normalize_string(file.filename, normalize_string(meta.filename, key)),
+        previousFilename = normalize_string(
+          file.previousFilename,
+          normalize_string(file.previous_filename, normalize_string(meta.previous_filename, ""))
+        ),
+        status = normalize_string(file.status, normalize_string(meta.status, "")),
+        additions = tonumber(file.additions) or tonumber(meta.additions) or 0,
+        deletions = tonumber(file.deletions) or tonumber(meta.deletions) or 0,
+        patch = normalize_string(file.patch, normalize_string(meta.patch, "")),
+      }
+    end
+  end
+
+  for key, meta in pairs(rest_map) do
+    if not seen[key] then
+      merged[#merged + 1] = {
+        path = key,
+        filename = normalize_string(meta.filename, key),
+        previousFilename = normalize_string(meta.previous_filename, ""),
+        status = normalize_string(meta.status, ""),
+        additions = tonumber(meta.additions) or 0,
+        deletions = tonumber(meta.deletions) or 0,
+        patch = normalize_string(meta.patch, ""),
+      }
+    end
+  end
+
+  details.files = merged
+  return details
 end
 
 function M.list_for_query(query)
@@ -498,7 +636,7 @@ function M.list_for_query(query)
     return nil, err
   end
 
-  return prs, nil
+  return dedupe_prs(prs), nil
 end
 
 function M.list_for_query_async(query, callback, opts)
@@ -540,7 +678,7 @@ function M.list_for_query_async(query, callback, opts)
         callback(nil, err)
         return
       end
-      callback(prs, nil)
+      callback(dedupe_prs(prs), nil)
     end)
   end)
 end
@@ -631,7 +769,17 @@ function M.fetch_details(number)
     return nil, err
   end
 
-  return enrich_details_with_repositories(details), nil
+  local enriched = enrich_details_with_repositories(details)
+  if type(enriched) == "table" and details_files_need_enrichment(enriched.files) then
+    local rest_files, rest_err = M.fetch_pr_files_api(number)
+    if rest_files then
+      enriched = merge_file_metadata(enriched, rest_files)
+    elseif rest_err and rest_err ~= "" then
+      -- keep details from gh pr view; callers can still infer mode from fetch errors
+    end
+  end
+
+  return enriched, nil
 end
 
 function M.fetch_details_async(number, callback)
@@ -648,22 +796,22 @@ function M.fetch_details_async(number, callback)
       return
     end
 
-    callback(enrich_details_with_repositories(details), nil)
+    local enriched = enrich_details_with_repositories(details)
+    if type(enriched) ~= "table" or not details_files_need_enrichment(enriched.files) then
+      callback(enriched, nil)
+      return
+    end
+
+    M.fetch_pr_files_api_async(number, function(rest_files)
+      if rest_files then
+        enriched = merge_file_metadata(enriched, rest_files)
+      end
+      callback(enriched, nil)
+    end)
   end)
 end
 
-function M.fetch_review_threads(number, opts)
-  opts = opts or {}
-
-  local repository, repo_err = M.resolve_repository()
-  if not repository then
-    return nil, repo_err
-  end
-
-  local threads_first = clamp_positive(opts.threads_first, 50, 100)
-  local comments_first = clamp_positive(opts.comments_first, 50, 100)
-
-  local query = [[
+local review_threads_query = [[
 query($owner:String!, $name:String!, $number:Int!, $threadsFirst:Int!, $commentsFirst:Int!) {
   repository(owner:$owner, name:$name) {
     pullRequest(number:$number) {
@@ -700,11 +848,15 @@ query($owner:String!, $name:String!, $number:Int!, $threadsFirst:Int!, $comments
 }
 ]]
 
-  local response, err = gh.run_json({
+local function review_threads_args(repository, number, opts)
+  local threads_first = clamp_positive(opts.threads_first, 50, 100)
+  local comments_first = clamp_positive(opts.comments_first, 50, 100)
+
+  return {
     "api",
     "graphql",
     "-f",
-    "query=" .. query,
+    "query=" .. review_threads_query,
     "-F",
     "owner=" .. repository.owner,
     "-F",
@@ -715,12 +867,10 @@ query($owner:String!, $name:String!, $number:Int!, $threadsFirst:Int!, $comments
     "threadsFirst=" .. tostring(threads_first),
     "-F",
     "commentsFirst=" .. tostring(comments_first),
-  })
+  }
+end
 
-  if not response then
-    return nil, err
-  end
-
+local function parse_review_threads_response(response)
   if type(response.errors) == "table" and #response.errors > 0 then
     local first_error = response.errors[1]
     if type(first_error) == "table" and type(first_error.message) == "string" and first_error.message ~= "" then
@@ -758,6 +908,49 @@ query($owner:String!, $name:String!, $number:Int!, $threadsFirst:Int!, $comments
   end
 
   return threads, nil
+end
+
+function M.fetch_review_threads(number, opts)
+  opts = opts or {}
+
+  local repository, repo_err = M.resolve_repository()
+  if not repository then
+    return nil, repo_err
+  end
+
+  local response, err = gh.run_json(review_threads_args(repository, number, opts))
+
+  if not response then
+    return nil, err
+  end
+
+  return parse_review_threads_response(response)
+end
+
+function M.fetch_review_threads_async(number, opts, callback)
+  opts = type(opts) == "table" and opts or {}
+  callback = callback or function() end
+
+  local repository, repo_err = M.resolve_repository()
+  if not repository then
+    callback(nil, repo_err)
+    return
+  end
+
+  gh.run_json_async(review_threads_args(repository, number, opts), nil, function(response, err)
+    if not response then
+      callback(nil, err)
+      return
+    end
+
+    local threads, parse_err = parse_review_threads_response(response)
+    if not threads then
+      callback(nil, parse_err)
+      return
+    end
+
+    callback(threads, nil)
+  end)
 end
 
 local function normalize_diff_side(value)
@@ -1356,6 +1549,525 @@ function M.review(number, event, body)
   return true, nil
 end
 
+local function graphql_error_message(response, fallback)
+  fallback = fallback or "GraphQL request failed"
+  if type(response) ~= "table" then
+    return fallback
+  end
+
+  local errors = response.errors
+  if type(errors) ~= "table" or #errors == 0 then
+    return fallback
+  end
+
+  local first_error = errors[1]
+  if type(first_error) == "table" and type(first_error.message) == "string" and first_error.message ~= "" then
+    return first_error.message
+  end
+
+  return fallback
+end
+
+local function run_graphql(query, variables)
+  local args = {
+    "api",
+    "graphql",
+    "-f",
+    "query=" .. query,
+  }
+
+  for _, variable in ipairs(type(variables) == "table" and variables or {}) do
+    local key = type(variable.key) == "string" and variable.key or nil
+    local value = variable.value
+    if key and value ~= nil then
+      local flag = variable.flag == "-F" and "-F" or "-f"
+      table.insert(args, flag)
+      table.insert(args, key .. "=" .. tostring(value))
+    end
+  end
+
+  local response, err = gh.run_json(args)
+  if not response then
+    return nil, err
+  end
+
+  if type(response.errors) == "table" and #response.errors > 0 then
+    return nil, graphql_error_message(response)
+  end
+
+  return response, nil
+end
+
+local function fetch_review_context(number)
+  local repository, repo_err = M.resolve_repository()
+  if not repository then
+    return nil, repo_err
+  end
+
+  local query = [[
+query($owner:String!, $name:String!, $number:Int!) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      id
+      reviews(first:50, states:[PENDING]) {
+        nodes {
+          id
+          state
+          body
+          author { login }
+        }
+      }
+    }
+  }
+}
+]]
+
+  local response, err = run_graphql(query, {
+    { flag = "-f", key = "owner", value = repository.owner },
+    { flag = "-f", key = "name", value = repository.name },
+    { flag = "-F", key = "number", value = tonumber(number) or number },
+  })
+  if not response then
+    return nil, err
+  end
+
+  local data = response.data
+  local repo_node = type(data) == "table" and data.repository or nil
+  local pr_node = type(repo_node) == "table" and repo_node.pullRequest or nil
+  if type(pr_node) ~= "table" or type(pr_node.id) ~= "string" or pr_node.id == "" then
+    return nil, "Unable to resolve pull request GraphQL id"
+  end
+
+  local pending_reviews = {}
+  local reviews_nodes = type(pr_node.reviews) == "table" and pr_node.reviews.nodes or {}
+  for _, item in ipairs(type(reviews_nodes) == "table" and reviews_nodes or {}) do
+    pending_reviews[#pending_reviews + 1] = {
+      id = normalize_string(item.id, ""),
+      state = normalize_string(item.state, ""),
+      body = normalize_string(item.body, ""),
+      author = normalize_login(item.author, "unknown"),
+    }
+  end
+
+  return {
+    repository = repository,
+    pull_request_id = pr_node.id,
+    pending_reviews = pending_reviews,
+  }, nil
+end
+
+local function pending_review_for_login(context, login)
+  local selected = nil
+  for _, review in ipairs(type(context.pending_reviews) == "table" and context.pending_reviews or {}) do
+    if normalize_string(review.author, "") == login then
+      selected = review
+    end
+  end
+  return selected
+end
+
+local function create_pending_review(pull_request_id, author_login)
+  local mutation = [[
+mutation($pullRequestId:ID!) {
+  addPullRequestReview(input:{ pullRequestId:$pullRequestId }) {
+    pullRequestReview {
+      id
+      state
+      body
+    }
+  }
+}
+]]
+
+  local response, err = run_graphql(mutation, {
+    { flag = "-f", key = "pullRequestId", value = pull_request_id },
+  })
+  if not response then
+    return nil, err
+  end
+
+  local data = response.data
+  local mutation_node = type(data) == "table" and data.addPullRequestReview or nil
+  local review = type(mutation_node) == "table" and mutation_node.pullRequestReview or nil
+  if type(review) ~= "table" or type(review.id) ~= "string" or review.id == "" then
+    return nil, "Unable to create pending review"
+  end
+
+  return {
+    id = normalize_string(review.id, ""),
+    state = normalize_string(review.state, "PENDING"),
+    body = normalize_string(review.body, ""),
+    author = normalize_string(author_login, "unknown"),
+    created = true,
+  }, nil
+end
+
+function M.find_pending_review(number)
+  local context, context_err = fetch_review_context(number)
+  if not context then
+    return nil, context_err
+  end
+
+  local login, login_err = get_user_login()
+  if not login then
+    return nil, login_err
+  end
+
+  local pending = pending_review_for_login(context, login)
+  if not pending then
+    return nil, nil
+  end
+
+  pending.pull_request_id = context.pull_request_id
+  pending.created = false
+  return pending, nil
+end
+
+function M.ensure_pending_review(number)
+  local context, context_err = fetch_review_context(number)
+  if not context then
+    return nil, context_err
+  end
+
+  local login, login_err = get_user_login()
+  if not login then
+    return nil, login_err
+  end
+
+  local pending = pending_review_for_login(context, login)
+  if pending then
+    pending.pull_request_id = context.pull_request_id
+    pending.created = false
+    return pending, nil
+  end
+
+  local created, created_err = create_pending_review(context.pull_request_id, login)
+  if not created then
+    return nil, created_err
+  end
+
+  created.pull_request_id = context.pull_request_id
+  return created, nil
+end
+
+local function normalize_line_number(value)
+  local number = tonumber(value)
+  if not number then
+    return nil
+  end
+  number = math.floor(number)
+  if number < 1 then
+    return nil
+  end
+  return number
+end
+
+function M.add_pending_inline_comment(number, opts)
+  opts = type(opts) == "table" and opts or {}
+
+  local path = normalize_string(opts.path, "")
+  if path == "" then
+    return false, "Missing file path for inline comment"
+  end
+
+  local body = type(opts.body) == "string" and opts.body or ""
+  if vim.trim(body) == "" then
+    return false, "Inline comment message cannot be empty"
+  end
+
+  local line = normalize_line_number(opts.line)
+  if not line then
+    return false, "Missing target line for inline comment"
+  end
+
+  local start_line = normalize_line_number(opts.start_line)
+  if start_line and start_line > line then
+    start_line, line = line, start_line
+  end
+  if start_line and start_line == line then
+    start_line = nil
+  end
+
+  local side = normalize_diff_side(opts.side)
+  if side == "" then
+    side = "RIGHT"
+  end
+  local start_side = normalize_diff_side(opts.start_side)
+  if start_side == "" then
+    start_side = side
+  end
+
+  local pending, pending_err = M.ensure_pending_review(number)
+  if not pending then
+    return false, pending_err
+  end
+
+  local pull_request_id = normalize_string(pending.pull_request_id, "")
+  if pull_request_id == "" then
+    return false, "Unable to resolve pull request id for inline comment"
+  end
+
+  local response
+  local err
+  if start_line then
+    local mutation = [[
+mutation(
+  $pullRequestId:ID!,
+  $path:String!,
+  $body:String!,
+  $startLine:Int!,
+  $line:Int!,
+  $startSide:DiffSide!,
+  $side:DiffSide!
+) {
+  addPullRequestReviewThread(input:{
+    pullRequestId:$pullRequestId,
+    path:$path,
+    body:$body,
+    startLine:$startLine,
+    line:$line,
+    startSide:$startSide,
+    side:$side
+  }) {
+    thread {
+      id
+      path
+      startLine
+      line
+      diffSide
+    }
+  }
+}
+]]
+
+    response, err = run_graphql(mutation, {
+      { flag = "-f", key = "pullRequestId", value = pull_request_id },
+      { flag = "-f", key = "path", value = path },
+      { flag = "-f", key = "body", value = body },
+      { flag = "-F", key = "startLine", value = start_line },
+      { flag = "-F", key = "line", value = line },
+      { flag = "-F", key = "startSide", value = start_side },
+      { flag = "-F", key = "side", value = side },
+    })
+  else
+    local mutation = [[
+mutation($pullRequestId:ID!, $path:String!, $body:String!, $line:Int!, $side:DiffSide!) {
+  addPullRequestReviewThread(input:{
+    pullRequestId:$pullRequestId,
+    path:$path,
+    body:$body,
+    line:$line,
+    side:$side
+  }) {
+    thread {
+      id
+      path
+      line
+      diffSide
+    }
+  }
+}
+]]
+
+    response, err = run_graphql(mutation, {
+      { flag = "-f", key = "pullRequestId", value = pull_request_id },
+      { flag = "-f", key = "path", value = path },
+      { flag = "-f", key = "body", value = body },
+      { flag = "-F", key = "line", value = line },
+      { flag = "-F", key = "side", value = side },
+    })
+  end
+
+  if not response then
+    return false, err
+  end
+
+  local data = response.data
+  local mutation_node = type(data) == "table" and data.addPullRequestReviewThread or nil
+  local thread = type(mutation_node) == "table" and mutation_node.thread or nil
+  if type(thread) ~= "table" or type(thread.id) ~= "string" or thread.id == "" then
+    return false, "Unable to create inline review comment"
+  end
+
+  return true, nil
+end
+
+function M.add_pending_review_comment(number, body, opts)
+  opts = type(opts) == "table" and opts or {}
+
+  local message = type(body) == "string" and vim.trim(body) or ""
+  if message == "" then
+    return false, "Pending review comment message cannot be empty"
+  end
+
+  local pending, pending_err = M.ensure_pending_review(number)
+  if not pending then
+    return false, pending_err
+  end
+
+  local review_id = normalize_string(pending.id, "")
+  if review_id == "" then
+    return false, "Missing pending review id"
+  end
+
+  local final_body = message
+  if opts.append == true then
+    local current_body = normalize_string(pending.body, "")
+    if current_body ~= "" then
+      local separator = normalize_string(opts.separator, "\n\n---\n\n")
+      final_body = current_body .. separator .. message
+    end
+  end
+
+  local mutation = [[
+mutation($pullRequestReviewId:ID!, $body:String!) {
+  updatePullRequestReview(input:{
+    pullRequestReviewId:$pullRequestReviewId,
+    body:$body
+  }) {
+    pullRequestReview {
+      id
+      state
+      body
+    }
+  }
+}
+]]
+
+  local response, err = run_graphql(mutation, {
+    { flag = "-f", key = "pullRequestReviewId", value = review_id },
+    { flag = "-f", key = "body", value = final_body },
+  })
+  if not response then
+    return false, err
+  end
+
+  local data = response.data
+  local mutation_node = type(data) == "table" and data.updatePullRequestReview or nil
+  local review = type(mutation_node) == "table" and mutation_node.pullRequestReview or nil
+  if type(review) ~= "table" or type(review.id) ~= "string" or review.id == "" then
+    return false, "Unable to update pending review comment"
+  end
+
+  return true, nil
+end
+
+local function normalize_pending_event(event)
+  local normalized = normalize_string(event, ""):lower()
+  if normalized == "comment" then
+    return "COMMENT", nil
+  end
+  if normalized == "approve" then
+    return "APPROVE", nil
+  end
+  if normalized == "request_changes" then
+    return "REQUEST_CHANGES", nil
+  end
+  return nil, "Unsupported pending review event"
+end
+
+function M.submit_pending_review(number, event, body)
+  local pending, pending_err = M.ensure_pending_review(number)
+  if not pending then
+    return false, pending_err
+  end
+
+  local review_id = normalize_string(pending.id, "")
+  if review_id == "" then
+    return false, "Missing pending review id"
+  end
+
+  local event_enum, event_err = normalize_pending_event(event)
+  if not event_enum then
+    return false, event_err
+  end
+
+  local response
+  local err
+  local text = type(body) == "string" and body or ""
+  if text ~= "" then
+    local mutation = [[
+mutation($pullRequestReviewId:ID!, $event:PullRequestReviewEvent!, $body:String!) {
+  submitPullRequestReview(input:{
+    pullRequestReviewId:$pullRequestReviewId,
+    event:$event,
+    body:$body
+  }) {
+    pullRequestReview {
+      id
+      state
+      submittedAt
+    }
+  }
+}
+]]
+
+    response, err = run_graphql(mutation, {
+      { flag = "-f", key = "pullRequestReviewId", value = review_id },
+      { flag = "-F", key = "event", value = event_enum },
+      { flag = "-f", key = "body", value = text },
+    })
+  else
+    local mutation = [[
+mutation($pullRequestReviewId:ID!, $event:PullRequestReviewEvent!) {
+  submitPullRequestReview(input:{
+    pullRequestReviewId:$pullRequestReviewId,
+    event:$event
+  }) {
+    pullRequestReview {
+      id
+      state
+      submittedAt
+    }
+  }
+}
+]]
+
+    response, err = run_graphql(mutation, {
+      { flag = "-f", key = "pullRequestReviewId", value = review_id },
+      { flag = "-F", key = "event", value = event_enum },
+    })
+  end
+
+  if not response then
+    return false, err
+  end
+
+  return true, nil
+end
+
+function M.discard_pending_review(number)
+  local pending, pending_err = M.find_pending_review(number)
+  if pending_err then
+    return false, pending_err
+  end
+  if not pending then
+    return false, "No pending review found for current user"
+  end
+
+  local review_id = normalize_string(pending.id, "")
+  if review_id == "" then
+    return false, "Missing pending review id"
+  end
+
+  local mutation = [[
+mutation($pullRequestReviewId:ID!) {
+  deletePullRequestReview(input:{ pullRequestReviewId:$pullRequestReviewId }) {
+    clientMutationId
+  }
+}
+]]
+
+  local response, err = run_graphql(mutation, {
+    { flag = "-f", key = "pullRequestReviewId", value = review_id },
+  })
+  if not response then
+    return false, err
+  end
+
+  return true, nil
+end
+
 function M.merge(number, method, delete_branch)
   local args = { "pr", "merge", tostring(number) }
 
@@ -1385,13 +2097,188 @@ function M.fetch_pr_files_api(number)
     return nil, repo_err
   end
 
-  local endpoint = string.format("repos/%s/pulls/%d/files", repository.full_name, number)
+  local endpoint = string.format("repos/%s/pulls/%d/files?per_page=100", repository.full_name, number)
   local files, err = gh.run_json({ "api", endpoint })
   if not files then
     return nil, err
   end
 
   return files, nil
+end
+
+function M.fetch_pr_files_api_async(number, callback)
+  callback = callback or function() end
+
+  local repository, repo_err = M.resolve_repository()
+  if not repository then
+    callback(nil, repo_err)
+    return
+  end
+
+  local endpoint = string.format("repos/%s/pulls/%d/files?per_page=100", repository.full_name, number)
+  gh.run_json_async({ "api", endpoint }, nil, function(files, err)
+    if not files then
+      callback(nil, err)
+      return
+    end
+
+    callback(files, nil)
+  end)
+end
+
+local function append_page_params(endpoint, page, per_page)
+  local separator = endpoint:find("?", 1, true) and "&" or "?"
+  return string.format("%s%sper_page=%d&page=%d", endpoint, separator, per_page, page)
+end
+
+local function fetch_paginated_endpoint(endpoint, opts)
+  opts = type(opts) == "table" and opts or {}
+  local per_page = clamp_positive(opts.per_page, 100, 100)
+  local max_pages = clamp_positive(opts.max_pages, 20, 100)
+
+  local rows = {}
+  for page = 1, max_pages do
+    local page_endpoint = append_page_params(endpoint, page, per_page)
+    local payload, err = gh.run_json({ "api", page_endpoint })
+    if not payload then
+      return nil, err
+    end
+
+    if type(payload) ~= "table" then
+      return nil, "Unexpected GitHub API response format"
+    end
+
+    local count = 0
+    for _, item in ipairs(payload) do
+      rows[#rows + 1] = item
+      count = count + 1
+    end
+
+    if count < per_page then
+      break
+    end
+  end
+
+  return rows, nil
+end
+
+local function resolve_repository_from_opts(opts)
+  opts = type(opts) == "table" and opts or {}
+  local repository = normalize_repository_filter(opts.repository)
+  if repository then
+    return repository, nil
+  end
+  return M.resolve_repository()
+end
+
+function M.fetch_repo_labels(opts)
+  local repository, repo_err = resolve_repository_from_opts(opts)
+  if not repository then
+    return nil, repo_err
+  end
+
+  local endpoint = string.format("repos/%s/labels", repository.full_name)
+  local items, err = fetch_paginated_endpoint(endpoint, opts)
+  if not items then
+    return nil, err
+  end
+
+  local labels = {}
+  local seen = {}
+  for _, item in ipairs(items) do
+    local name = normalize_string(item.name, "")
+    local key = normalize_string(name, ""):lower()
+    if name ~= "" and key ~= "" and not seen[key] then
+      seen[key] = true
+      labels[#labels + 1] = {
+        name = name,
+        color = normalize_string(item.color, ""),
+        description = normalize_string(item.description, ""),
+      }
+    end
+  end
+
+  table.sort(labels, function(left, right)
+    return normalize_string(left.name, ""):lower() < normalize_string(right.name, ""):lower()
+  end)
+
+  return labels, nil
+end
+
+function M.fetch_reviewer_candidates(opts)
+  local repository, repo_err = resolve_repository_from_opts(opts)
+  if not repository then
+    return nil, repo_err
+  end
+
+  local users_endpoint = string.format("repos/%s/collaborators", repository.full_name)
+  local users_payload, users_err = fetch_paginated_endpoint(users_endpoint, opts)
+  if not users_payload then
+    return nil, users_err
+  end
+
+  local users = {}
+  for _, item in ipairs(users_payload) do
+    local login = normalize_string(item.login, "")
+    if login ~= "" then
+      users[#users + 1] = {
+        kind = "user",
+        value = login,
+        display = "@" .. login,
+      }
+    end
+  end
+
+  table.sort(users, function(left, right)
+    return left.value:lower() < right.value:lower()
+  end)
+
+  local teams = {}
+  local warnings = {}
+  local teams_endpoint = string.format("repos/%s/teams", repository.full_name)
+  local teams_payload, teams_err = fetch_paginated_endpoint(teams_endpoint, opts)
+  if teams_payload then
+    for _, item in ipairs(teams_payload) do
+      local slug = normalize_string(item.slug, "")
+      local org = type(item.organization) == "table" and normalize_string(item.organization.login, "") or repository.owner
+      if slug ~= "" and org ~= "" then
+        local value = org .. "/" .. slug
+        teams[#teams + 1] = {
+          kind = "team",
+          value = value,
+          display = "@" .. value,
+        }
+      end
+    end
+
+    table.sort(teams, function(left, right)
+      return left.value:lower() < right.value:lower()
+    end)
+  elseif type(teams_err) == "string" and teams_err ~= "" then
+    warnings[#warnings + 1] = "Unable to load teams for reviewers: " .. teams_err
+  end
+
+  local merged = {}
+  local seen = {}
+  local function append_candidates(items)
+    for _, item in ipairs(items) do
+      local key = normalize_string(item.value, ""):lower()
+      if key ~= "" and not seen[key] then
+        seen[key] = true
+        merged[#merged + 1] = item
+      end
+    end
+  end
+  append_candidates(users)
+  append_candidates(teams)
+
+  return {
+    repository = repository.full_name,
+    users = users,
+    teams = teams,
+    merged = merged,
+    warnings = warnings,
+  }, nil
 end
 
 function M.fetch_patch_for_file(number, path)

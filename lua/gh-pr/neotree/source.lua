@@ -5,6 +5,7 @@ local M = {
 
 local cache_store = require("gh-pr.cache_store")
 local config = require("gh-pr.config")
+local follow = require("gh-pr.neotree.follow")
 local path_tree = require("gh-pr.path_tree")
 local pr_service = require("gh-pr.pr_service")
 local repo = require("gh-pr.repo")
@@ -152,6 +153,54 @@ local function maybe_prune_persisted_cache()
   cache_store.prune(max_age, now)
 end
 
+local function dedupe_prs(prs)
+  local result = {}
+  local seen = {}
+  for _, pr in ipairs(type(prs) == "table" and prs or {}) do
+    local number = tonumber(type(pr) == "table" and pr.number or nil)
+    local key = number and tostring(number) or nil
+    if key and not seen[key] then
+      seen[key] = true
+      result[#result + 1] = pr
+    end
+  end
+  return result
+end
+
+local function sanitize_query_results(results)
+  local sanitized = {}
+  for _, result in ipairs(type(results) == "table" and results or {}) do
+    if type(result) == "table" and type(result.query) == "table" then
+      sanitized[#sanitized + 1] = {
+        query = result.query,
+        error = result.error,
+        prs = dedupe_prs(result.prs),
+      }
+    end
+  end
+  return sanitized
+end
+
+local function sanitize_details_map(details_by_pr)
+  local sanitized = {}
+  for number, details in pairs(type(details_by_pr) == "table" and details_by_pr or {}) do
+    if type(details) == "table" then
+      local files = {}
+      local seen_paths = {}
+      for _, file in ipairs(type(details.files) == "table" and details.files or {}) do
+        local path = type(file) == "table" and (file.path or file.filename) or nil
+        if type(path) == "string" and path ~= "" and not seen_paths[path] then
+          seen_paths[path] = true
+          files[#files + 1] = file
+        end
+      end
+      details.files = files
+      sanitized[tostring(number)] = details
+    end
+  end
+  return sanitized
+end
+
 local function new_repo_session(repo_context)
   return {
     key = repo_context.key,
@@ -167,6 +216,7 @@ local function new_repo_session(repo_context)
     last_error = nil,
     stale = false,
     states = {},
+    follow = {},
     loaded_from_disk = false,
   }
 end
@@ -182,8 +232,8 @@ local function ensure_repo_session(repo_context)
     maybe_prune_persisted_cache()
     local persisted = cache_store.get_repo(repo_context.key)
     if type(persisted) == "table" then
-      session.query_results = type(persisted.query_results) == "table" and persisted.query_results or {}
-      session.details_by_pr = type(persisted.details_by_pr) == "table" and persisted.details_by_pr or {}
+      session.query_results = sanitize_query_results(persisted.query_results)
+      session.details_by_pr = sanitize_details_map(persisted.details_by_pr)
       session.updated_at = tonumber(persisted.updated_at) or 0
       session.stale = session_is_stale(session)
     end
@@ -215,6 +265,32 @@ local function register_state(session, state)
   local key = tostring(state)
   session.states[key] = state
   state.gh_pr_repo_key = session.key
+end
+
+local function ensure_follow_state(session)
+  if type(session.follow) ~= "table" then
+    session.follow = {}
+  end
+  return session.follow
+end
+
+local function remember_revealed_node(session, node_id, context)
+  local follow_state = ensure_follow_state(session)
+  if type(node_id) == "string" and node_id ~= "" then
+    follow_state.last_node_id = node_id
+  end
+
+  if type(context) == "table" then
+    local pr_number = tonumber(context.pr_number)
+    if pr_number then
+      follow_state.last_pr = pr_number
+    end
+
+    local path = follow.normalize_path(context.path)
+    if path ~= "" then
+      follow_state.last_path = path
+    end
+  end
 end
 
 local function repository_full_name(details)
@@ -292,12 +368,14 @@ end
 
 local function collect_file_entries(pr, details)
   local entries = {}
+  local seen_paths = {}
   local repo_full_name = repository_full_name(details)
   local hide_viewed = config.get().hide_viewed_files
 
   for _, file in ipairs(details.files or {}) do
     local path = file.path or file.filename
-    if path and path ~= "" then
+    if path and path ~= "" and not seen_paths[path] then
+      seen_paths[path] = true
       if not (hide_viewed and runtime_state.is_viewed(repo_full_name, pr.number, path)) then
         entries[#entries + 1] = {
           path = path,
@@ -351,7 +429,10 @@ local function build_file_nodes(id_prefix, pr, details)
 end
 
 local function get_query_node(query, results, session, opts)
-  local query_id = tostring(query.id or query.label or "query")
+  opts = opts or {}
+  local query_index = tonumber(opts.query_index) or 0
+  local query_base_id = tostring(query.id or query.label or "query")
+  local query_id = string.format("%s:%d", query_base_id, query_index)
   local query_prefix = string.format("query:%s", query_id)
   local children = {}
 
@@ -370,7 +451,16 @@ local function get_query_node(query, results, session, opts)
       extra = { kind = "message" },
     })
   else
+    local seen_prs = {}
     for _, pr in ipairs(results.prs) do
+      local number = tonumber(pr.number)
+      if number and seen_prs[number] then
+        goto continue
+      end
+      if number then
+        seen_prs[number] = true
+      end
+
       local pr_prefix = string.format("%s:pr:%d", query_prefix, pr.number)
       local details = session.details_by_pr[tostring(pr.number)]
       local detail_err = session.detail_errors[tostring(pr.number)]
@@ -431,6 +521,7 @@ local function get_query_node(query, results, session, opts)
           details = details,
         },
       })
+      ::continue::
     end
   end
 
@@ -485,10 +576,13 @@ local function build_nodes(session)
     })
   end
 
-  for _, result in ipairs(query_results) do
+  for index, result in ipairs(query_results) do
     local folder_name = result.query.folder or "General"
     folder_map[folder_name] = folder_map[folder_name] or {}
-    table.insert(folder_map[folder_name], result)
+    table.insert(folder_map[folder_name], {
+      index = index,
+      result = result,
+    })
   end
 
   local folders = vim.tbl_keys(folder_map)
@@ -496,9 +590,10 @@ local function build_nodes(session)
 
   for _, folder_name in ipairs(folders) do
     local query_nodes = {}
-    for _, result in ipairs(folder_map[folder_name]) do
-      table.insert(query_nodes, get_query_node(result.query, result, session, {
+    for _, item in ipairs(folder_map[folder_name]) do
+      table.insert(query_nodes, get_query_node(item.result.query, item.result, session, {
         show_stale_badge = show_stale_badge,
+        query_index = item.index,
       }))
     end
 
@@ -605,6 +700,96 @@ local function filter_details_map(details_by_pr, allowed)
   return filtered
 end
 
+local function reveal_context_in_state(state, session, context)
+  if type(state) ~= "table" or type(session) ~= "table" or type(context) ~= "table" then
+    return false
+  end
+
+  local session_repo = type(session.repository) == "table" and session.repository.full_name or nil
+  if type(context.repo) == "string" and context.repo ~= "" and type(session_repo) == "string" and context.repo ~= session_repo then
+    return false
+  end
+
+  local pr_number = tonumber(context.pr_number)
+  local target_path = follow.normalize_path(context.path)
+  if not pr_number or target_path == "" then
+    return false
+  end
+
+  local node = follow.find_file_node(state, function(entry)
+    if entry.pr_number ~= pr_number then
+      return false
+    end
+    if entry.path == target_path then
+      return true
+    end
+    return entry.previous_path ~= "" and entry.previous_path == target_path
+  end)
+  if not node then
+    return false
+  end
+
+  local focused, node_id = follow.focus_node_without_steal(state, node)
+  if focused then
+    remember_revealed_node(session, node_id, {
+      pr_number = pr_number,
+      path = target_path,
+    })
+  end
+
+  return focused
+end
+
+local function reveal_last_node_in_state(state, session)
+  if type(state) ~= "table" or type(session) ~= "table" then
+    return false
+  end
+
+  local follow_state = ensure_follow_state(session)
+  if type(follow_state.last_node_id) == "string" and follow_state.last_node_id ~= "" then
+    local focused = select(1, follow.focus_node_without_steal(state, follow_state.last_node_id))
+    if focused then
+      return true
+    end
+  end
+
+  local fallback_context = {
+    pr_number = tonumber(follow_state.last_pr),
+    path = follow_state.last_path,
+    repo = type(session.repository) == "table" and session.repository.full_name or nil,
+  }
+
+  if fallback_context.pr_number and type(fallback_context.path) == "string" and fallback_context.path ~= "" then
+    return reveal_context_in_state(state, session, fallback_context)
+  end
+
+  return false
+end
+
+local function follow_current_file_if_visible(_)
+  local states = follow.visible_source_states("gh_pr")
+  if vim.tbl_isempty(states) then
+    return false
+  end
+
+  local context = follow.resolve_buffer_context()
+  for _, state in ipairs(states) do
+    local repo_key = type(state) == "table" and state.gh_pr_repo_key or nil
+    local session = type(repo_key) == "string" and runtime_cache.repos[repo_key] or nil
+    if session then
+      local revealed = false
+      if context then
+        revealed = reveal_context_in_state(state, session, context)
+      end
+      if not revealed then
+        reveal_last_node_in_state(state, session)
+      end
+    end
+  end
+
+  return true
+end
+
 local start_background_refresh
 
 local function finish_refresh(repo_context, payload)
@@ -624,10 +809,10 @@ local function finish_refresh(repo_context, payload)
   end
 
   session.last_error = nil
-  session.query_results = payload.query_results
+  session.query_results = sanitize_query_results(payload.query_results)
 
   local allowed = allowed_numbers_from_results(payload.query_results)
-  session.details_by_pr = filter_details_map(payload.details_by_pr, allowed)
+  session.details_by_pr = sanitize_details_map(filter_details_map(payload.details_by_pr, allowed))
   session.detail_errors = type(payload.detail_errors) == "table" and payload.detail_errors or {}
   session.updated_at = now_seconds()
 
@@ -635,6 +820,7 @@ local function finish_refresh(repo_context, payload)
   session.stale = session_is_stale(session)
   persist_session(repo_context, session)
   render_repo_states(repo_context.key)
+  follow_current_file_if_visible({ reason = "refresh" })
 
   if cache_options().sync_visible_buffers ~= false then
     virtual_files.sync_visible_pr_buffers(session.details_by_pr, {
@@ -745,6 +931,7 @@ M.navigate = function(state, path)
 
   start_background_refresh(repo_context, { force = false })
   render_state(state, session)
+  follow_current_file_if_visible({ reason = "navigate" })
 end
 
 function M.request_refresh(state, opts)
@@ -769,6 +956,12 @@ function M.request_refresh(state, opts)
   return start_background_refresh(repo_context, {
     force = opts.force == true,
   })
+end
+
+function M.render_cached_states()
+  for repo_key, _ in pairs(runtime_cache.repos) do
+    render_repo_states(repo_key)
+  end
 end
 
 function M.refresh_if_focused()
@@ -802,6 +995,11 @@ function M.refresh_if_focused()
   end
 
   M.request_refresh(state, { force = false, notify_error = false })
+  follow_current_file_if_visible({ reason = "focused" })
+end
+
+function M.follow_current_file_if_visible(opts)
+  return follow_current_file_if_visible(opts)
 end
 
 M.setup = function(source_config, _)
@@ -827,6 +1025,7 @@ M.setup = function(source_config, _)
     ["a"] = "comment_review",
     ["d"] = "request_changes_review",
     ["m"] = "merge_pr",
+    ["S"] = "start_review",
     ["c"] = "checkout_pr",
     ["p"] = "toggle_viewed",
     ["v"] = "toggle_viewed",
@@ -834,7 +1033,6 @@ M.setup = function(source_config, _)
     ["x"] = "noop",
     ["y"] = "noop",
     ["<C-r>"] = "noop",
-    ["S"] = "noop",
     ["s"] = "noop",
     ["t"] = "noop",
     ["w"] = "noop",

@@ -7,6 +7,13 @@ local state = {
     file = nil,
   },
   viewed = {},
+  reviews = {},
+  prefs = {
+    diff_view = {
+      mode = "vertical",
+      ignore_whitespace = false,
+    },
+  },
 }
 
 local function joinpath(...)
@@ -57,12 +64,19 @@ local function load_persisted_state()
   if type(decoded.viewed) == "table" then
     state.viewed = decoded.viewed
   end
+
+  if type(decoded.prefs) == "table" then
+    state.prefs = vim.tbl_deep_extend("force", state.prefs, decoded.prefs)
+  end
 end
 
 local function save_persisted_state()
   ensure_state_dir()
   local path = state_file_path()
-  local encoded = vim.json.encode({ viewed = state.viewed })
+  local encoded = vim.json.encode({
+    viewed = state.viewed,
+    prefs = state.prefs,
+  })
   vim.fn.writefile(vim.split(encoded, "\n", { plain = true }), path)
 end
 
@@ -102,8 +116,41 @@ local function ensure_pr_bucket(repo_full_name, pr_number)
   return state.viewed[repo_full_name][tostring(pr_number)]
 end
 
+local function normalize_path(path)
+  if type(path) ~= "string" then
+    return ""
+  end
+
+  return path:gsub("\\", "/")
+end
+
+local function normalize_diff_mode(mode)
+  if mode == "vertical" or mode == "horizontal" or mode == "unified" then
+    return mode
+  end
+
+  return "vertical"
+end
+
+local function sanitize_diff_view_prefs(input)
+  local result = {
+    mode = "vertical",
+    ignore_whitespace = false,
+  }
+
+  if type(input) ~= "table" then
+    return result
+  end
+
+  result.mode = normalize_diff_mode(input.mode)
+  result.ignore_whitespace = input.ignore_whitespace == true
+  return result
+end
+
 function M.setup()
   load_persisted_state()
+  state.prefs = state.prefs or {}
+  state.prefs.diff_view = sanitize_diff_view_prefs(state.prefs.diff_view)
 end
 
 function M.set_active_pr(pr, details)
@@ -131,7 +178,8 @@ function M.clear_active()
 end
 
 function M.is_viewed(repo_full_name, pr_number, path)
-  if type(path) ~= "string" or path == "" then
+  path = normalize_path(path)
+  if path == "" then
     return false
   end
 
@@ -144,7 +192,8 @@ function M.is_viewed(repo_full_name, pr_number, path)
 end
 
 function M.set_viewed(repo_full_name, pr_number, path, viewed)
-  if type(path) ~= "string" or path == "" then
+  path = normalize_path(path)
+  if path == "" then
     return false
   end
 
@@ -164,6 +213,7 @@ function M.set_viewed(repo_full_name, pr_number, path, viewed)
 end
 
 function M.toggle_viewed(repo_full_name, pr_number, path)
+  path = normalize_path(path)
   local viewed = M.is_viewed(repo_full_name, pr_number, path)
   M.set_viewed(repo_full_name, pr_number, path, not viewed)
   return not viewed
@@ -181,6 +231,73 @@ function M.reset_pr_viewed(repo_full_name, pr_number)
   state.viewed[repo_full_name][tostring(pr_number)] = {}
   save_persisted_state()
   return true
+end
+
+function M.set_active_review(repo_full_name, pr, details)
+  if type(repo_full_name) ~= "string" or repo_full_name == "" then
+    return false
+  end
+
+  if type(pr) ~= "table" then
+    return false
+  end
+
+  local number = tonumber(pr.number)
+  if not number then
+    return false
+  end
+
+  state.reviews[repo_full_name] = {
+    pr = pr,
+    details = details or pr,
+    updated_at = os.time(),
+  }
+  return true
+end
+
+function M.get_active_review(repo_full_name)
+  if type(repo_full_name) ~= "string" or repo_full_name == "" then
+    return nil, nil
+  end
+
+  local review = state.reviews[repo_full_name]
+  if type(review) ~= "table" then
+    return nil, nil
+  end
+
+  return review.pr, review.details
+end
+
+function M.clear_active_review(repo_full_name)
+  if type(repo_full_name) ~= "string" or repo_full_name == "" then
+    return false
+  end
+
+  if state.reviews[repo_full_name] == nil then
+    return false
+  end
+
+  state.reviews[repo_full_name] = nil
+  return true
+end
+
+function M.get_diff_view_prefs()
+  state.prefs = state.prefs or {}
+  state.prefs.diff_view = sanitize_diff_view_prefs(state.prefs.diff_view)
+  return vim.deepcopy(state.prefs.diff_view)
+end
+
+function M.set_diff_view_prefs(prefs)
+  state.prefs = state.prefs or {}
+  state.prefs.diff_view = sanitize_diff_view_prefs(prefs)
+  save_persisted_state()
+  return true
+end
+
+function M.update_diff_view_pref(key, value)
+  local current = M.get_diff_view_prefs()
+  current[key] = value
+  return M.set_diff_view_prefs(current)
 end
 
 return M

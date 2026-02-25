@@ -196,5 +196,16 @@ M.merge_pr = function(state)
   actions.merge()
 end
 
+M.start_review = function(state)
+  local node = current_node(state)
+  if not node or not has_pr_context(node) then
+    return
+  end
+
+  apply_context(node)
+  local pr = node.extra and node.extra.pr or nil
+  actions.start_review(pr and pr.number or nil)
+end
+
 cc._add_common_commands(M)
 return M

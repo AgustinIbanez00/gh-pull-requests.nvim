@@ -125,6 +125,33 @@ local defaults = {
       show_stale_badge = true,
       sync_visible_buffers = true,
     },
+    gh_pr_review = {
+      enabled = true,
+      ttl_seconds = 60,
+      auto_refresh_when_focused = true,
+      max_cache_age_seconds = 900,
+      show_stale_badge = true,
+      sync_visible_buffers = true,
+    },
+  },
+  follow_current_file = {
+    enabled = true,
+    debounce_ms = 60,
+    sources = {
+      pr = true,
+      pr_review = true,
+    },
+  },
+  diff_view = {
+    mode = "vertical",
+    ignore_whitespace = false,
+    shortcuts = {
+      toggle_whitespace = ",dw",
+      cycle_mode = ",dm",
+      set_vertical = ",dv",
+      set_horizontal = ",dh",
+      set_unified = ",du",
+    },
   },
   ui = {
     use_neotree = true,
@@ -406,6 +433,7 @@ local function sanitize_cache(cache_options)
 
   local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.cache), cache_options)
   result.gh_pr = type(result.gh_pr) == "table" and result.gh_pr or {}
+  result.gh_pr_review = type(result.gh_pr_review) == "table" and result.gh_pr_review or {}
 
   if type(result.gh_pr.enabled) ~= "boolean" then
     result.gh_pr.enabled = defaults.cache.gh_pr.enabled
@@ -427,6 +455,31 @@ local function sanitize_cache(cache_options)
 
   if type(result.gh_pr.sync_visible_buffers) ~= "boolean" then
     result.gh_pr.sync_visible_buffers = defaults.cache.gh_pr.sync_visible_buffers
+  end
+
+  if type(result.gh_pr_review.enabled) ~= "boolean" then
+    result.gh_pr_review.enabled = defaults.cache.gh_pr_review.enabled
+  end
+
+  result.gh_pr_review.ttl_seconds = sanitize_positive_integer(
+    result.gh_pr_review.ttl_seconds,
+    defaults.cache.gh_pr_review.ttl_seconds
+  )
+  result.gh_pr_review.max_cache_age_seconds = sanitize_positive_integer(
+    result.gh_pr_review.max_cache_age_seconds,
+    defaults.cache.gh_pr_review.max_cache_age_seconds
+  )
+
+  if type(result.gh_pr_review.auto_refresh_when_focused) ~= "boolean" then
+    result.gh_pr_review.auto_refresh_when_focused = defaults.cache.gh_pr_review.auto_refresh_when_focused
+  end
+
+  if type(result.gh_pr_review.show_stale_badge) ~= "boolean" then
+    result.gh_pr_review.show_stale_badge = defaults.cache.gh_pr_review.show_stale_badge
+  end
+
+  if type(result.gh_pr_review.sync_visible_buffers) ~= "boolean" then
+    result.gh_pr_review.sync_visible_buffers = defaults.cache.gh_pr_review.sync_visible_buffers
   end
 
   return result
@@ -453,6 +506,37 @@ local function sanitize_path_render(path_render, opts)
 
   if opts.path_render == nil and opts.file_list_layout ~= nil then
     result.mode = sanitize_legacy_file_list_layout(opts.file_list_layout)
+  end
+
+  return result
+end
+
+local function sanitize_follow_current_file(follow_current_file)
+  if type(follow_current_file) ~= "table" then
+    return vim.deepcopy(defaults.follow_current_file)
+  end
+
+  local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.follow_current_file), follow_current_file)
+  if type(result.enabled) ~= "boolean" then
+    result.enabled = defaults.follow_current_file.enabled
+  end
+
+  local debounce_ms = tonumber(result.debounce_ms)
+  if type(debounce_ms) ~= "number" then
+    debounce_ms = defaults.follow_current_file.debounce_ms
+  end
+  debounce_ms = math.floor(debounce_ms)
+  if debounce_ms < 0 then
+    debounce_ms = defaults.follow_current_file.debounce_ms
+  end
+  result.debounce_ms = debounce_ms
+
+  result.sources = type(result.sources) == "table" and result.sources or {}
+  if type(result.sources.pr) ~= "boolean" then
+    result.sources.pr = defaults.follow_current_file.sources.pr
+  end
+  if type(result.sources.pr_review) ~= "boolean" then
+    result.sources.pr_review = defaults.follow_current_file.sources.pr_review
   end
 
   return result
@@ -616,6 +700,36 @@ local function sanitize_line_comments(line_comments)
   return result
 end
 
+local function sanitize_diff_view(diff_view)
+  if type(diff_view) ~= "table" then
+    return vim.deepcopy(defaults.diff_view)
+  end
+
+  local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.diff_view), diff_view)
+  if result.mode ~= "vertical" and result.mode ~= "horizontal" and result.mode ~= "unified" then
+    result.mode = defaults.diff_view.mode
+  end
+
+  if type(result.ignore_whitespace) ~= "boolean" then
+    result.ignore_whitespace = defaults.diff_view.ignore_whitespace
+  end
+
+  result.shortcuts = type(result.shortcuts) == "table" and result.shortcuts or {}
+  result.shortcuts.toggle_whitespace = type(result.shortcuts.toggle_whitespace) == "string"
+      and result.shortcuts.toggle_whitespace
+    or defaults.diff_view.shortcuts.toggle_whitespace
+  result.shortcuts.cycle_mode = type(result.shortcuts.cycle_mode) == "string" and result.shortcuts.cycle_mode
+    or defaults.diff_view.shortcuts.cycle_mode
+  result.shortcuts.set_vertical = type(result.shortcuts.set_vertical) == "string" and result.shortcuts.set_vertical
+    or defaults.diff_view.shortcuts.set_vertical
+  result.shortcuts.set_horizontal = type(result.shortcuts.set_horizontal) == "string" and result.shortcuts.set_horizontal
+    or defaults.diff_view.shortcuts.set_horizontal
+  result.shortcuts.set_unified = type(result.shortcuts.set_unified) == "string" and result.shortcuts.set_unified
+    or defaults.diff_view.shortcuts.set_unified
+
+  return result
+end
+
 function M.setup(opts)
   opts = opts or {}
   state = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts)
@@ -635,6 +749,8 @@ function M.setup(opts)
   state.line_comments = sanitize_line_comments(state.line_comments)
   state.overview = sanitize_overview(state.overview)
   state.cache = sanitize_cache(state.cache)
+  state.follow_current_file = sanitize_follow_current_file(state.follow_current_file)
+  state.diff_view = sanitize_diff_view(state.diff_view)
   state.path_render = sanitize_path_render(state.path_render, opts)
 
   if type(state.ui) ~= "table" then

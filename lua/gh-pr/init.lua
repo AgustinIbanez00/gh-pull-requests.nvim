@@ -8,6 +8,8 @@ local runtime_state = require("gh-pr.state")
 local uv = vim.uv or vim.loop
 
 local auto_refresh_timer = nil
+local follow_current_file_seq = 0
+local configured_neotree_sources = {}
 
 local function notify_error(message)
   vim.notify(message, vim.log.levels.ERROR)
@@ -71,7 +73,12 @@ local function ensure_neotree_source(source_name, source_module_name)
       end
     end
     if not has_selector_source then
-      local display_name = source_name == "gh_pr_comments" and "  Comments " or "  PR "
+      local display_map = {
+        gh_pr = "  PR ",
+        gh_pr_comments = "  Comments ",
+        gh_pr_review = "  PR Review ",
+      }
+      local display_name = display_map[source_name] or ("  " .. tostring(source_name) .. " ")
       table.insert(selector_sources, { source = source_name, display_name = display_name })
     end
   end
@@ -87,16 +94,22 @@ local function ensure_neotree_source(source_name, source_module_name)
     return false
   end
 
+  if configured_neotree_sources[source_name] then
+    return true
+  end
+
   local setup_ok, setup_err = pcall(manager.setup, source_name, neo_tree.config[source_name], neo_tree.config, source_module)
   if not setup_ok then
     notify_error("Failed to setup " .. source_name .. " Neo-tree source: " .. tostring(setup_err))
     return false
   end
 
+  configured_neotree_sources[source_name] = true
   return true
 end
 
-local function open_neotree(source_name, source_module_name)
+local function open_neotree(source_name, source_module_name, opts)
+  opts = opts or {}
   source_name = source_name or "gh_pr"
   source_module_name = source_module_name or source_name
 
@@ -111,7 +124,7 @@ local function open_neotree(source_name, source_module_name)
 
   local status, err = pcall(command.execute, {
     source = source_name,
-    toggle = true,
+    toggle = opts.toggle ~= false,
     reveal = false,
     position = "left",
   })
@@ -147,17 +160,35 @@ local function open_comments_view(number)
     return
   end
 
-  local _, _, activate_err = actions.activate_pr(number, number ~= nil)
-  if activate_err then
-    notify_error(activate_err)
-    return
-  end
-
   pcall(function()
     require("gh-pr.neotree.comments_source").invalidate_cache()
   end)
 
-  open_neotree("gh_pr_comments", "gh_pr_comments")
+  if number ~= nil then
+    local _, _, activate_err = actions.activate_review(number, { refresh = true })
+    if activate_err then
+      notify_error(activate_err)
+      return
+    end
+  else
+    local active_pr, active_details = runtime_state.get_active_pr()
+    if active_pr and active_details then
+      actions.set_active_review(active_pr, active_details)
+    end
+  end
+
+  open_neotree("gh_pr_review", "gh_pr_review", { toggle = false })
+end
+
+local function open_review_view(opts)
+  opts = opts or {}
+  if not repo.ensure_git_repo() then
+    return false
+  end
+
+  return open_neotree("gh_pr_review", "gh_pr_review", {
+    toggle = opts.toggle ~= false,
+  })
 end
 
 local function refresh_views()
@@ -168,7 +199,12 @@ local function refresh_views()
 
   local manager_ok, manager = pcall(require, "neo-tree.sources.manager")
   if manager_ok then
-    pcall(manager.refresh, "gh_pr_comments")
+    pcall(manager.refresh, "gh_pr_review")
+  end
+
+  local review_ok, review_source = pcall(require, "gh-pr.neotree.review_source")
+  if review_ok and type(review_source.request_refresh) == "function" then
+    pcall(review_source.request_refresh, nil, { force = true, notify_error = false })
   end
 end
 
@@ -183,12 +219,28 @@ end
 local function start_auto_refresh_timer()
   stop_auto_refresh_timer()
 
-  local cache_options = (((config.get() or {}).cache or {}).gh_pr or {})
-  if cache_options.auto_refresh_when_focused == false then
+  local cache_config = ((config.get() or {}).cache or {})
+  local gh_pr_cache_options = type(cache_config.gh_pr) == "table" and cache_config.gh_pr or {}
+  local gh_pr_review_cache_options = type(cache_config.gh_pr_review) == "table" and cache_config.gh_pr_review or {}
+
+  local gh_pr_enabled = gh_pr_cache_options.auto_refresh_when_focused ~= false
+  local gh_pr_review_enabled = gh_pr_review_cache_options.auto_refresh_when_focused ~= false
+  if not gh_pr_enabled and not gh_pr_review_enabled then
     return
   end
 
-  local interval = tonumber(cache_options.ttl_seconds) or 60
+  local intervals = {}
+  if gh_pr_enabled then
+    intervals[#intervals + 1] = tonumber(gh_pr_cache_options.ttl_seconds) or 60
+  end
+  if gh_pr_review_enabled then
+    intervals[#intervals + 1] = tonumber(gh_pr_review_cache_options.ttl_seconds) or 60
+  end
+
+  local interval = intervals[1] or 60
+  for index = 2, #intervals do
+    interval = math.min(interval, intervals[index])
+  end
   interval = math.max(1, math.floor(interval))
 
   if not uv or type(uv.new_timer) ~= "function" then
@@ -206,7 +258,60 @@ local function start_auto_refresh_timer()
     if source_ok and type(source.refresh_if_focused) == "function" then
       source.refresh_if_focused()
     end
+
+    local review_ok, review_source = pcall(require, "gh-pr.neotree.review_source")
+    if review_ok and type(review_source.refresh_if_focused) == "function" then
+      review_source.refresh_if_focused()
+    end
   end))
+end
+
+local function follow_current_file_options()
+  local options = (config.get() or {}).follow_current_file or {}
+  local sources = type(options.sources) == "table" and options.sources or {}
+  local debounce_ms = tonumber(options.debounce_ms)
+  if type(debounce_ms) ~= "number" then
+    debounce_ms = 60
+  end
+  debounce_ms = math.max(0, math.floor(debounce_ms))
+
+  return {
+    enabled = options.enabled ~= false,
+    debounce_ms = debounce_ms,
+    source_pr = sources.pr ~= false,
+    source_pr_review = sources.pr_review ~= false,
+  }
+end
+
+local function schedule_follow_current_file()
+  local options = follow_current_file_options()
+  if not options.enabled then
+    return
+  end
+
+  follow_current_file_seq = follow_current_file_seq + 1
+  local token = follow_current_file_seq
+  vim.defer_fn(function()
+    if token ~= follow_current_file_seq then
+      return
+    end
+
+    local review_visible = false
+    if options.source_pr_review then
+      local review_ok, review_source = pcall(require, "gh-pr.neotree.review_source")
+      if review_ok and type(review_source.follow_current_file_if_visible) == "function" then
+        local ok, visible = pcall(review_source.follow_current_file_if_visible, { reason = "autocmd" })
+        review_visible = ok and visible == true
+      end
+    end
+
+    if not review_visible and options.source_pr then
+      local source_ok, source = pcall(require, "gh-pr.neotree.source")
+      if source_ok and type(source.follow_current_file_if_visible) == "function" then
+        pcall(source.follow_current_file_if_visible, { reason = "autocmd" })
+      end
+    end
+  end, options.debounce_ms)
 end
 
 local function prompt(text, default)
@@ -304,6 +409,10 @@ function M.setup(opts)
     group = group,
     callback = stop_auto_refresh_timer,
   })
+  vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
+    group = group,
+    callback = schedule_follow_current_file,
+  })
 end
 
 function M.open_pull_requests()
@@ -312,6 +421,15 @@ end
 
 function M.open_comments(number)
   open_comments_view(number)
+end
+
+function M.open_review_tree(opts)
+  opts = opts or {}
+  return open_review_view(opts)
+end
+
+function M.start_review(number)
+  actions.start_review(number)
 end
 
 function M.refresh()
@@ -381,6 +499,30 @@ end
 
 function M.comment()
   actions.review("comment")
+end
+
+function M.review_submit_pending()
+  actions.submit_pending_comment_review()
+end
+
+function M.review_approve_pending()
+  actions.submit_pending_approve_review()
+end
+
+function M.review_request_changes_pending()
+  actions.submit_pending_request_changes_review()
+end
+
+function M.review_discard_pending()
+  actions.discard_pending_review()
+end
+
+function M.add_inline_comment()
+  actions.add_inline_comment()
+end
+
+function M.add_inline_comment_visual()
+  actions.add_inline_comment_visual()
 end
 
 function M.merge(method)

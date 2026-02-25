@@ -11,11 +11,14 @@ A Neovim plugin that brings a GitHub Pull Requests workflow (similar to VSCode) 
 - Overview timeline tab that merges comments, reviews, and review-thread comments in chronological order.
 - Open commit diffs directly from Overview > Commits (virtual patch buffers, no checkout).
 - Virtual readonly file buffers for base/head versions (no disk writes).
-- Side-by-side diff view for changed files.
+- Configurable diff rendering for changed files: vertical split, horizontal split, or unified inline.
+- Toggle whitespace-sensitive vs whitespace-ignored diff rendering in file buffers.
 - Configurable path rendering in `Files` and `Comments` trees (`compact`, `tree`, `flat`).
 - Line comment indicators in PR file buffers (signcolumn + virtual text).
 - Floating modal popup with PR line comments on `K` in virtual PR buffers.
-- Comments tree (`gh_pr_comments`) with Problems-like navigation and preview.
+- Dedicated review workspace source (`gh_pr_review`) with sections: Overview, Labels, Files, Reviewers, Commits, Checks, Comments.
+- Start review flow from PR source (`S`) with optional GitHub pending review creation ("started a review").
+- Comments view migrated into PR Review > Comments (Problems-like navigation and preview preserved).
 - PR checkout (`gh pr checkout`).
 - Review actions:
   - approve
@@ -140,6 +143,35 @@ Optional:
         labels = true,
       },
     },
+    cache = {
+      gh_pr = {
+        enabled = true,
+        ttl_seconds = 60,
+        auto_refresh_when_focused = true,
+        max_cache_age_seconds = 900,
+        show_stale_badge = true,
+        sync_visible_buffers = true,
+      },
+      gh_pr_review = {
+        enabled = true,
+        ttl_seconds = 60,
+        auto_refresh_when_focused = true,
+        max_cache_age_seconds = 900,
+        show_stale_badge = true,
+        sync_visible_buffers = true,
+      },
+    },
+    diff_view = {
+      mode = "vertical", -- "vertical" | "horizontal" | "unified"
+      ignore_whitespace = false,
+      shortcuts = {
+        toggle_whitespace = ",dw",
+        cycle_mode = ",dm",
+        set_vertical = ",dv",
+        set_horizontal = ",dh",
+        set_unified = ",du",
+      },
+    },
     queries = {
       { folder = "Inbox", label = "Waiting For My Review", query = "is:open review-requested:@me" },
       { folder = "Inbox", label = "Assigned To Me", query = "is:open assignee:@me" },
@@ -158,7 +190,9 @@ Optional:
 
 - `:GhPrOpen` open PR UI (Neo-tree first, Telescope fallback).
 - `:GhPrList` open Telescope query/PR picker.
-- `:GhPrComments [number]` open PR comments tree (Problems-like), with `p` preview and enter-to-open navigation.
+- `:GhPrComments [number]` open PR Review source focused on current/selected PR review context.
+- `:GhPrStartReview [number]` start review flow for selected PR (optional remote pending review prompt).
+- `:GhPrReviewTree` toggle PR Review source.
 - `:GhPrRefresh` refresh data.
 - `:GhPrOverview` open active PR overview interactive tabs buffer (requires `snacks.nvim`).
 - `:GhPrOverviewRefresh` refresh active PR overview buffer in place.
@@ -173,6 +207,10 @@ Optional:
 - `:GhPrApprove` prompt review message and confirm before submit.
 - `:GhPrRequestChanges` prompt review message and confirm before submit.
 - `:GhPrComment` prompt review message and confirm before submit.
+- `:GhPrReviewSubmit` submit current pending review as comment (message + confirm).
+- `:GhPrReviewApprove` submit current pending review as approve (message + confirm).
+- `:GhPrReviewRequestChanges` submit current pending review as request changes (message + confirm).
+- `:GhPrReviewDiscard` discard current pending review (confirm).
 - `:GhPrMerge [merge|squash|rebase]` merge active PR.
 - `:GhPrQueryAdd` add query.
 - `:GhPrQueryEdit` edit query.
@@ -183,11 +221,13 @@ Optional:
 - `<leader>gho` open PR UI.
 - `<leader>ghl` open Telescope list.
 - `<leader>ghm` open PR comments tree.
+- `<leader>ghx` toggle PR Review source.
 - `<leader>ghr` refresh.
 - `<leader>ghv` PR overview.
 - `<leader>ghc` checkout.
 - `<leader>ghd` open diff.
 - `C` in `gh_pr` Neo-tree source opens PR comments tree.
+- `S` in `gh_pr` Neo-tree source starts review for selected PR.
 - `<leader>ght` toggle viewed.
 - `<leader>ghn` next diff hunk.
 - `<leader>ghp` previous diff hunk.
@@ -206,8 +246,8 @@ Inside the overview buffer:
 - `1..9` jump to tab
 - `et` edit title
 - `eb` edit description
-- `el` edit labels (comma-separated, replacement mode)
-- `er` edit reviewers (comma-separated, replacement mode)
+- `el` edit labels (multi-select, replacement mode)
+- `er` edit reviewers (multi-select, replacement mode; users + teams)
 - `ea` edit assignees (comma-separated, replacement mode)
 - `em` edit milestone (empty input removes milestone)
 - `es` change state (`open`/`closed`)
@@ -219,31 +259,78 @@ Inside the overview buffer:
 - `O` open original file for selected file row
 - `M` open modified file for selected file row
 - Every overview edit asks confirmation before execution and refreshes the overview on success.
+- In multi-select edits (`labels/reviewers`), unselected current items are removed.
+- `,x` toggle PR Review source while staying in review flow.
 
 Inside PR virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenModified`):
 - `K` show PR comments for the current line in a modal floating window
+- `R` refresh current diff buffer from GitHub
+- `?` show floating help with available PR diff shortcuts
+- `q` quick close: in 2-way diff closes `modified/head`; in single-buffer view closes and opens `PR Review`
+- `Q` close current diff view(s) and open/focus `PR Review`
+- `,dw` toggle whitespace diff mode (ignored/strict)
+- `,dm` cycle diff mode (`vertical` -> `horizontal` -> `unified`)
+- `,dv` force vertical split mode
+- `,dh` force horizontal split mode
+- `,du` force unified mode (single virtual diff buffer)
+- `gc` add inline review comment at current line (`MODIFIED`/head or `unified`)
+- visual `gc` add inline review comment for selected line range (`v`/`V`, `MODIFIED`/head or `unified`)
+- for `ADDED` files, `GhPrOpenDiff` opens a single MODIFIED buffer (no split/unified diff layout)
+- in `ADDED` single-buffer mode, `gc` is allowed on any line/range
+- inline comments are pre-validated before opening the composer:
+  - `MODIFIED`/head must be inside PR diff hunks
+  - `unified` is limited to added (`+`) lines in the diff
+- inline comment editor uses `<C-s>` to submit draft and `q`/`<Esc>` to cancel
 - `,n` next diff change
 - `,p` previous diff change
 - `,f` next file in PR
 - `,F` previous file in PR
 - `,v` next reviewed file in PR
 - `,V` previous reviewed file in PR
+- `,rs` submit pending review as comment
+- `,ra` submit pending review as approve
+- `,rr` submit pending review as request changes
+- `,rd` discard pending review
+- `,x` toggle PR Review source
 
-Inside `gh_pr_comments` Neo-tree source:
-- `<CR>` open comment location
-- `o` open comment location
-- `p` preview comment location in right split
-- `R` refresh comments
-- Long threads open a focused floating buffer; navigate with normal motions and close with `q`/`<Esc>`
+Inside `gh_pr_review` Neo-tree source:
+- Root node shows active PR (`PR #N - title`) for current repository.
+- Sections: `Overview`, `Labels`, `Files`, `Reviewers`, `Commits`, `Checks`, `Comments`.
+- `<CR>` actions:
+  - `Overview` opens overview buffer
+  - `Files` opens diffs
+  - `Commits` opens commit patch diff
+  - `Checks` opens check URL
+  - `Comments` is a tree with `By File` and `Global` sections
+  - `By File` groups comment threads by path/file and thread labels show status badges
+    (`[UNRESOLVED]`, `[RESOLVED]`, `[CLOSED]`)
+  - `Global` includes review events and general PR comments
+  - Thread nodes/items open file/line and thread popup when location exists
+  - Review/general comment nodes open timeline popup
+- `p`/`v` on files toggles viewed state and refreshes PR state immediately.
+- `R` forces a refresh from GitHub for the active review PR.
+- `l` opens labels multi-select edit dialog.
+- `r` opens reviewers multi-select edit dialog.
+- `S` submit pending review as comment.
+- `A` submit pending review as approve.
+- `C` submit pending review as request changes.
+- `D` discard pending review.
+- `s` re-runs start-review flow for selected PR context.
 
 ## Neo-tree source
 
-The plugin exposes a source module named `gh_pr` (`lua/gh_pr.lua`).
-`GhPrOpen` auto-registers the source in Neo-tree config at runtime.
+The plugin exposes source modules:
+- `gh_pr` (`lua/gh_pr.lua`)
+- `gh_pr_review` (`lua/gh_pr_review.lua`)
+
+`GhPrOpen`, `GhPrStartReview`, and `GhPrReviewTree` auto-register required sources in Neo-tree config at runtime.
 
 ## Notes
 
 - Query definitions are persisted in `stdpath("state")/gh-pr/queries.json`.
 - Viewed file state is persisted in `stdpath("state")/gh-pr/state.json`.
+- Diff view preferences (`mode`, `ignore_whitespace`) are persisted in `stdpath("state")/gh-pr/state.json`.
 - PR cache is persisted in `stdpath("state")/gh-pr/pr_cache.json`.
+- Cache entries are scoped per source and repository key (`gh_pr` and `gh_pr_review`).
 - File content is fetched from GitHub API through `gh api` and opened in readonly buffers.
+- File open in PR views no longer falls back to patch (`@@`) buffers when content fetch fails; commit patch views remain explicit.
