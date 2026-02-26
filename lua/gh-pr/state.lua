@@ -14,6 +14,9 @@ local state = {
       ignore_whitespace = false,
       render_whitespace = true,
     },
+    images = {
+      fallback_default_action = "metadata",
+    },
   },
 }
 
@@ -150,10 +153,29 @@ local function sanitize_diff_view_prefs(input)
   return result
 end
 
+local function sanitize_image_prefs(input)
+  local result = {
+    fallback_default_action = "metadata",
+  }
+
+  if type(input) ~= "table" then
+    return result
+  end
+
+  local action = type(input.fallback_default_action) == "string" and input.fallback_default_action:lower() or ""
+  if action ~= "metadata" and action ~= "open_local_current" and action ~= "open_local_both" and action ~= "open_github" then
+    action = "metadata"
+  end
+  result.fallback_default_action = action
+
+  return result
+end
+
 function M.setup()
   load_persisted_state()
   state.prefs = state.prefs or {}
   state.prefs.diff_view = sanitize_diff_view_prefs(state.prefs.diff_view)
+  state.prefs.images = sanitize_image_prefs(state.prefs.images)
 end
 
 function M.set_active_pr(pr, details)
@@ -301,6 +323,25 @@ function M.update_diff_view_pref(key, value)
   local current = M.get_diff_view_prefs()
   current[key] = value
   return M.set_diff_view_prefs(current)
+end
+
+function M.get_image_prefs()
+  state.prefs = state.prefs or {}
+  state.prefs.images = sanitize_image_prefs(state.prefs.images)
+  return vim.deepcopy(state.prefs.images)
+end
+
+function M.set_image_prefs(prefs)
+  state.prefs = state.prefs or {}
+  state.prefs.images = sanitize_image_prefs(prefs)
+  save_persisted_state()
+  return true
+end
+
+function M.update_image_pref(key, value)
+  local current = M.get_image_prefs()
+  current[key] = value
+  return M.set_image_prefs(current)
 end
 
 return M

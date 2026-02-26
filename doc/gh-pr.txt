@@ -41,6 +41,8 @@ Commands
     `By File` groups threads by path/file and uses status badges:
     `[UNRESOLVED]`, `[RESOLVED]`, `[CLOSED]`.
     `Global` includes review events and general PR comments.
+    In `Files`, directory nodes show `X/Y VIEWED` in yellow when at least
+    one descendant file is viewed (recursive count including subfolders).
     Inside `gh_pr_review`, `R` forces refresh from GitHub for active PR.
     `l` opens labels multi-select edit dialog.
     `r` opens reviewers multi-select edit dialog.
@@ -48,6 +50,16 @@ Commands
     `A` submit pending review as approve.
     `C` submit pending review as request changes.
     `D` discard pending review.
+    `zA` expand all review nodes.
+    `za` collapse all review nodes.
+    `zF` expand `Files` subtree.
+    `zf` collapse `Files` subtree.
+    `zV` expand paths that contain viewed files.
+    `zv` collapse paths that contain viewed files.
+    `zC` expand `Comments > By File`.
+    `zc` collapse `Comments > By File`.
+    `zG` expand `Comments > Global` (including subgroups).
+    `zg` collapse `Comments > Global` (including subgroups).
     `s` re-runs start-review flow for selected PR context.
 
 :GhPrRefresh
@@ -102,6 +114,16 @@ Overview buffer keymaps:
 :GhPrOpenDiff
     Opens active file as virtual PR diff using configured render mode:
     vertical split, horizontal split, or unified inline.
+    Image files (`png/jpg/jpeg/gif/webp/bmp/svg`) are rendered as previews
+    in virtual buffers when `snacks.image` is available.
+    If configured mode is `unified` for an image file, gh-pr forces split
+    layout (vertical/horizontal) for base/head preview.
+    If image rendering is unavailable/unsupported, fallback behavior is
+    controlled by `diff_view.images.fallback_mode`:
+      - `menu` opens a custom buffer with fallback actions
+      - `metadata_only` renders metadata text diff in the current buffer
+      - `auto_local` opens local cached image(s), then metadata fallback
+      - `auto_github` opens GitHub compare URL, then metadata fallback
     If GitHub file content cannot be loaded, command fails with an explicit
     error (no implicit patch fallback buffer).
     In virtual PR buffers, `K` opens a modal floating window with comments
@@ -124,6 +146,8 @@ Overview buffer keymaps:
       `,du` force unified mode
       `gc` add inline comment at cursor (`MODIFIED`/head or `unified`)
       visual `gc` add inline comment for selected range (`v`/`V`, head or `unified`)
+      image files disable `K`, `gc`, `,n`, `,p` and whitespace/layout toggles
+      image files: `<CR>` runs default fallback action, `gf` opens fallback menu
       for `ADDED` files, opens single MODIFIED buffer (no split/unified layout)
       in `ADDED` single mode, `gc` is allowed on any line/range
       inline comments are validated before opening composer:
@@ -293,6 +317,20 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.shortcuts.set_vertical` (`",dv"`)
 - `diff_view.shortcuts.set_horizontal` (`",dh"`)
 - `diff_view.shortcuts.set_unified` (`",du"`)
+- `diff_view.images.enabled` (`true`)
+- `diff_view.images.backend` (`"snacks"`, only backend currently supported)
+- `diff_view.images.formats` (`png/jpg/jpeg/gif/webp/bmp/svg`)
+- `diff_view.images.cache_dir` (`nil`, defaults to `stdpath("cache")/gh-pr/images`)
+- `diff_view.images.fallback` (`"placeholder"`)
+- `diff_view.images.fallback_mode` (`"menu"`, also `"metadata_only"` / `"auto_local"` / `"auto_github"`)
+- `diff_view.images.fallback_default_action` (`"metadata"`, also `"open_local_current"` / `"open_local_both"` / `"open_github"`)
+- `diff_view.images.fallback_menu_keymap` (`"gf"`)
+- `diff_view.images.fallback_open_local` (`"system"`)
+- `diff_view.images.fallback_github_target` (`"pr_files"`, also `"pr"`)
+- `diff_view.images.show_metadata` (`true`)
+- `diff_view.images.metadata_resolution_strategy` (`"hybrid"`, also `"internal"` / `"external"`)
+- `diff_view.images.metadata_external_command` (`{ "magick", "identify", "-format", "%w %h", "{file}" }`)
+- `diff_view.images.max_bytes` (`26214400`, 25 MiB)
 - `queries` list: `{ folder, label, query }`
 - `ui.use_neotree` (`true`)
 - `ui.telescope_fallback` (`true`)
@@ -303,5 +341,6 @@ Persistence
 - Queries: `stdpath("state")/gh-pr/queries.json`
 - Viewed files: `stdpath("state")/gh-pr/state.json`
 - Diff view prefs (`mode`, `ignore_whitespace`, `render_whitespace`): `stdpath("state")/gh-pr/state.json`
+- Image fallback default action: `stdpath("state")/gh-pr/state.json`
 - PR cache: `stdpath("state")/gh-pr/pr_cache.json`
 - Cache is stored per source/repo key (`gh_pr` and `gh_pr_review`).

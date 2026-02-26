@@ -19,6 +19,9 @@ local runtime_cache = {
   last_prune_at = 0,
 }
 
+local REFRESH_MODE_UI = "ui-refresh"
+local REFRESH_MODE_CACHE_ONLY = "cache-only"
+
 local DEFAULT_RENDERERS = {
   folder = {
     { "indent", with_expanders = true },
@@ -64,6 +67,62 @@ local DEFAULT_RENDERERS = {
 
 local function now_seconds()
   return os.time()
+end
+
+local function normalize_refresh_context(context)
+  local source = type(context) == "table" and context or {}
+  local mode = source.mode == REFRESH_MODE_CACHE_ONLY and REFRESH_MODE_CACHE_ONLY or REFRESH_MODE_UI
+  local reason = type(source.reason) == "string" and source.reason ~= "" and source.reason or "manual"
+  local notify
+  if type(source.notify) == "boolean" then
+    notify = source.notify
+  else
+    notify = mode == REFRESH_MODE_UI and reason == "timer"
+  end
+
+  return {
+    mode = mode,
+    reason = reason,
+    notify = notify,
+  }
+end
+
+local function merge_refresh_context(current, incoming)
+  local left = normalize_refresh_context(current)
+  local right = normalize_refresh_context(incoming)
+  return {
+    mode = (left.mode == REFRESH_MODE_UI or right.mode == REFRESH_MODE_UI) and REFRESH_MODE_UI
+      or REFRESH_MODE_CACHE_ONLY,
+    reason = right.reason ~= "" and right.reason or left.reason,
+    notify = left.notify == true or right.notify == true,
+  }
+end
+
+local function should_update_ui(refresh_context)
+  return type(refresh_context) == "table" and refresh_context.mode == REFRESH_MODE_UI
+end
+
+local function queue_pending_refresh(session, opts)
+  local pending = type(session.pending_refresh) == "table" and session.pending_refresh or {
+    force = false,
+    refresh_context = normalize_refresh_context(nil),
+  }
+
+  pending.force = pending.force == true or opts.force == true
+  pending.refresh_context = merge_refresh_context(pending.refresh_context, opts.refresh_context)
+  session.pending_refresh = pending
+end
+
+local function consume_pending_refresh(session)
+  local pending = type(session.pending_refresh) == "table" and session.pending_refresh or nil
+  session.pending_refresh = nil
+  if type(pending) ~= "table" then
+    return nil
+  end
+
+  pending.force = pending.force == true
+  pending.refresh_context = normalize_refresh_context(pending.refresh_context)
+  return pending
 end
 
 local function cache_options()
@@ -212,7 +271,7 @@ local function new_repo_session(repo_context)
     updated_at = 0,
     loading = false,
     inflight = false,
-    pending_refresh = false,
+    pending_refresh = nil,
     last_error = nil,
     stale = false,
     states = {},
@@ -793,6 +852,9 @@ end
 local start_background_refresh
 
 local function finish_refresh(repo_context, payload)
+  payload = type(payload) == "table" and payload or {}
+  local refresh_context = normalize_refresh_context(payload.refresh_context)
+  local ui_refresh = should_update_ui(refresh_context)
   local session = ensure_repo_session(repo_context)
   session.inflight = false
   session.loading = false
@@ -800,10 +862,13 @@ local function finish_refresh(repo_context, payload)
   if payload.error then
     session.last_error = payload.error
     session.stale = session_is_stale(session)
-    render_repo_states(repo_context.key)
-    if session.pending_refresh then
-      session.pending_refresh = false
-      start_background_refresh(repo_context, { force = true })
+    if ui_refresh then
+      render_repo_states(repo_context.key)
+    end
+
+    local pending = consume_pending_refresh(session)
+    if pending then
+      start_background_refresh(repo_context, pending)
     end
     return
   end
@@ -819,29 +884,35 @@ local function finish_refresh(repo_context, payload)
   apply_runtime_cache(session)
   session.stale = session_is_stale(session)
   persist_session(repo_context, session)
-  render_repo_states(repo_context.key)
-  follow_current_file_if_visible({ reason = "refresh" })
 
-  if cache_options().sync_visible_buffers ~= false then
-    virtual_files.sync_visible_pr_buffers(session.details_by_pr, {
-      repository = repo_context.repository.full_name,
-    })
+  if ui_refresh then
+    render_repo_states(repo_context.key)
+    follow_current_file_if_visible({ reason = "refresh" })
+
+    if cache_options().sync_visible_buffers ~= false then
+      virtual_files.sync_visible_pr_buffers(session.details_by_pr, {
+        repository = repo_context.repository.full_name,
+      })
+    end
   end
 
-  if session.pending_refresh then
-    session.pending_refresh = false
-    start_background_refresh(repo_context, { force = true })
+  local pending = consume_pending_refresh(session)
+  if pending then
+    start_background_refresh(repo_context, pending)
   end
 end
 
 start_background_refresh = function(repo_context, opts)
   opts = opts or {}
+  opts.refresh_context = normalize_refresh_context(opts.refresh_context)
+  local ui_refresh = should_update_ui(opts.refresh_context)
   local session = ensure_repo_session(repo_context)
 
   if session.inflight then
-    if opts.force then
-      session.pending_refresh = true
-    end
+    queue_pending_refresh(session, {
+      force = true,
+      refresh_context = opts.refresh_context,
+    })
     return false
   end
 
@@ -854,11 +925,19 @@ start_background_refresh = function(repo_context, opts)
   session.inflight = true
   session.loading = true
   session.stale = session_is_stale(session)
-  render_repo_states(repo_context.key)
+  if ui_refresh then
+    if opts.refresh_context.reason == "timer" and opts.refresh_context.notify then
+      vim.notify("Updating PRs...", vim.log.levels.INFO)
+    end
+    render_repo_states(repo_context.key)
+  end
 
   pr_service.list_queries_with_results_async(function(query_results, query_err)
     if not query_results then
-      finish_refresh(repo_context, { error = query_err or "Unable to fetch pull requests" })
+      finish_refresh(repo_context, {
+        error = query_err or "Unable to fetch pull requests",
+        refresh_context = opts.refresh_context,
+      })
       return
     end
 
@@ -874,6 +953,7 @@ start_background_refresh = function(repo_context, opts)
           query_results = query_results,
           details_by_pr = details_by_pr,
           detail_errors = detail_errors,
+          refresh_context = opts.refresh_context,
         })
         return
       end
@@ -955,6 +1035,7 @@ function M.request_refresh(state, opts)
 
   return start_background_refresh(repo_context, {
     force = opts.force == true,
+    refresh_context = normalize_refresh_context(opts.refresh_context),
   })
 end
 
@@ -964,25 +1045,20 @@ function M.render_cached_states()
   end
 end
 
-function M.refresh_if_focused()
-  local options = cache_options()
-  if options.auto_refresh_when_focused == false then
-    return
-  end
-
+local function resolve_current_focused_state()
   local winid = vim.api.nvim_get_current_win()
   if not winid or not vim.api.nvim_win_is_valid(winid) then
-    return
+    return false, nil
   end
 
   local bufnr = vim.api.nvim_win_get_buf(winid)
   local filetype = vim.api.nvim_get_option_value("filetype", { buf = bufnr })
   if filetype ~= "neo-tree" then
-    return
+    return false, nil
   end
 
   if vim.b[bufnr].neo_tree_source ~= "gh_pr" then
-    return
+    return false, nil
   end
 
   local state = nil
@@ -994,7 +1070,33 @@ function M.refresh_if_focused()
     end
   end
 
-  M.request_refresh(state, { force = false, notify_error = false })
+  return true, state
+end
+
+function M.is_focused()
+  return select(1, resolve_current_focused_state())
+end
+
+function M.refresh_if_focused()
+  local options = cache_options()
+  if options.auto_refresh_when_focused == false then
+    return
+  end
+
+  local focused, state = resolve_current_focused_state()
+  if not focused then
+    return
+  end
+
+  M.request_refresh(state, {
+    force = false,
+    notify_error = false,
+    refresh_context = {
+      mode = REFRESH_MODE_UI,
+      reason = "timer",
+      notify = true,
+    },
+  })
   follow_current_file_if_visible({ reason = "focused" })
 end
 

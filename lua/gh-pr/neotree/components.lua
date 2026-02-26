@@ -204,4 +204,27 @@ M.viewed_badge = function(_, node, _)
   return { text = "", highlight = "GhPrViewedBadge" }
 end
 
+M.folder_viewed_badge = function(_, node, _)
+  if not (node.extra and node.extra.kind == "directory") then
+    return { text = "", highlight = "GhPrViewedBadge" }
+  end
+
+  local counts = node.extra.viewed_counts
+  if type(counts) ~= "table" then
+    return { text = "", highlight = "GhPrViewedBadge" }
+  end
+
+  local viewed = tonumber(counts.viewed) or 0
+  local total = tonumber(counts.total) or 0
+  local show_prefix = node.extra.show_viewed_prefix == true
+  if not show_prefix or total < 1 or viewed < 1 then
+    return { text = "", highlight = "GhPrViewedBadge" }
+  end
+
+  return {
+    text = string.format("%d/%d VIEWED ", viewed, total),
+    highlight = "GhPrViewedBadge",
+  }
+end
+
 return vim.tbl_deep_extend("force", common, M)

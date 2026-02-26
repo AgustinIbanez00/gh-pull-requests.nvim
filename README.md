@@ -13,6 +13,7 @@ A Neovim plugin that brings a GitHub Pull Requests workflow (similar to VSCode) 
 - Virtual readonly file buffers for base/head versions (no disk writes).
 - Configurable diff rendering for changed files: vertical split, horizontal split, or unified inline.
 - Toggle whitespace-sensitive vs whitespace-ignored diff rendering in file buffers.
+- Image file preview in PR diffs (`png/jpg/jpeg/gif/webp/bmp/svg`) with configurable fallback actions (local open, GitHub compare URL, metadata diff text).
 - Configurable path rendering in `Files` and `Comments` trees (`compact`, `tree`, `flat`).
 - Line comment indicators in PR file buffers (signcolumn + virtual text).
 - Floating modal popup with PR line comments on `K` in virtual PR buffers.
@@ -181,6 +182,22 @@ Optional:
         set_horizontal = ",dh",
         set_unified = ",du",
       },
+      images = {
+        enabled = true,
+        backend = "snacks", -- currently only snacks.image
+        formats = { "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg" },
+        cache_dir = nil, -- defaults to stdpath("cache") .. "/gh-pr/images"
+        fallback = "placeholder",
+        fallback_mode = "menu", -- "menu" | "metadata_only" | "auto_local" | "auto_github"
+        fallback_default_action = "metadata", -- "metadata" | "open_local_current" | "open_local_both" | "open_github"
+        fallback_menu_keymap = "gf", -- custom menu key for image fallback actions
+        fallback_open_local = "system", -- currently only "system"
+        fallback_github_target = "pr_files", -- "pr_files" | "pr"
+        show_metadata = true,
+        metadata_resolution_strategy = "hybrid", -- "internal" | "external" | "hybrid"
+        metadata_external_command = { "magick", "identify", "-format", "%w %h", "{file}" },
+        max_bytes = 25 * 1024 * 1024,
+      },
     },
     queries = {
       { folder = "Inbox", label = "Waiting For My Review", query = "is:open review-requested:@me" },
@@ -287,6 +304,11 @@ Inside PR virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenMod
 - `gc` add inline review comment at current line (`MODIFIED`/head or `unified`)
 - visual `gc` add inline review comment for selected line range (`v`/`V`, `MODIFIED`/head or `unified`)
 - for `ADDED` files, `GhPrOpenDiff` opens a single MODIFIED buffer (no split/unified diff layout)
+- for image files (`png/jpg/jpeg/gif/webp/bmp/svg`), previews are rendered in virtual buffers when supported by `snacks.image`
+- for image files in `unified` mode, plugin forces split view (vertical/horizontal) instead of unified text diff
+- for image files, line-comments popup and inline comment/hunk shortcuts (`K`, `gc`, `,n`, `,p`) are disabled
+- for image files, `<CR>` runs the configured default fallback action and `gf` opens the custom fallback actions menu
+- if image render backend is unavailable/unsupported, gh-pr opens the image fallback menu (configurable), can open local cached files, open GitHub compare URL, and can render metadata diff text (resolution/size/sha)
 - in `ADDED` single-buffer mode, `gc` is allowed on any line/range
 - inline comments are pre-validated before opening the composer:
   - `MODIFIED`/head must be inside PR diff hunks
@@ -305,6 +327,22 @@ Inside PR virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenMod
 - `,rd` discard pending review
 - `,x` toggle PR Review source
 
+Image diff rendering options (`diff_view.images`):
+- `enabled` (`true`)
+- `backend` (`"snacks"`)
+- `formats` (`{ "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg" }`)
+- `cache_dir` (`nil` => `stdpath("cache")/gh-pr/images`)
+- `fallback` (`"placeholder"`)
+- `fallback_mode` (`"menu"`, also `"metadata_only"` / `"auto_local"` / `"auto_github"`)
+- `fallback_default_action` (`"metadata"`, also `"open_local_current"` / `"open_local_both"` / `"open_github"`)
+- `fallback_menu_keymap` (`"gf"`)
+- `fallback_open_local` (`"system"`)
+- `fallback_github_target` (`"pr_files"`, also `"pr"`)
+- `show_metadata` (`true`)
+- `metadata_resolution_strategy` (`"hybrid"`, also `"internal"` / `"external"`)
+- `metadata_external_command` (`{ "magick", "identify", "-format", "%w %h", "{file}" }`)
+- `max_bytes` (`26214400`)
+
 Inside `gh_pr_review` Neo-tree source:
 - Root node shows active PR (`PR #N - title`) for current repository.
 - Sections: `Overview`, `Labels`, `Files`, `Reviewers`, `Commits`, `Checks`, `Comments`.
@@ -316,9 +354,11 @@ Inside `gh_pr_review` Neo-tree source:
   - `Comments` is a tree with `By File` and `Global` sections
   - `By File` groups comment threads by path/file and thread labels show status badges
     (`[UNRESOLVED]`, `[RESOLVED]`, `[CLOSED]`)
-  - `Global` includes review events and general PR comments
-  - Thread nodes/items open file/line and thread popup when location exists
-  - Review/general comment nodes open timeline popup
+- `Global` includes review events and general PR comments
+- Thread nodes/items open file/line and thread popup when location exists
+- Review/general comment nodes open timeline popup
+- In `Files`, directory nodes show a yellow prefix `X/Y VIEWED` when at least one descendant file is viewed
+  (counts are recursive and include subfolders).
 - `p`/`v` on files toggles viewed state and refreshes PR state immediately.
 - `R` forces a refresh from GitHub for the active review PR.
 - `l` opens labels multi-select edit dialog.
@@ -327,6 +367,16 @@ Inside `gh_pr_review` Neo-tree source:
 - `A` submit pending review as approve.
 - `C` submit pending review as request changes.
 - `D` discard pending review.
+- `zA` expand all review nodes.
+- `za` collapse all review nodes.
+- `zF` expand `Files` subtree.
+- `zf` collapse `Files` subtree.
+- `zV` expand paths that contain viewed files.
+- `zv` collapse paths that contain viewed files.
+- `zC` expand `Comments > By File`.
+- `zc` collapse `Comments > By File`.
+- `zG` expand `Comments > Global` (including subgroups).
+- `zg` collapse `Comments > Global` (including subgroups).
 - `s` re-runs start-review flow for selected PR context.
 
 ## Neo-tree source
@@ -342,6 +392,7 @@ The plugin exposes source modules:
 - Query definitions are persisted in `stdpath("state")/gh-pr/queries.json`.
 - Viewed file state is persisted in `stdpath("state")/gh-pr/state.json`.
 - Diff view preferences (`mode`, `ignore_whitespace`, `render_whitespace`) are persisted in `stdpath("state")/gh-pr/state.json`.
+- Image fallback default action is persisted in `stdpath("state")/gh-pr/state.json`.
 - PR cache is persisted in `stdpath("state")/gh-pr/pr_cache.json`.
 - Cache entries are scoped per source and repository key (`gh_pr` and `gh_pr_review`).
 - File content is fetched from GitHub API through `gh api` and opened in readonly buffers.

@@ -19,7 +19,7 @@ local DEFAULT_RENDERERS = {
   folder = {
     { "indent", with_expanders = true },
     { "kind_icon" },
-    { "container", width = "100%", content = { { "name", zindex = 10 } } },
+    { "container", width = "100%", content = { { "folder_viewed_badge", zindex = 10 }, { "name", zindex = 11 } } },
   },
   files = {
     { "indent", with_expanders = true },
@@ -34,7 +34,7 @@ local DEFAULT_RENDERERS = {
   directory = {
     { "indent", with_expanders = true },
     { "kind_icon" },
-    { "container", width = "100%", content = { { "name", zindex = 10 } } },
+    { "container", width = "100%", content = { { "folder_viewed_badge", zindex = 10 }, { "name", zindex = 11 } } },
   },
   file = {
     { "indent", with_expanders = false },
@@ -58,8 +58,67 @@ local runtime_cache = {
   last_prune_at = 0,
 }
 
+local REFRESH_MODE_UI = "ui-refresh"
+local REFRESH_MODE_CACHE_ONLY = "cache-only"
+
 local function now_seconds()
   return os.time()
+end
+
+local function normalize_refresh_context(context)
+  local source = type(context) == "table" and context or {}
+  local mode = source.mode == REFRESH_MODE_CACHE_ONLY and REFRESH_MODE_CACHE_ONLY or REFRESH_MODE_UI
+  local reason = type(source.reason) == "string" and source.reason ~= "" and source.reason or "manual"
+  local notify
+  if type(source.notify) == "boolean" then
+    notify = source.notify
+  else
+    notify = mode == REFRESH_MODE_UI and reason == "timer"
+  end
+
+  return {
+    mode = mode,
+    reason = reason,
+    notify = notify,
+  }
+end
+
+local function merge_refresh_context(current, incoming)
+  local left = normalize_refresh_context(current)
+  local right = normalize_refresh_context(incoming)
+  return {
+    mode = (left.mode == REFRESH_MODE_UI or right.mode == REFRESH_MODE_UI) and REFRESH_MODE_UI
+      or REFRESH_MODE_CACHE_ONLY,
+    reason = right.reason ~= "" and right.reason or left.reason,
+    notify = left.notify == true or right.notify == true,
+  }
+end
+
+local function should_update_ui(refresh_context)
+  return type(refresh_context) == "table" and refresh_context.mode == REFRESH_MODE_UI
+end
+
+local function queue_pending_refresh(session, opts)
+  local pending = type(session.pending_refresh) == "table" and session.pending_refresh or {
+    force = false,
+    refresh_context = normalize_refresh_context(nil),
+  }
+
+  pending.force = pending.force == true or opts.force == true
+  pending.refresh_context = merge_refresh_context(pending.refresh_context, opts.refresh_context)
+  session.pending_refresh = pending
+end
+
+local function consume_pending_refresh(session)
+  local pending = type(session.pending_refresh) == "table" and session.pending_refresh or nil
+  session.pending_refresh = nil
+  if type(pending) ~= "table" then
+    return nil
+  end
+
+  pending.force = pending.force == true
+  pending.refresh_context = normalize_refresh_context(pending.refresh_context)
+  return pending
 end
 
 local function has_full_details(details)
@@ -191,7 +250,7 @@ local function new_repo_session(repo_context)
     updated_at = 0,
     loading = false,
     inflight = false,
-    pending_refresh = false,
+    pending_refresh = nil,
     last_error = nil,
     stale = false,
     follow = {},
@@ -349,30 +408,78 @@ local function file_display_name(path, file, options)
   return base_name
 end
 
+local function normalize_tree_path(path)
+  if type(path) ~= "string" then
+    return ""
+  end
+
+  local normalized = path:gsub("\\", "/"):gsub("/+", "/")
+  normalized = normalized:gsub("^/", ""):gsub("/$", "")
+  return normalized
+end
+
+local function directory_path_of_file(path)
+  local normalized = normalize_tree_path(path)
+  if normalized == "" then
+    return ""
+  end
+
+  local directory = normalized:match("^(.*)/[^/]+$")
+  return type(directory) == "string" and directory or ""
+end
+
+local function add_directory_count(counts, directory_path, viewed)
+  if type(counts) ~= "table" or type(directory_path) ~= "string" or directory_path == "" then
+    return
+  end
+
+  local current = ""
+  for segment in directory_path:gmatch("[^/]+") do
+    current = current == "" and segment or (current .. "/" .. segment)
+    local bucket = counts[current]
+    if type(bucket) ~= "table" then
+      bucket = { viewed = 0, total = 0 }
+      counts[current] = bucket
+    end
+    bucket.total = (tonumber(bucket.total) or 0) + 1
+    if viewed then
+      bucket.viewed = (tonumber(bucket.viewed) or 0) + 1
+    end
+  end
+end
+
 local function build_file_nodes(pr, details, repo_full_name)
   local render_options = config.get_path_render("gh_pr")
   local hide_viewed = (config.get() or {}).hide_viewed_files == true
   local entries = {}
   local seen_paths = {}
+  local directory_counts = {}
   local total_files = 0
   local viewed_files = 0
 
   for _, file in ipairs(type(details.files) == "table" and details.files or {}) do
     local path = file.path or file.filename
-    if type(path) == "string" and path ~= "" and not seen_paths[path] then
+    if type(path) == "string" and path ~= "" then
+      local normalized_path = normalize_tree_path(path)
+      if normalized_path == "" or seen_paths[normalized_path] then
+        goto continue
+      end
       seen_paths[path] = true
-      local viewed = runtime_state.is_viewed(repo_full_name, pr.number, path)
+      seen_paths[normalized_path] = true
+      local viewed = runtime_state.is_viewed(repo_full_name, pr.number, normalized_path)
+      add_directory_count(directory_counts, directory_path_of_file(normalized_path), viewed)
       total_files = total_files + 1
       if viewed then
         viewed_files = viewed_files + 1
       end
       if not (hide_viewed and viewed) then
         entries[#entries + 1] = {
-          path = path,
+          path = normalized_path,
           payload = file,
         }
       end
     end
+    ::continue::
   end
 
   if vim.tbl_isempty(entries) then
@@ -394,6 +501,10 @@ local function build_file_nodes(pr, details, repo_full_name)
     mode = render_options.mode,
     separator = render_options.separator,
     create_directory_node = function(display_name, full_path)
+      local normalized_full_path = normalize_tree_path(full_path)
+      local counts = directory_counts[normalized_full_path]
+      local viewed = type(counts) == "table" and tonumber(counts.viewed) or nil
+      local total = type(counts) == "table" and tonumber(counts.total) or nil
       return {
         id = string.format("ghpr-review:%d:file-dir:%s", pr.number, full_path),
         name = display_name,
@@ -401,8 +512,12 @@ local function build_file_nodes(pr, details, repo_full_name)
         children = {},
         extra = {
           kind = "directory",
+          path = normalized_full_path,
           pr = pr,
           details = details,
+          repo = repo_full_name,
+          viewed_counts = (viewed and total) and { viewed = viewed, total = total } or nil,
+          show_viewed_prefix = viewed ~= nil and total ~= nil and total > 0 and viewed > 0,
         },
       }
     end,
@@ -707,6 +822,194 @@ local function build_check_nodes(pr, details)
   end
 
   return nodes
+end
+
+local function collect_commit_signature(details)
+  local commits = type(details.commits) == "table" and details.commits or {}
+  local ids = {}
+  local set = {}
+  local latest_oid = ""
+
+  for _, commit in ipairs(commits) do
+    local oid = type(commit) == "table" and type(commit.oid) == "string" and commit.oid or ""
+    if oid ~= "" then
+      if latest_oid == "" then
+        latest_oid = oid
+      end
+      ids[#ids + 1] = oid
+      set[oid] = true
+    end
+  end
+
+  return {
+    count = #ids,
+    ids = ids,
+    set = set,
+    latest_oid = latest_oid,
+    signature = table.concat(ids, "|"),
+  }
+end
+
+local function collect_check_signature(details)
+  local checks = type(details.statusCheckRollup) == "table" and details.statusCheckRollup or {}
+  local entries = {}
+
+  for _, check in ipairs(checks) do
+    local name = normalize_check_name(check)
+    local state = normalize_check_result(check)
+    entries[#entries + 1] = string.format("%s=%s", sanitize_node_id_component(name), sanitize_node_id_component(state))
+  end
+
+  table.sort(entries)
+  return {
+    total = #entries,
+    signature = table.concat(entries, "|"),
+  }
+end
+
+local function build_review_snapshot(pr_number, details)
+  if type(details) ~= "table" then
+    return nil
+  end
+
+  local commits = collect_commit_signature(details)
+  local checks = collect_check_signature(details)
+  local files_changed = tonumber(details.changedFiles)
+  if type(files_changed) ~= "number" then
+    files_changed = #(type(details.files) == "table" and details.files or {})
+  end
+
+  return {
+    pr_number = tonumber(pr_number) or tonumber(details.number),
+    state = type(details.state) == "string" and details.state:upper() or "",
+    is_draft = details.isDraft == true,
+    review_decision = type(details.reviewDecision) == "string" and details.reviewDecision:upper() or "",
+    merge_state = type(details.mergeStateStatus) == "string" and details.mergeStateStatus:upper() or "",
+    mergeable = tostring(details.mergeable or ""),
+    updated_at = type(details.updatedAt) == "string" and details.updatedAt or "",
+    files_changed = files_changed,
+    commits = commits,
+    checks = checks,
+  }
+end
+
+local function summarize_review_changes(previous_snapshot, current_snapshot)
+  if type(previous_snapshot) ~= "table" or type(current_snapshot) ~= "table" then
+    return nil
+  end
+
+  local summary = {
+    pr_number = current_snapshot.pr_number,
+    pr_switched = previous_snapshot.pr_number ~= current_snapshot.pr_number,
+    state_changes = 0,
+    commit_changes = 0,
+    new_commits = 0,
+    check_changes = 0,
+    file_changes = 0,
+    metadata_changes = 0,
+  }
+
+  if previous_snapshot.state ~= current_snapshot.state
+    or previous_snapshot.is_draft ~= current_snapshot.is_draft
+    or previous_snapshot.review_decision ~= current_snapshot.review_decision
+    or previous_snapshot.merge_state ~= current_snapshot.merge_state
+    or previous_snapshot.mergeable ~= current_snapshot.mergeable then
+    summary.state_changes = 1
+  end
+
+  if previous_snapshot.commits.signature ~= current_snapshot.commits.signature then
+    summary.commit_changes = 1
+    local new_commit_count = 0
+    for oid, _ in pairs(current_snapshot.commits.set or {}) do
+      if not previous_snapshot.commits.set[oid] then
+        new_commit_count = new_commit_count + 1
+      end
+    end
+    if new_commit_count == 0 and current_snapshot.commits.count > previous_snapshot.commits.count then
+      new_commit_count = current_snapshot.commits.count - previous_snapshot.commits.count
+    end
+    summary.new_commits = math.max(0, new_commit_count)
+  end
+
+  if previous_snapshot.checks.signature ~= current_snapshot.checks.signature then
+    summary.check_changes = 1
+  end
+
+  if previous_snapshot.files_changed ~= current_snapshot.files_changed then
+    summary.file_changes = 1
+  end
+
+  if summary.state_changes == 0
+    and summary.commit_changes == 0
+    and summary.check_changes == 0
+    and summary.file_changes == 0
+    and previous_snapshot.updated_at ~= current_snapshot.updated_at then
+    summary.metadata_changes = 1
+  end
+
+  if summary.pr_switched
+    or summary.state_changes > 0
+    or summary.commit_changes > 0
+    or summary.check_changes > 0
+    or summary.file_changes > 0
+    or summary.metadata_changes > 0 then
+    return summary
+  end
+
+  return nil
+end
+
+local function summarize_review_change_message(summary)
+  if type(summary) ~= "table" then
+    return nil
+  end
+
+  local details = {}
+  if summary.pr_switched then
+    details[#details + 1] = "active review changed"
+  end
+  if summary.new_commits > 0 then
+    details[#details + 1] = string.format("commits:+%d", summary.new_commits)
+  elseif summary.commit_changes > 0 then
+    details[#details + 1] = "commits updated"
+  end
+  if summary.state_changes > 0 then
+    details[#details + 1] = "state updated"
+  end
+  if summary.check_changes > 0 then
+    details[#details + 1] = "checks updated"
+  end
+  if summary.file_changes > 0 then
+    details[#details + 1] = "files changed"
+  end
+  if summary.metadata_changes > 0 then
+    details[#details + 1] = "metadata updated"
+  end
+
+  if vim.tbl_isempty(details) then
+    return nil
+  end
+
+  local pr_number = tonumber(summary.pr_number)
+  if pr_number then
+    return string.format("PR #%d updated (%s)", pr_number, table.concat(details, ", "))
+  end
+
+  return "PR review updated (" .. table.concat(details, ", ") .. ")"
+end
+
+local function refresh_visible_overview_if_needed(pr_number)
+  local actions_ok, actions = pcall(require, "gh-pr.actions")
+  if not actions_ok or type(actions.refresh_visible_overview_for_pr) ~= "function" then
+    return 0
+  end
+
+  local ok, refreshed = pcall(actions.refresh_visible_overview_for_pr, pr_number)
+  if not ok or type(refreshed) ~= "number" then
+    return 0
+  end
+
+  return refreshed
 end
 
 local function normalize_label_color(value)
@@ -1738,6 +2041,9 @@ end
 local start_background_refresh
 
 local function finish_refresh(repo_context, payload)
+  payload = type(payload) == "table" and payload or {}
+  local refresh_context = normalize_refresh_context(payload.refresh_context)
+  local ui_refresh = should_update_ui(refresh_context)
   local session = ensure_repo_session(repo_context)
   session.inflight = false
   session.loading = false
@@ -1745,13 +2051,18 @@ local function finish_refresh(repo_context, payload)
   if payload.error then
     session.last_error = payload.error
     session.stale = session_is_stale(session)
-    render_repo_states(repo_context.key)
-    if session.pending_refresh then
-      session.pending_refresh = false
-      start_background_refresh(repo_context, { force = true })
+    if ui_refresh then
+      render_repo_states(repo_context.key)
+    end
+
+    local pending = consume_pending_refresh(session)
+    if pending then
+      start_background_refresh(repo_context, pending)
     end
     return
   end
+
+  local previous_snapshot = build_review_snapshot(session.pr_number, session.details)
 
   session.last_error = nil
   session.pr_number = payload.pr_number
@@ -1759,46 +2070,71 @@ local function finish_refresh(repo_context, payload)
   session.updated_at = now_seconds()
   session.stale = session_is_stale(session)
 
+  local current_snapshot = build_review_snapshot(session.pr_number, session.details)
+  local change_summary = summarize_review_changes(previous_snapshot, current_snapshot)
+
   comments_source.invalidate_cache()
   persist_session(repo_context, session)
-  render_repo_states(repo_context.key)
-  follow_current_file_if_visible({ reason = "refresh" })
 
-  if cache_options().sync_visible_buffers ~= false then
-    virtual_files.sync_visible_pr_buffers({
-      [tostring(session.pr_number)] = session.details,
-    }, {
-      repository = repo_context.repository.full_name,
-    })
+  if ui_refresh then
+    render_repo_states(repo_context.key)
+    follow_current_file_if_visible({ reason = "refresh" })
+
+    if cache_options().sync_visible_buffers ~= false then
+      virtual_files.sync_visible_pr_buffers({
+        [tostring(session.pr_number)] = session.details,
+      }, {
+        repository = repo_context.repository.full_name,
+      })
+    end
+
+    if change_summary then
+      refresh_visible_overview_if_needed(session.pr_number)
+    end
+
+    if refresh_context.reason == "timer" and refresh_context.notify and change_summary then
+      local change_message = summarize_review_change_message(change_summary)
+      if type(change_message) == "string" and change_message ~= "" then
+        vim.notify(change_message, vim.log.levels.INFO)
+      end
+    end
   end
 
   local review_pr, _ = active_review_for_repo(repo_context)
   if type(review_pr) == "table" and tonumber(review_pr.number) ~= tonumber(session.pr_number) then
-    session.pending_refresh = true
+    queue_pending_refresh(session, {
+      force = true,
+      refresh_context = refresh_context,
+    })
   end
 
-  if session.pending_refresh then
-    session.pending_refresh = false
-    start_background_refresh(repo_context, { force = true })
+  local pending = consume_pending_refresh(session)
+  if pending then
+    start_background_refresh(repo_context, pending)
   end
 end
 
 start_background_refresh = function(repo_context, opts)
   opts = opts or {}
+  opts.refresh_context = normalize_refresh_context(opts.refresh_context)
+  local ui_refresh = should_update_ui(opts.refresh_context)
   local session = ensure_repo_session(repo_context)
   local review_pr, _ = active_review_for_repo(repo_context)
   local review_number = type(review_pr) == "table" and tonumber(review_pr.number) or nil
   if not review_number then
     session.loading = false
     session.inflight = false
-    render_repo_states(repo_context.key)
+    if ui_refresh then
+      render_repo_states(repo_context.key)
+    end
     return false
   end
 
   if session.inflight then
-    if opts.force then
-      session.pending_refresh = true
-    end
+    queue_pending_refresh(session, {
+      force = true,
+      refresh_context = opts.refresh_context,
+    })
     return false
   end
 
@@ -1812,12 +2148,18 @@ start_background_refresh = function(repo_context, opts)
   session.inflight = true
   session.loading = true
   session.stale = session_is_stale(session)
-  render_repo_states(repo_context.key)
+  if ui_refresh then
+    if opts.refresh_context.reason == "timer" and opts.refresh_context.notify then
+      vim.notify("Updating PR...", vim.log.levels.INFO)
+    end
+    render_repo_states(repo_context.key)
+  end
 
   pr_service.fetch_details_async(review_number, function(details, details_err)
     if not details then
       finish_refresh(repo_context, {
         error = details_err or "Unable to fetch PR details",
+        refresh_context = opts.refresh_context,
       })
       return
     end
@@ -1837,6 +2179,7 @@ start_background_refresh = function(repo_context, opts)
       finish_refresh(repo_context, {
         pr_number = review_number,
         details = details,
+        refresh_context = opts.refresh_context,
       })
     end)
   end)
@@ -1894,6 +2237,7 @@ function M.request_refresh(state, opts)
 
   return start_background_refresh(repo_context, {
     force = opts.force == true,
+    refresh_context = normalize_refresh_context(opts.refresh_context),
   })
 end
 
@@ -1903,25 +2247,20 @@ function M.render_cached_states()
   end
 end
 
-function M.refresh_if_focused()
-  local options = cache_options()
-  if options.auto_refresh_when_focused == false then
-    return
-  end
-
+local function resolve_current_focused_state()
   local winid = vim.api.nvim_get_current_win()
   if not winid or not vim.api.nvim_win_is_valid(winid) then
-    return
+    return false, nil
   end
 
   local bufnr = vim.api.nvim_win_get_buf(winid)
   local filetype = vim.api.nvim_get_option_value("filetype", { buf = bufnr })
   if filetype ~= "neo-tree" then
-    return
+    return false, nil
   end
 
   if vim.b[bufnr].neo_tree_source ~= "gh_pr_review" then
-    return
+    return false, nil
   end
 
   local state = nil
@@ -1933,7 +2272,33 @@ function M.refresh_if_focused()
     end
   end
 
-  M.request_refresh(state, { force = false, notify_error = false })
+  return true, state
+end
+
+function M.is_focused()
+  return select(1, resolve_current_focused_state())
+end
+
+function M.refresh_if_focused()
+  local options = cache_options()
+  if options.auto_refresh_when_focused == false then
+    return
+  end
+
+  local focused, state = resolve_current_focused_state()
+  if not focused then
+    return
+  end
+
+  M.request_refresh(state, {
+    force = false,
+    notify_error = false,
+    refresh_context = {
+      mode = REFRESH_MODE_UI,
+      reason = "timer",
+      notify = true,
+    },
+  })
   follow_current_file_if_visible({ reason = "focused" })
 end
 
@@ -1981,6 +2346,16 @@ M.setup = function(source_config, _)
     ["A"] = "submit_pending_approve_review",
     ["C"] = "submit_pending_request_changes_review",
     ["D"] = "discard_pending_review",
+    ["zA"] = "expand_all_review_nodes",
+    ["za"] = "collapse_all_review_nodes",
+    ["zF"] = "expand_files_nodes",
+    ["zf"] = "collapse_files_nodes",
+    ["zV"] = "expand_viewed_file_paths",
+    ["zv"] = "collapse_viewed_file_paths",
+    ["zC"] = "expand_comments_by_file",
+    ["zc"] = "collapse_comments_by_file",
+    ["zG"] = "expand_comments_global",
+    ["zg"] = "collapse_comments_global",
     ["s"] = "start_review",
     ["x"] = "toggle_review_tree",
     ["e"] = "toggle_auto_expand_width",

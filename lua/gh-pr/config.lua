@@ -162,6 +162,22 @@ local defaults = {
       set_horizontal = ",dh",
       set_unified = ",du",
     },
+    images = {
+      enabled = true,
+      backend = "snacks",
+      formats = { "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg" },
+      cache_dir = nil,
+      fallback = "placeholder",
+      fallback_mode = "menu",
+      fallback_default_action = "metadata",
+      fallback_menu_keymap = "gf",
+      fallback_open_local = "system",
+      fallback_github_target = "pr_files",
+      show_metadata = true,
+      metadata_resolution_strategy = "hybrid",
+      metadata_external_command = { "magick", "identify", "-format", "%w %h", "{file}" },
+      max_bytes = 26214400,
+    },
   },
   ui = {
     use_neotree = true,
@@ -767,6 +783,117 @@ local function sanitize_diff_view(diff_view)
     or defaults.diff_view.shortcuts.set_horizontal
   result.shortcuts.set_unified = type(result.shortcuts.set_unified) == "string" and result.shortcuts.set_unified
     or defaults.diff_view.shortcuts.set_unified
+
+  result.images = type(result.images) == "table" and result.images or {}
+  if type(result.images.enabled) ~= "boolean" then
+    result.images.enabled = defaults.diff_view.images.enabled
+  end
+  if type(result.images.backend) ~= "string" or result.images.backend == "" then
+    result.images.backend = defaults.diff_view.images.backend
+  end
+  result.images.backend = result.images.backend:lower()
+  if result.images.backend ~= "snacks" then
+    result.images.backend = defaults.diff_view.images.backend
+  end
+
+  local formats = {}
+  for _, ext in ipairs(type(result.images.formats) == "table" and result.images.formats or {}) do
+    if type(ext) == "string" and ext ~= "" then
+      local normalized = ext:lower():gsub("^%.+", "")
+      if normalized ~= "" then
+        formats[#formats + 1] = normalized
+      end
+    end
+  end
+  if vim.tbl_isempty(formats) then
+    formats = vim.deepcopy(defaults.diff_view.images.formats)
+  end
+  result.images.formats = formats
+
+  if type(result.images.cache_dir) ~= "string" or result.images.cache_dir == "" then
+    result.images.cache_dir = defaults.diff_view.images.cache_dir
+  end
+
+  if type(result.images.fallback) ~= "string" or result.images.fallback == "" then
+    result.images.fallback = defaults.diff_view.images.fallback
+  end
+  result.images.fallback = result.images.fallback:lower()
+  if result.images.fallback ~= "placeholder" then
+    result.images.fallback = defaults.diff_view.images.fallback
+  end
+
+  if type(result.images.fallback_mode) ~= "string" or result.images.fallback_mode == "" then
+    result.images.fallback_mode = defaults.diff_view.images.fallback_mode
+  end
+  result.images.fallback_mode = result.images.fallback_mode:lower()
+  if result.images.fallback_mode ~= "menu"
+    and result.images.fallback_mode ~= "metadata_only"
+    and result.images.fallback_mode ~= "auto_local"
+    and result.images.fallback_mode ~= "auto_github" then
+    result.images.fallback_mode = defaults.diff_view.images.fallback_mode
+  end
+
+  if type(result.images.fallback_default_action) ~= "string" or result.images.fallback_default_action == "" then
+    result.images.fallback_default_action = defaults.diff_view.images.fallback_default_action
+  end
+  result.images.fallback_default_action = result.images.fallback_default_action:lower()
+  if result.images.fallback_default_action ~= "metadata"
+    and result.images.fallback_default_action ~= "open_local_current"
+    and result.images.fallback_default_action ~= "open_local_both"
+    and result.images.fallback_default_action ~= "open_github" then
+    result.images.fallback_default_action = defaults.diff_view.images.fallback_default_action
+  end
+
+  if type(result.images.fallback_menu_keymap) ~= "string" then
+    result.images.fallback_menu_keymap = defaults.diff_view.images.fallback_menu_keymap
+  end
+
+  if type(result.images.fallback_open_local) ~= "string" or result.images.fallback_open_local == "" then
+    result.images.fallback_open_local = defaults.diff_view.images.fallback_open_local
+  end
+  result.images.fallback_open_local = result.images.fallback_open_local:lower()
+  if result.images.fallback_open_local ~= "system" then
+    result.images.fallback_open_local = defaults.diff_view.images.fallback_open_local
+  end
+
+  if type(result.images.fallback_github_target) ~= "string" or result.images.fallback_github_target == "" then
+    result.images.fallback_github_target = defaults.diff_view.images.fallback_github_target
+  end
+  result.images.fallback_github_target = result.images.fallback_github_target:lower()
+  if result.images.fallback_github_target ~= "pr_files" and result.images.fallback_github_target ~= "pr" then
+    result.images.fallback_github_target = defaults.diff_view.images.fallback_github_target
+  end
+
+  if type(result.images.show_metadata) ~= "boolean" then
+    result.images.show_metadata = defaults.diff_view.images.show_metadata
+  end
+
+  if type(result.images.metadata_resolution_strategy) ~= "string" or result.images.metadata_resolution_strategy == "" then
+    result.images.metadata_resolution_strategy = defaults.diff_view.images.metadata_resolution_strategy
+  end
+  result.images.metadata_resolution_strategy = result.images.metadata_resolution_strategy:lower()
+  if result.images.metadata_resolution_strategy ~= "internal"
+    and result.images.metadata_resolution_strategy ~= "external"
+    and result.images.metadata_resolution_strategy ~= "hybrid" then
+    result.images.metadata_resolution_strategy = defaults.diff_view.images.metadata_resolution_strategy
+  end
+
+  local external_command = {}
+  for _, token in ipairs(type(result.images.metadata_external_command) == "table" and result.images.metadata_external_command or {}) do
+    if type(token) == "string" and token ~= "" then
+      external_command[#external_command + 1] = token
+    end
+  end
+  if vim.tbl_isempty(external_command) then
+    external_command = vim.deepcopy(defaults.diff_view.images.metadata_external_command)
+  end
+  result.images.metadata_external_command = external_command
+
+  local max_bytes = tonumber(result.images.max_bytes)
+  if type(max_bytes) ~= "number" or max_bytes < 1 then
+    max_bytes = defaults.diff_view.images.max_bytes
+  end
+  result.images.max_bytes = math.floor(max_bytes)
 
   return result
 end

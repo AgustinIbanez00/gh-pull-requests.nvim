@@ -2,6 +2,7 @@ local M = {}
 
 local config = require("gh-pr.config")
 local gh = require("gh-pr.gh")
+local image_renderer = require("gh-pr.image_renderer")
 local line_comments = require("gh-pr.line_comments")
 local state = require("gh-pr.state")
 
@@ -126,9 +127,68 @@ local function resolve_head_repository(details, base_repository)
   return extract_repo(details.headRepository) or base_repository
 end
 
-local function fetch_content(repository, ref, path)
+local function resolve_image_options()
+  local diff_view = (config.get() or {}).diff_view or {}
+  local images = type(diff_view.images) == "table" and diff_view.images or {}
+  local formats = {}
+  for _, ext in ipairs(type(images.formats) == "table" and images.formats or {}) do
+    if type(ext) == "string" and ext ~= "" then
+      formats[#formats + 1] = ext:lower():gsub("^%.+", "")
+    end
+  end
+  if vim.tbl_isempty(formats) then
+    formats = { "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg" }
+  end
+
+  local max_bytes = tonumber(images.max_bytes)
+  if type(max_bytes) ~= "number" or max_bytes < 1 then
+    max_bytes = 26214400
+  end
+
+  local external_command = {}
+  for _, token in ipairs(type(images.metadata_external_command) == "table" and images.metadata_external_command or {}) do
+    if type(token) == "string" and token ~= "" then
+      external_command[#external_command + 1] = token
+    end
+  end
+  if vim.tbl_isempty(external_command) then
+    external_command = { "magick", "identify", "-format", "%w %h", "{file}" }
+  end
+
+  return {
+    enabled = images.enabled ~= false,
+    backend = type(images.backend) == "string" and images.backend:lower() or "snacks",
+    formats = formats,
+    cache_dir = type(images.cache_dir) == "string" and images.cache_dir ~= "" and images.cache_dir or nil,
+    fallback = type(images.fallback) == "string" and images.fallback:lower() or "placeholder",
+    fallback_mode = type(images.fallback_mode) == "string" and images.fallback_mode:lower() or "menu",
+    fallback_default_action = type(images.fallback_default_action) == "string"
+        and images.fallback_default_action:lower()
+      or "metadata",
+    fallback_menu_keymap = type(images.fallback_menu_keymap) == "string" and images.fallback_menu_keymap or "gf",
+    fallback_open_local = type(images.fallback_open_local) == "string" and images.fallback_open_local:lower() or "system",
+    fallback_github_target = type(images.fallback_github_target) == "string"
+        and images.fallback_github_target:lower()
+      or "pr_files",
+    show_metadata = images.show_metadata ~= false,
+    metadata_resolution_strategy = type(images.metadata_resolution_strategy) == "string"
+        and images.metadata_resolution_strategy:lower()
+      or "hybrid",
+    metadata_external_command = external_command,
+    max_bytes = math.floor(max_bytes),
+  }
+end
+
+local function normalize_asset_path(path)
+  if type(path) ~= "string" then
+    return ""
+  end
+  return path:gsub("\\", "/")
+end
+
+local function fetch_asset(repository, ref, path, image_options)
   if not repository or not ref or not path then
-    return "", "Missing repository/ref/path to fetch content"
+    return nil, "Missing repository/ref/path to fetch content"
   end
 
   local api = string.format(
@@ -140,14 +200,55 @@ local function fetch_content(repository, ref, path)
   )
   local payload, err = gh.run_json({ "api", api })
   if not payload then
-    return "", err
+    return nil, err
   end
+
+  local size = tonumber(payload.size) or 0
+  local normalized_path = normalize_asset_path(path)
+  local ext = image_renderer.extension(normalized_path)
+  local is_image = image_renderer.is_image_path(normalized_path, image_options and image_options.formats or nil)
 
   if payload.encoding ~= "base64" then
-    return "", nil
+    return {
+      path = normalized_path,
+      ext = ext,
+      size = size,
+      sha = type(payload.sha) == "string" and payload.sha or "",
+      encoding = type(payload.encoding) == "string" and payload.encoding or "",
+      is_image = is_image,
+      bytes = "",
+      text = "",
+      skipped = false,
+    }, nil
   end
 
-  return decode_base64(payload.content), nil
+  if is_image and image_options and tonumber(image_options.max_bytes) and size > image_options.max_bytes then
+    return {
+      path = normalized_path,
+      ext = ext,
+      size = size,
+      sha = type(payload.sha) == "string" and payload.sha or "",
+      encoding = payload.encoding,
+      is_image = true,
+      bytes = "",
+      text = "",
+      skipped = true,
+      skip_reason = "image exceeds configured max_bytes",
+    }, nil
+  end
+
+  local decoded = decode_base64(payload.content)
+  return {
+    path = normalized_path,
+    ext = ext,
+    size = size > 0 and size or #decoded,
+    sha = type(payload.sha) == "string" and payload.sha or "",
+    encoding = payload.encoding,
+    is_image = is_image,
+    bytes = decoded,
+    text = decoded,
+    skipped = false,
+  }, nil
 end
 
 local function is_not_found_error(err)
@@ -345,6 +446,7 @@ end
 local function resolve_configured_diff_view()
   local options = (config.get() or {}).diff_view or {}
   local whitespace = type(options.whitespace) == "table" and options.whitespace or {}
+  local images = resolve_image_options()
   return {
     mode = normalize_diff_mode(options.mode, "vertical"),
     ignore_whitespace = options.ignore_whitespace == true,
@@ -359,6 +461,7 @@ local function resolve_configured_diff_view()
           and whitespace.highlight_group
         or "GhPrDiffWhitespace",
     },
+    images = images,
     shortcuts = type(options.shortcuts) == "table" and options.shortcuts or {},
   }
 end
@@ -386,6 +489,7 @@ function M.resolve_diff_view_options(overrides)
   options.ignore_whitespace = options.ignore_whitespace == true
   options.render_whitespace = options.render_whitespace ~= false
   options.whitespace = type(options.whitespace) == "table" and options.whitespace or configured.whitespace
+  options.images = type(options.images) == "table" and options.images or configured.images
 
   if type(overrides) == "table" then
     if overrides.view_mode ~= nil then
@@ -402,7 +506,18 @@ function M.resolve_diff_view_options(overrides)
   return options
 end
 
-local function set_pr_buffer_keymaps(bufnr)
+local function set_pr_buffer_keymaps(bufnr, keymap_opts)
+  keymap_opts = type(keymap_opts) == "table" and keymap_opts or {}
+  local image_mode = keymap_opts.is_image == true
+  local images_cfg = type(keymap_opts.images) == "table" and keymap_opts.images or resolve_image_options()
+  local fallback_menu_key = type(images_cfg.fallback_menu_keymap) == "string" and images_cfg.fallback_menu_keymap or "gf"
+
+  local function remove_buffer_keymap(mode, lhs)
+    if type(lhs) == "string" and lhs ~= "" then
+      pcall(vim.keymap.del, mode, lhs, { buffer = bufnr })
+    end
+  end
+
   local function call_action(name)
     return function()
       local ok, actions = pcall(require, "gh-pr.actions")
@@ -414,10 +529,14 @@ local function set_pr_buffer_keymaps(bufnr)
 
   local opts = { buffer = bufnr, silent = true, nowait = true }
   local diff_shortcuts = resolve_diff_view_shortcuts()
-  vim.keymap.set("n", "gc", call_action("add_inline_comment"), vim.tbl_extend("force", opts, { desc = "Add inline PR comment" }))
-  vim.keymap.set("x", "gc", call_action("add_inline_comment_visual"), vim.tbl_extend("force", opts, {
-    desc = "Add inline PR comment for selection",
-  }))
+  if not image_mode then
+    vim.keymap.set("n", "gc", call_action("add_inline_comment"), vim.tbl_extend("force", opts, {
+      desc = "Add inline PR comment",
+    }))
+    vim.keymap.set("x", "gc", call_action("add_inline_comment_visual"), vim.tbl_extend("force", opts, {
+      desc = "Add inline PR comment for selection",
+    }))
+  end
   vim.keymap.set(
     "n",
     "R",
@@ -432,13 +551,49 @@ local function set_pr_buffer_keymaps(bufnr)
     vim.tbl_extend("force", opts, { desc = "Close diff views and open PR Review" })
   )
   vim.keymap.set("n", "?", call_action("show_diff_shortcuts"), vim.tbl_extend("force", opts, { desc = "Show PR diff shortcuts" }))
-  vim.keymap.set("n", ",n", call_action("next_change"), vim.tbl_extend("force", opts, { desc = "Next PR change" }))
-  vim.keymap.set("n", ",p", call_action("prev_change"), vim.tbl_extend("force", opts, { desc = "Previous PR change" }))
+  if not image_mode then
+    vim.keymap.set("n", ",n", call_action("next_change"), vim.tbl_extend("force", opts, { desc = "Next PR change" }))
+    vim.keymap.set("n", ",p", call_action("prev_change"), vim.tbl_extend("force", opts, { desc = "Previous PR change" }))
+  end
   vim.keymap.set("n", ",f", call_action("next_file"), vim.tbl_extend("force", opts, { desc = "Next PR file" }))
   vim.keymap.set("n", ",F", call_action("prev_file"), vim.tbl_extend("force", opts, { desc = "Previous PR file" }))
   vim.keymap.set("n", ",v", call_action("next_reviewed_file"), vim.tbl_extend("force", opts, { desc = "Next reviewed PR file" }))
   vim.keymap.set("n", ",V", call_action("prev_reviewed_file"), vim.tbl_extend("force", opts, { desc = "Previous reviewed PR file" }))
-  if diff_shortcuts.toggle_whitespace ~= "" then
+  if image_mode then
+    local configured_lc = (config.get() or {}).line_comments or {}
+    local line_comment_key = type(configured_lc.keymap) == "string" and configured_lc.keymap or "K"
+    remove_buffer_keymap("n", "gc")
+    remove_buffer_keymap("x", "gc")
+    remove_buffer_keymap("n", ",n")
+    remove_buffer_keymap("n", ",p")
+    remove_buffer_keymap("n", line_comment_key)
+    remove_buffer_keymap("n", diff_shortcuts.toggle_whitespace)
+    remove_buffer_keymap("n", diff_shortcuts.toggle_render_whitespace)
+    remove_buffer_keymap("n", diff_shortcuts.cycle_mode)
+    remove_buffer_keymap("n", diff_shortcuts.set_vertical)
+    remove_buffer_keymap("n", diff_shortcuts.set_horizontal)
+    remove_buffer_keymap("n", diff_shortcuts.set_unified)
+    vim.keymap.set(
+      "n",
+      "<CR>",
+      call_action("run_image_fallback_default_action"),
+      vim.tbl_extend("force", opts, { desc = "Run default image fallback action" })
+    )
+    if fallback_menu_key ~= "" then
+      vim.keymap.set(
+        "n",
+        fallback_menu_key,
+        call_action("open_image_fallback_menu"),
+        vim.tbl_extend("force", opts, { desc = "Open image fallback actions menu" })
+      )
+    end
+  else
+    remove_buffer_keymap("n", "<CR>")
+    if fallback_menu_key ~= "" then
+      remove_buffer_keymap("n", fallback_menu_key)
+    end
+  end
+  if not image_mode and diff_shortcuts.toggle_whitespace ~= "" then
     vim.keymap.set(
       "n",
       diff_shortcuts.toggle_whitespace,
@@ -446,7 +601,7 @@ local function set_pr_buffer_keymaps(bufnr)
       vim.tbl_extend("force", opts, { desc = "Toggle whitespace diff mode" })
     )
   end
-  if diff_shortcuts.toggle_render_whitespace ~= "" then
+  if not image_mode and diff_shortcuts.toggle_render_whitespace ~= "" then
     vim.keymap.set(
       "n",
       diff_shortcuts.toggle_render_whitespace,
@@ -454,7 +609,7 @@ local function set_pr_buffer_keymaps(bufnr)
       vim.tbl_extend("force", opts, { desc = "Toggle whitespace/tab rendering" })
     )
   end
-  if diff_shortcuts.cycle_mode ~= "" then
+  if not image_mode and diff_shortcuts.cycle_mode ~= "" then
     vim.keymap.set(
       "n",
       diff_shortcuts.cycle_mode,
@@ -462,7 +617,7 @@ local function set_pr_buffer_keymaps(bufnr)
       vim.tbl_extend("force", opts, { desc = "Cycle diff render mode" })
     )
   end
-  if diff_shortcuts.set_vertical ~= "" then
+  if not image_mode and diff_shortcuts.set_vertical ~= "" then
     vim.keymap.set(
       "n",
       diff_shortcuts.set_vertical,
@@ -470,7 +625,7 @@ local function set_pr_buffer_keymaps(bufnr)
       vim.tbl_extend("force", opts, { desc = "Set vertical diff mode" })
     )
   end
-  if diff_shortcuts.set_horizontal ~= "" then
+  if not image_mode and diff_shortcuts.set_horizontal ~= "" then
     vim.keymap.set(
       "n",
       diff_shortcuts.set_horizontal,
@@ -478,7 +633,7 @@ local function set_pr_buffer_keymaps(bufnr)
       vim.tbl_extend("force", opts, { desc = "Set horizontal diff mode" })
     )
   end
-  if diff_shortcuts.set_unified ~= "" then
+  if not image_mode and diff_shortcuts.set_unified ~= "" then
     vim.keymap.set(
       "n",
       diff_shortcuts.set_unified,
@@ -669,6 +824,32 @@ end
 local function open_buffer(content, path, kind, details, pr, repo_override, comment_ctx, canonical_path, buffer_opts)
   buffer_opts = type(buffer_opts) == "table" and buffer_opts or {}
   local repository = repo_override or resolve_base_repository(details)
+  local image_asset = type(buffer_opts.image_asset) == "table" and buffer_opts.image_asset or nil
+  local is_image = buffer_opts.is_image == true and image_asset ~= nil
+  local images_cfg = type(buffer_opts.images) == "table" and buffer_opts.images or resolve_image_options()
+  local image_reason = type(buffer_opts.image_reason) == "string" and buffer_opts.image_reason or ""
+  local file_status = type(buffer_opts.file_status) == "string" and buffer_opts.file_status or ""
+  local image_side = type(buffer_opts.image_side) == "string" and buffer_opts.image_side or kind
+  local image_base_path = type(buffer_opts.image_base_path) == "string" and buffer_opts.image_base_path or nil
+  local image_head_path = type(buffer_opts.image_head_path) == "string" and buffer_opts.image_head_path or nil
+  local pr_url = type(buffer_opts.pr_url) == "string" and buffer_opts.pr_url or ""
+  if pr_url == "" and type(details) == "table" and type(details.url) == "string" then
+    pr_url = details.url
+  end
+  if pr_url == "" and type(pr) == "table" and type(pr.url) == "string" then
+    pr_url = pr.url
+  end
+  if pr_url ~= "" then
+    pr_url = pr_url:gsub("/+$", "")
+  end
+  local pr_files_url = type(buffer_opts.pr_files_url) == "string" and buffer_opts.pr_files_url or ""
+  if pr_files_url == "" and pr_url ~= "" then
+    if pr_url:find("/files$", 1, true) then
+      pr_files_url = pr_url
+    else
+      pr_files_url = pr_url .. "/files"
+    end
+  end
   local canonical = normalize_path(canonical_path ~= nil and canonical_path or path)
   if canonical == "" then
     canonical = normalize_path(path)
@@ -693,9 +874,22 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
   end
 
   local bufnr = existing or vim.api.nvim_create_buf(true, true)
-  local lines = vim.split(content, "\n", { plain = true })
+  local lines
+  if is_image then
+    lines = image_renderer.build_placeholder_lines({
+      path = path,
+      side = image_side,
+      status = file_status,
+      size = image_asset.size,
+      sha = image_asset.sha,
+      show_metadata = images_cfg.show_metadata ~= false,
+      reason = image_reason,
+    })
+  else
+    lines = vim.split(content or "", "\n", { plain = true })
+  end
   local ft = type(buffer_opts.filetype) == "string" and buffer_opts.filetype
-    or ((kind == "patch" or kind == "unified") and "diff" or resolve_path_filetype(path))
+    or (is_image and "markdown" or ((kind == "patch" or kind == "unified") and "diff" or resolve_path_filetype(path)))
 
   set_buffer_content(bufnr, lines)
 
@@ -723,10 +917,24 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
   vim.b[bufnr].gh_pr_number = pr.number
   vim.b[bufnr].gh_pr_file_kind = kind
   vim.b[bufnr].gh_pr_file_mode = type(buffer_opts.file_mode) == "string" and buffer_opts.file_mode or nil
+  vim.b[bufnr].gh_pr_is_image = is_image
+  vim.b[bufnr].gh_pr_image_side = is_image and image_side or nil
+  vim.b[bufnr].gh_pr_image_cache_path = nil
+  vim.b[bufnr].gh_pr_image_reason = is_image and image_reason or nil
+  vim.b[bufnr].gh_pr_image_status = is_image and file_status or nil
+  vim.b[bufnr].gh_pr_pr_url = pr_url ~= "" and pr_url or nil
+  vim.b[bufnr].gh_pr_pr_files_url = pr_files_url ~= "" and pr_files_url or nil
+  vim.b[bufnr].gh_pr_image_base_path = is_image and image_base_path or nil
+  vim.b[bufnr].gh_pr_image_head_path = is_image and image_head_path or nil
+  vim.b[bufnr].gh_pr_image_size = is_image and tonumber(image_asset.size or 0) or nil
+  vim.b[bufnr].gh_pr_image_sha = is_image and image_asset.sha or nil
+  vim.b[bufnr].gh_pr_image_ext = is_image and image_asset.ext or nil
+  vim.b[bufnr].gh_pr_image_fallback = is_image and false or nil
+  vim.b[bufnr].gh_pr_image_fallback_notified_reason = nil
   vim.b[bufnr].gh_pr_comment_side = nil
   vim.b[bufnr].gh_pr_unified_line_map = nil
 
-  if type(comment_ctx) == "table" then
+  if (not is_image) and type(comment_ctx) == "table" then
     local side = comment_ctx.side
     if side == "base" or side == "head" then
       vim.b[bufnr].gh_pr_comment_side = side
@@ -754,7 +962,20 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
     vim.api.nvim_buf_clear_namespace(bufnr, unified_syntax_ns, 0, -1)
   end
 
-  set_pr_buffer_keymaps(bufnr)
+  set_pr_buffer_keymaps(bufnr, {
+    is_image = is_image,
+    images = images_cfg,
+  })
+
+  if is_image and not vim.b[bufnr].gh_pr_image_cleanup_attached then
+    vim.b[bufnr].gh_pr_image_cleanup_attached = true
+    vim.api.nvim_create_autocmd("BufWipeout", {
+      buffer = bufnr,
+      callback = function()
+        image_renderer.clear(bufnr)
+      end,
+    })
+  end
 
   return bufnr
 end
@@ -789,6 +1010,7 @@ end
 local function read_base_and_head(details, _, file)
   local base_repository = resolve_base_repository(details)
   local head_repository = resolve_head_repository(details, base_repository)
+  local image_options = resolve_image_options()
 
   if not base_repository then
     return nil, "Unable to resolve base repository"
@@ -803,22 +1025,44 @@ local function read_base_and_head(details, _, file)
 
   local base_content = ""
   local head_content = ""
+  local base_asset = {
+    path = normalize_asset_path(base_path),
+    size = 0,
+    sha = "",
+    is_image = false,
+    bytes = "",
+    text = "",
+    skipped = false,
+  }
+  local head_asset = {
+    path = normalize_asset_path(head_path),
+    size = 0,
+    sha = "",
+    is_image = false,
+    bytes = "",
+    text = "",
+    skipped = false,
+  }
   local errors = {}
   local file_mode = "diff_pair"
   local fetch_base_err = nil
   local fetch_head_err = nil
 
   if status ~= "added" then
-    base_content, fetch_base_err = fetch_content(base_repository, details.baseRefName, base_path)
+    base_asset, fetch_base_err = fetch_asset(base_repository, details.baseRefName, base_path, image_options)
     if fetch_base_err then
       table.insert(errors, "base: " .. fetch_base_err)
+    elseif type(base_asset) == "table" then
+      base_content = base_asset.text or ""
     end
   end
 
   if status ~= "removed" then
-    head_content, fetch_head_err = fetch_content(head_repository, details.headRefName, head_path)
+    head_asset, fetch_head_err = fetch_asset(head_repository, details.headRefName, head_path, image_options)
     if fetch_head_err then
       table.insert(errors, "head: " .. fetch_head_err)
+    elseif type(head_asset) == "table" then
+      head_content = head_asset.text or ""
     end
   end
 
@@ -850,6 +1094,12 @@ local function read_base_and_head(details, _, file)
     head_path = head_path,
     repo = base_repository,
     file_mode = file_mode,
+    status = status,
+    image_options = image_options,
+    base_asset = base_asset,
+    head_asset = head_asset,
+    is_image = (type(base_asset) == "table" and base_asset.is_image == true)
+      or (type(head_asset) == "table" and head_asset.is_image == true),
   }, nil
 end
 
@@ -1172,6 +1422,122 @@ local function apply_diff_window_sync(base_win, head_win)
   end
 end
 
+local function image_placeholder_reason(reason)
+  local normalized = type(reason) == "string" and reason or ""
+  if normalized == "backend-unavailable" then
+    return "snacks.image not available in this session"
+  end
+  if normalized == "terminal-or-format-unsupported" then
+    return "terminal backend does not support this image format"
+  end
+  if normalized == "too-large" then
+    return "image exceeds configured max_bytes"
+  end
+  if normalized == "disabled" then
+    return "image previews disabled by configuration"
+  end
+  if normalized == "unsupported-backend" then
+    return "configured image backend is not supported"
+  end
+  if normalized == "missing-bytes" then
+    return "unable to decode image bytes from GitHub contents API"
+  end
+  if normalized == "not-image" then
+    return "file is not recognized as a supported image"
+  end
+  if normalized ~= "" then
+    return normalized
+  end
+  return "preview unavailable"
+end
+
+local function refresh_image_placeholder(bufnr, path, side, status, asset, image_options, reason)
+  if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local lines = image_renderer.build_placeholder_lines({
+    path = path,
+    side = side,
+    status = status,
+    size = type(asset) == "table" and asset.size or nil,
+    sha = type(asset) == "table" and asset.sha or nil,
+    show_metadata = type(image_options) == "table" and image_options.show_metadata ~= false,
+    reason = reason,
+  })
+  set_buffer_content(bufnr, lines)
+  vim.b[bufnr].gh_pr_image_reason = reason
+end
+
+local function render_image_in_window(bufnr, winid, details, pr, side, status, asset, image_options)
+  if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false, "invalid-buffer"
+  end
+
+  local repository = resolve_base_repository(details)
+  local repo_name = repository and repository.full_name or (vim.b[bufnr].gh_pr_repo or "")
+  local cache_path = nil
+  if type(asset) == "table" and type(asset.bytes) == "string" and asset.bytes ~= "" then
+    local ensured, ensure_err = image_renderer.ensure_cache({
+      repository = repo_name,
+      pr_number = pr.number,
+      side = side,
+      path = asset.path,
+      sha = asset.sha,
+      size = asset.size,
+      bytes = asset.bytes,
+      images = image_options,
+    })
+    if ensured then
+      cache_path = ensured
+      vim.b[bufnr].gh_pr_image_cache_path = ensured
+    elseif ensure_err then
+      vim.b[bufnr].gh_pr_image_cache_path = nil
+    end
+  end
+  local ok_render, render_err, meta = image_renderer.render({
+    bufnr = bufnr,
+    winid = winid,
+    repository = repo_name,
+    pr_number = pr.number,
+    side = side,
+    asset = asset,
+    images = image_options,
+  })
+
+  if ok_render then
+    if type(meta) == "table" and type(meta.cache_path) == "string" then
+      vim.b[bufnr].gh_pr_image_cache_path = meta.cache_path
+    elseif cache_path then
+      vim.b[bufnr].gh_pr_image_cache_path = cache_path
+    end
+    vim.b[bufnr].gh_pr_image_reason = "rendered"
+    vim.b[bufnr].gh_pr_image_fallback = false
+    vim.b[bufnr].gh_pr_image_fallback_notified_reason = nil
+    return true, nil
+  end
+
+  local message = image_placeholder_reason(render_err)
+  refresh_image_placeholder(
+    bufnr,
+    type(asset) == "table" and asset.path or vim.b[bufnr].gh_pr_path,
+    side,
+    status,
+    asset,
+    image_options,
+    message
+  )
+  vim.b[bufnr].gh_pr_image_fallback = true
+  if vim.b[bufnr].gh_pr_image_fallback_notified_reason ~= message then
+    vim.b[bufnr].gh_pr_image_fallback_notified_reason = message
+    local ok_actions, actions = pcall(require, "gh-pr.actions")
+    if ok_actions and type(actions.on_image_render_fallback) == "function" then
+      pcall(actions.on_image_render_fallback, bufnr, message)
+    end
+  end
+  return false, message
+end
+
 function M.open_original(details, pr, file, opts)
   opts = opts or {}
   local data, err = read_base_and_head(details, pr, file)
@@ -1182,7 +1548,7 @@ function M.open_original(details, pr, file, opts)
   local canonical_path = normalize_path(file.path or file.filename)
   local mode = data.file_mode == "added_single" and "added_single" or (data.file_mode == "removed_single" and "removed_single" or "diff_pair")
   local kind = mode == "added_single" and "head" or "base"
-  local comment_ctx = build_comment_ctx(opts.line_comments, kind == "head" and "head" or "base", {
+  local comment_ctx = data.is_image and nil or build_comment_ctx(opts.line_comments, kind == "head" and "head" or "base", {
     data.base_path,
     data.head_path,
     file.path,
@@ -1192,6 +1558,7 @@ function M.open_original(details, pr, file, opts)
   })
   local display_path = kind == "head" and data.head_path or data.base_path
   local content = kind == "head" and data.head_content or data.base_content
+  local asset = kind == "head" and data.head_asset or data.base_asset
   local existing = resolve_existing_buffer(data.repo, pr.number, canonical_path, kind)
   if existing then
     focus_existing_buffer(existing)
@@ -1199,8 +1566,20 @@ function M.open_original(details, pr, file, opts)
   local buf = open_buffer(content, display_path, kind, details, pr, data.repo, comment_ctx, canonical_path, {
     existing_bufnr = existing,
     file_mode = mode,
+    is_image = data.is_image,
+    image_side = kind,
+    image_asset = asset,
+    image_reason = "",
+    file_status = data.status,
+    images = data.image_options,
+    image_base_path = data.base_path,
+    image_head_path = data.head_path,
+    pr_url = type(details.url) == "string" and details.url or (type(pr.url) == "string" and pr.url or ""),
   })
   vim.api.nvim_win_set_buf(0, buf)
+  if data.is_image then
+    render_image_in_window(buf, vim.api.nvim_get_current_win(), details, pr, kind, data.status, asset, data.image_options)
+  end
   return buf, nil
 end
 
@@ -1214,7 +1593,7 @@ function M.open_modified(details, pr, file, opts)
   local canonical_path = normalize_path(file.path or file.filename)
   local mode = data.file_mode == "added_single" and "added_single" or (data.file_mode == "removed_single" and "removed_single" or "diff_pair")
   local kind = mode == "removed_single" and "base" or "head"
-  local comment_ctx = build_comment_ctx(opts.line_comments, kind == "base" and "base" or "head", {
+  local comment_ctx = data.is_image and nil or build_comment_ctx(opts.line_comments, kind == "base" and "base" or "head", {
     data.head_path,
     data.base_path,
     file.path,
@@ -1224,6 +1603,7 @@ function M.open_modified(details, pr, file, opts)
   })
   local display_path = kind == "base" and data.base_path or data.head_path
   local content = kind == "base" and data.base_content or data.head_content
+  local asset = kind == "base" and data.base_asset or data.head_asset
   local existing = resolve_existing_buffer(data.repo, pr.number, canonical_path, kind)
   if existing then
     focus_existing_buffer(existing)
@@ -1231,8 +1611,20 @@ function M.open_modified(details, pr, file, opts)
   local buf = open_buffer(content, display_path, kind, details, pr, data.repo, comment_ctx, canonical_path, {
     existing_bufnr = existing,
     file_mode = mode,
+    is_image = data.is_image,
+    image_side = kind,
+    image_asset = asset,
+    image_reason = "",
+    file_status = data.status,
+    images = data.image_options,
+    image_base_path = data.base_path,
+    image_head_path = data.head_path,
+    pr_url = type(details.url) == "string" and details.url or (type(pr.url) == "string" and pr.url or ""),
   })
   vim.api.nvim_win_set_buf(0, buf)
+  if data.is_image then
+    render_image_in_window(buf, vim.api.nvim_get_current_win(), details, pr, kind, data.status, asset, data.image_options)
+  end
   return buf, nil
 end
 
@@ -1245,6 +1637,7 @@ function M.open_diff(details, pr, file, opts)
 
   local diff_view = M.resolve_diff_view_options(opts)
   local mode = normalize_diff_mode(diff_view.mode, "vertical")
+  local render_mode = (data.is_image and mode == "unified") and "vertical" or mode
   local canonical_path = normalize_path(file.path or file.filename)
   if canonical_path == "" then
     return nil, "Unable to resolve file path"
@@ -1254,7 +1647,8 @@ function M.open_diff(details, pr, file, opts)
     local single_kind = data.file_mode == "added_single" and "head" or "base"
     local single_content = single_kind == "head" and (data.head_content or "") or (data.base_content or "")
     local single_path = single_kind == "head" and (data.head_path or canonical_path) or (data.base_path or canonical_path)
-    local single_comment_ctx = build_comment_ctx(opts.line_comments, single_kind == "head" and "head" or "base", {
+    local single_asset = single_kind == "head" and data.head_asset or data.base_asset
+    local single_comment_ctx = data.is_image and nil or build_comment_ctx(opts.line_comments, single_kind == "head" and "head" or "base", {
       data.head_path,
       data.base_path,
       file.path,
@@ -1287,21 +1681,34 @@ function M.open_diff(details, pr, file, opts)
       {
         existing_bufnr = existing_single,
         file_mode = data.file_mode,
+        is_image = data.is_image,
+        image_side = single_kind,
+        image_asset = single_asset,
+        image_reason = "",
+        file_status = data.status,
+        images = data.image_options,
+        image_base_path = data.base_path,
+        image_head_path = data.head_path,
+        pr_url = type(details.url) == "string" and details.url or (type(pr.url) == "string" and pr.url or ""),
       }
     )
 
     clear_diff_window_state(target_win)
     vim.api.nvim_win_set_buf(target_win, single_buf)
-    apply_window_whitespace_render(target_win, diff_view.render_whitespace)
+    if data.is_image then
+      render_image_in_window(single_buf, target_win, details, pr, single_kind, data.status, single_asset, data.image_options)
+    else
+      apply_window_whitespace_render(target_win, diff_view.render_whitespace)
+    end
     pcall(vim.api.nvim_set_current_win, target_win)
     return {
       single_buf = single_buf,
-      mode = mode,
+      mode = render_mode,
       file_mode = data.file_mode,
     }, nil
   end
 
-  if mode == "unified" then
+  if render_mode == "unified" then
     local existing_unified = resolve_existing_buffer(data.repo, pr.number, canonical_path, "unified")
     local target_win = nil
     if existing_unified and focus_existing_buffer(existing_unified) then
@@ -1341,7 +1748,7 @@ function M.open_diff(details, pr, file, opts)
     vim.api.nvim_win_set_buf(target_win, unified_buf)
     apply_window_whitespace_render(target_win, diff_view.render_whitespace)
     pcall(vim.api.nvim_set_current_win, target_win)
-    return { unified_buf = unified_buf, mode = mode }, nil
+    return { unified_buf = unified_buf, mode = render_mode }, nil
   end
 
   local existing_base = resolve_existing_buffer(data.repo, pr.number, canonical_path, "base")
@@ -1361,7 +1768,7 @@ function M.open_diff(details, pr, file, opts)
   end
 
   pcall(vim.api.nvim_set_current_win, target_win)
-  local base_comment_ctx = build_comment_ctx(opts.line_comments, "base", {
+  local base_comment_ctx = data.is_image and nil or build_comment_ctx(opts.line_comments, "base", {
     data.base_path,
     data.head_path,
     file.path,
@@ -1381,6 +1788,15 @@ function M.open_diff(details, pr, file, opts)
     {
       existing_bufnr = existing_base,
       file_mode = "diff_pair",
+      is_image = data.is_image,
+      image_side = "base",
+      image_asset = data.base_asset,
+      image_reason = "",
+      file_status = data.status,
+      images = data.image_options,
+      image_base_path = data.base_path,
+      image_head_path = data.head_path,
+      pr_url = type(details.url) == "string" and details.url or (type(pr.url) == "string" and pr.url or ""),
     }
   )
   vim.api.nvim_win_set_buf(target_win, base_buf)
@@ -1396,7 +1812,7 @@ function M.open_diff(details, pr, file, opts)
 
   if not head_win then
     pcall(vim.api.nvim_set_current_win, target_win)
-    if mode == "horizontal" then
+    if render_mode == "horizontal" then
       vim.cmd("belowright split")
     else
       vim.cmd("vsplit")
@@ -1404,7 +1820,7 @@ function M.open_diff(details, pr, file, opts)
     head_win = vim.api.nvim_get_current_win()
   end
 
-  local head_comment_ctx = build_comment_ctx(opts.line_comments, "head", {
+  local head_comment_ctx = data.is_image and nil or build_comment_ctx(opts.line_comments, "head", {
     data.head_path,
     data.base_path,
     file.path,
@@ -1424,22 +1840,38 @@ function M.open_diff(details, pr, file, opts)
     {
       existing_bufnr = existing_head,
       file_mode = "diff_pair",
+      is_image = data.is_image,
+      image_side = "head",
+      image_asset = data.head_asset,
+      image_reason = "",
+      file_status = data.status,
+      images = data.image_options,
+      image_base_path = data.base_path,
+      image_head_path = data.head_path,
+      pr_url = type(details.url) == "string" and details.url or (type(pr.url) == "string" and pr.url or ""),
     }
   )
   vim.api.nvim_win_set_buf(head_win, head_buf)
 
-  pcall(vim.api.nvim_set_current_win, target_win)
-  vim.cmd("diffthis")
-  pcall(vim.api.nvim_set_current_win, head_win)
-  vim.cmd("diffthis")
-  apply_window_diffopt(target_win, diff_view.ignore_whitespace)
-  apply_window_diffopt(head_win, diff_view.ignore_whitespace)
-  apply_window_whitespace_render(target_win, diff_view.render_whitespace)
-  apply_window_whitespace_render(head_win, diff_view.render_whitespace)
-  apply_diff_window_sync(target_win, head_win)
+  if data.is_image then
+    clear_diff_window_state(target_win)
+    clear_diff_window_state(head_win)
+    render_image_in_window(base_buf, target_win, details, pr, "base", data.status, data.base_asset, data.image_options)
+    render_image_in_window(head_buf, head_win, details, pr, "head", data.status, data.head_asset, data.image_options)
+  else
+    pcall(vim.api.nvim_set_current_win, target_win)
+    vim.cmd("diffthis")
+    pcall(vim.api.nvim_set_current_win, head_win)
+    vim.cmd("diffthis")
+    apply_window_diffopt(target_win, diff_view.ignore_whitespace)
+    apply_window_diffopt(head_win, diff_view.ignore_whitespace)
+    apply_window_whitespace_render(target_win, diff_view.render_whitespace)
+    apply_window_whitespace_render(head_win, diff_view.render_whitespace)
+    apply_diff_window_sync(target_win, head_win)
+  end
   pcall(vim.api.nvim_set_current_win, target_win)
 
-  return { base_buf = base_buf, head_buf = head_buf, mode = mode, file_mode = "diff_pair" }, nil
+  return { base_buf = base_buf, head_buf = head_buf, mode = render_mode, file_mode = "diff_pair" }, nil
 end
 
 function M.open_commit_patch(details, pr, commit, opts)
@@ -1519,8 +1951,16 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
   end
 
   local repository = data.repo or resolve_base_repository(details)
+  local pr_url = type(details) == "table" and type(details.url) == "string" and details.url or ""
+  if pr_url ~= "" then
+    pr_url = pr_url:gsub("/+$", "")
+  end
+  local pr_files_url = pr_url ~= "" and (pr_url:find("/files$", 1, true) and pr_url or (pr_url .. "/files")) or ""
   local next_path
   local content
+  local image_asset = nil
+  local image_side = kind
+  local is_image_buffer = false
   local line_highlights = nil
   local unified_line_map = nil
   local file_mode = data.file_mode == "added_single" and "added_single"
@@ -1529,46 +1969,103 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
     if file_mode == "added_single" then
       next_path = data.head_path
       content = data.head_content or ""
+      image_asset = data.head_asset
+      image_side = "head"
     else
       next_path = data.base_path
       content = data.base_content or ""
+      image_asset = data.base_asset
+      image_side = "base"
     end
   elseif kind == "unified" then
-    local diff_view = M.resolve_diff_view_options()
     next_path = data.head_path or data.base_path
-    content, line_highlights, unified_line_map =
-      build_unified_diff_text(data.base_content or "", data.head_content or "", diff_view.ignore_whitespace)
-    file_mode = "unified"
+    if data.is_image then
+      content = ""
+      image_asset = data.head_asset.is_image and data.head_asset or data.base_asset
+      image_side = image_asset == data.base_asset and "base" or "head"
+      is_image_buffer = true
+      file_mode = "unified"
+    else
+      local diff_view = M.resolve_diff_view_options()
+      content, line_highlights, unified_line_map =
+        build_unified_diff_text(data.base_content or "", data.head_content or "", diff_view.ignore_whitespace)
+      file_mode = "unified"
+    end
   else
     if file_mode == "removed_single" then
       next_path = data.base_path
       content = data.base_content or ""
+      image_asset = data.base_asset
+      image_side = "base"
     else
       next_path = data.head_path
       content = data.head_content or ""
+      image_asset = data.head_asset
+      image_side = "head"
     end
+  end
+
+  if not is_image_buffer then
+    is_image_buffer = data.is_image and type(image_asset) == "table" and image_asset.is_image == true
   end
 
   if type(next_path) ~= "string" or next_path == "" then
     return false, "missing-file"
   end
 
-  local lines = vim.split(content, "\n", { plain = true })
+  local lines
+  if is_image_buffer then
+    lines = image_renderer.build_placeholder_lines({
+      path = next_path,
+      side = image_side,
+      status = data.status,
+      size = type(image_asset) == "table" and image_asset.size or nil,
+      sha = type(image_asset) == "table" and image_asset.sha or nil,
+      show_metadata = type(data.image_options) == "table" and data.image_options.show_metadata ~= false,
+      reason = "",
+    })
+  else
+    lines = vim.split(content, "\n", { plain = true })
+  end
   set_buffer_content(bufnr, lines)
-  apply_line_highlights(bufnr, line_highlights)
+  apply_line_highlights(bufnr, is_image_buffer and nil or line_highlights)
 
-  local filetype = kind == "unified" and "diff" or resolve_path_filetype(next_path)
+  local filetype = is_image_buffer and "markdown" or (kind == "unified" and "diff" or resolve_path_filetype(next_path))
   vim.api.nvim_buf_set_option(bufnr, "filetype", filetype)
   vim.b[bufnr].gh_pr_path = next_path
   local canonical_path = normalize_path(file.path or file.filename)
   vim.b[bufnr].gh_pr_file_path = canonical_path ~= "" and canonical_path or nil
   vim.b[bufnr].gh_pr_file_mode = file_mode
+  vim.b[bufnr].gh_pr_is_image = is_image_buffer
+  vim.b[bufnr].gh_pr_image_side = is_image_buffer and image_side or nil
+  vim.b[bufnr].gh_pr_image_status = is_image_buffer and data.status or nil
+  vim.b[bufnr].gh_pr_image_reason = is_image_buffer and "" or nil
+  vim.b[bufnr].gh_pr_image_cache_path = nil
+  vim.b[bufnr].gh_pr_pr_url = pr_url ~= "" and pr_url or nil
+  vim.b[bufnr].gh_pr_pr_files_url = pr_files_url ~= "" and pr_files_url or nil
+  vim.b[bufnr].gh_pr_image_base_path = is_image_buffer and data.base_path or nil
+  vim.b[bufnr].gh_pr_image_head_path = is_image_buffer and data.head_path or nil
+  vim.b[bufnr].gh_pr_image_size = is_image_buffer and type(image_asset) == "table" and tonumber(image_asset.size or 0) or nil
+  vim.b[bufnr].gh_pr_image_sha = is_image_buffer and type(image_asset) == "table" and image_asset.sha or nil
+  vim.b[bufnr].gh_pr_image_ext = is_image_buffer and type(image_asset) == "table" and image_asset.ext or nil
+  vim.b[bufnr].gh_pr_image_fallback = is_image_buffer and false or nil
+  vim.b[bufnr].gh_pr_image_fallback_notified_reason = nil
   vim.b[bufnr].gh_pr_unified_line_map = nil
-  if kind == "unified" and type(unified_line_map) == "table" then
+  if (not is_image_buffer) and kind == "unified" and type(unified_line_map) == "table" then
     vim.b[bufnr].gh_pr_unified_line_map = unified_line_map
     apply_unified_syntax_highlights(bufnr, canonical_path ~= "" and canonical_path or next_path, unified_line_map)
   else
     vim.api.nvim_buf_clear_namespace(bufnr, unified_syntax_ns, 0, -1)
+  end
+
+  if is_image_buffer then
+    set_pr_buffer_keymaps(bufnr, { is_image = true, images = data.image_options })
+    for _, win in ipairs(windows_showing_buffer(bufnr)) do
+      render_image_in_window(bufnr, win.winid, details, pr, image_side, data.status, image_asset, data.image_options)
+    end
+  else
+    image_renderer.clear(bufnr)
+    set_pr_buffer_keymaps(bufnr, { is_image = false, images = data.image_options })
   end
 
   if repository then

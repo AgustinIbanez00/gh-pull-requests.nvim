@@ -3,6 +3,7 @@ local M = {}
 local comment_composer = require("gh-pr.comment_composer")
 local comment_popup = require("gh-pr.comment_popup")
 local config = require("gh-pr.config")
+local image_metadata = require("gh-pr.image_metadata")
 local line_comments = require("gh-pr.line_comments")
 local multi_select = require("gh-pr.multi_select")
 local overview = require("gh-pr.overview")
@@ -77,6 +78,19 @@ end
 
 local function is_valid_win(winid)
   return type(winid) == "number" and winid > 0 and vim.api.nvim_win_is_valid(winid)
+end
+
+local function buffer_filetype(bufnr)
+  if not is_valid_buf(bufnr) then
+    return ""
+  end
+
+  local ok, filetype = pcall(vim.api.nvim_get_option_value, "filetype", { buf = bufnr })
+  if ok and type(filetype) == "string" then
+    return filetype
+  end
+
+  return type(vim.bo[bufnr].filetype) == "string" and vim.bo[bufnr].filetype or ""
 end
 
 local function positive_integer(value, fallback)
@@ -469,6 +483,917 @@ local function resolve_active_pr(number, opts)
 
   state.set_active_pr(details, details)
   return details, details, nil
+end
+
+local IMAGE_FALLBACK_ACTION_LABELS = {
+  metadata = "Render metadata diff in buffer",
+  open_local_current = "Open current image locally",
+  open_local_both = "Open base + modified images locally",
+  open_github = "Open GitHub PR image comparison",
+}
+
+local IMAGE_FALLBACK_ACTION_ORDER = {
+  "open_local_current",
+  "open_local_both",
+  "open_github",
+  "metadata",
+}
+
+local image_fallback_menu_state = nil
+
+local function is_valid_image_action(action)
+  return action == "metadata" or action == "open_local_current" or action == "open_local_both" or action == "open_github"
+end
+
+local function normalize_image_action(action, fallback)
+  local value = type(action) == "string" and action:lower() or ""
+  if is_valid_image_action(value) then
+    return value
+  end
+  local default_value = type(fallback) == "string" and fallback:lower() or "metadata"
+  if is_valid_image_action(default_value) then
+    return default_value
+  end
+  return "metadata"
+end
+
+local function image_action_label(action)
+  local normalized = normalize_image_action(action, "metadata")
+  return IMAGE_FALLBACK_ACTION_LABELS[normalized] or normalized
+end
+
+local function image_diff_options()
+  local diff_view = (config.get() or {}).diff_view or {}
+  local images = type(diff_view.images) == "table" and diff_view.images or {}
+  local external_command = {}
+  for _, token in ipairs(type(images.metadata_external_command) == "table" and images.metadata_external_command or {}) do
+    if type(token) == "string" and token ~= "" then
+      external_command[#external_command + 1] = token
+    end
+  end
+  if vim.tbl_isempty(external_command) then
+    external_command = { "magick", "identify", "-format", "%w %h", "{file}" }
+  end
+
+  return {
+    fallback_mode = type(images.fallback_mode) == "string" and images.fallback_mode:lower() or "menu",
+    fallback_default_action = normalize_image_action(images.fallback_default_action, "metadata"),
+    fallback_menu_keymap = type(images.fallback_menu_keymap) == "string" and images.fallback_menu_keymap or "gf",
+    fallback_open_local = type(images.fallback_open_local) == "string" and images.fallback_open_local:lower() or "system",
+    fallback_github_target = type(images.fallback_github_target) == "string"
+        and images.fallback_github_target:lower()
+      or "pr_files",
+    metadata_resolution_strategy = type(images.metadata_resolution_strategy) == "string"
+        and images.metadata_resolution_strategy:lower()
+      or "hybrid",
+    metadata_external_command = external_command,
+  }
+end
+
+local function resolve_image_default_action(images_cfg)
+  local fallback = type(images_cfg) == "table" and images_cfg.fallback_default_action or "metadata"
+  local action = normalize_image_action(fallback, "metadata")
+  if type(state.get_image_prefs) == "function" then
+    local prefs = state.get_image_prefs()
+    if type(prefs) == "table" then
+      action = normalize_image_action(prefs.fallback_default_action, action)
+    end
+  end
+  return action
+end
+
+local function persist_image_default_action(action)
+  local normalized = normalize_image_action(action, "metadata")
+  if type(state.update_image_pref) == "function" then
+    state.update_image_pref("fallback_default_action", normalized)
+    return true
+  end
+  if type(state.set_image_prefs) == "function" then
+    local current = type(state.get_image_prefs) == "function" and state.get_image_prefs() or {}
+    current.fallback_default_action = normalized
+    state.set_image_prefs(current)
+    return true
+  end
+  return false
+end
+
+local function file_readable(path)
+  return type(path) == "string" and path ~= "" and vim.fn.filereadable(path) == 1
+end
+
+local function trim_trailing_slash(url)
+  if type(url) ~= "string" then
+    return ""
+  end
+  return url:gsub("/+$", "")
+end
+
+local function current_image_side(ctx)
+  local side = type(ctx.side) == "string" and ctx.side or ""
+  if side == "base" or side == "head" then
+    return side
+  end
+  if ctx.status == "removed" then
+    return "base"
+  end
+  return "head"
+end
+
+local function side_present_for_status(status, side)
+  if status == "added" and side == "base" then
+    return false
+  end
+  if status == "removed" and side == "head" then
+    return false
+  end
+  return true
+end
+
+local function image_path_for_side(ctx, side)
+  local side_path = ""
+  if side == "base" then
+    side_path = normalize_path(ctx.base_path or "")
+  elseif side == "head" then
+    side_path = normalize_path(ctx.head_path or "")
+  end
+  if side_path ~= "" then
+    return side_path
+  end
+  return normalize_path(ctx.file_path or ctx.path or "")
+end
+
+local function parse_repo_full_name(full_name)
+  if type(full_name) ~= "string" or full_name == "" then
+    return nil
+  end
+  local owner, name = full_name:match("^([^/]+)/(.+)$")
+  if type(owner) ~= "string" or owner == "" or type(name) ~= "string" or name == "" then
+    return nil
+  end
+  return {
+    owner = owner,
+    name = name,
+    full_name = owner .. "/" .. name,
+  }
+end
+
+local function extract_repo_info(repo)
+  if type(repo) ~= "table" then
+    return nil
+  end
+
+  local parsed_owner, parsed_name
+  if type(repo.nameWithOwner) == "string" then
+    parsed_owner, parsed_name = repo.nameWithOwner:match("^([^/]+)/(.+)$")
+  end
+
+  local owner
+  if type(repo.owner) == "table" then
+    owner = repo.owner.login or repo.owner.name
+  else
+    owner = repo.owner
+  end
+  owner = owner or parsed_owner
+  local name = repo.name or parsed_name
+  if type(owner) ~= "string" or owner == "" or type(name) ~= "string" or name == "" then
+    return nil
+  end
+
+  return {
+    owner = owner,
+    name = name,
+    full_name = repo.nameWithOwner or (owner .. "/" .. name),
+  }
+end
+
+local function resolve_side_repository(details, side, fallback_full_name)
+  local base_repo = extract_repo_info(type(details) == "table" and details.baseRepository or nil)
+  local head_repo = extract_repo_info(type(details) == "table" and details.headRepository or nil) or base_repo
+  if side == "base" then
+    return base_repo or head_repo or parse_repo_full_name(fallback_full_name)
+  end
+  return head_repo or base_repo or parse_repo_full_name(fallback_full_name)
+end
+
+local function resolve_image_buffer_context(bufnr)
+  bufnr = type(bufnr) == "number" and bufnr or vim.api.nvim_get_current_buf()
+  if not is_valid_buf(bufnr) then
+    return nil, "Invalid buffer"
+  end
+  if vim.b[bufnr].gh_pr_is_image ~= true then
+    return nil, "Current buffer is not an image diff buffer"
+  end
+
+  local number = tonumber(vim.b[bufnr].gh_pr_number)
+  if not number then
+    return nil, "Unable to resolve pull request number for image buffer"
+  end
+
+  return {
+    bufnr = bufnr,
+    number = number,
+    repo = type(vim.b[bufnr].gh_pr_repo) == "string" and vim.b[bufnr].gh_pr_repo or "",
+    kind = type(vim.b[bufnr].gh_pr_file_kind) == "string" and vim.b[bufnr].gh_pr_file_kind or "",
+    file_path = normalize_path(vim.b[bufnr].gh_pr_file_path or ""),
+    path = normalize_path(vim.b[bufnr].gh_pr_path or ""),
+    side = type(vim.b[bufnr].gh_pr_image_side) == "string" and vim.b[bufnr].gh_pr_image_side or "",
+    status = type(vim.b[bufnr].gh_pr_image_status) == "string" and vim.b[bufnr].gh_pr_image_status:lower() or "",
+    reason = type(vim.b[bufnr].gh_pr_image_reason) == "string" and vim.b[bufnr].gh_pr_image_reason or "",
+    pr_url = trim_trailing_slash(vim.b[bufnr].gh_pr_pr_url),
+    pr_files_url = trim_trailing_slash(vim.b[bufnr].gh_pr_pr_files_url),
+    base_path = normalize_path(vim.b[bufnr].gh_pr_image_base_path or ""),
+    head_path = normalize_path(vim.b[bufnr].gh_pr_image_head_path or ""),
+    cache_path = type(vim.b[bufnr].gh_pr_image_cache_path) == "string" and vim.b[bufnr].gh_pr_image_cache_path or "",
+    size = tonumber(vim.b[bufnr].gh_pr_image_size) or 0,
+    sha = type(vim.b[bufnr].gh_pr_image_sha) == "string" and vim.b[bufnr].gh_pr_image_sha or "",
+    ext = type(vim.b[bufnr].gh_pr_image_ext) == "string" and vim.b[bufnr].gh_pr_image_ext:lower() or "",
+  }, nil
+end
+
+local function find_cached_image_asset(ctx, side)
+  if side == ctx.side and file_readable(ctx.cache_path) then
+    return {
+      side = side,
+      path = image_path_for_side(ctx, side),
+      cache_path = ctx.cache_path,
+      size = ctx.size,
+      sha = ctx.sha,
+      ext = ctx.ext,
+    }
+  end
+
+  local target_path = normalize_path(ctx.file_path ~= "" and ctx.file_path or ctx.path)
+  for _, candidate in ipairs(vim.api.nvim_list_bufs()) do
+    if candidate ~= ctx.bufnr and is_valid_buf(candidate) and vim.b[candidate].gh_pr_is_image == true then
+      local candidate_number = tonumber(vim.b[candidate].gh_pr_number)
+      local candidate_side = type(vim.b[candidate].gh_pr_image_side) == "string"
+          and vim.b[candidate].gh_pr_image_side
+        or (type(vim.b[candidate].gh_pr_file_kind) == "string" and vim.b[candidate].gh_pr_file_kind or "")
+      local candidate_path = normalize_path(vim.b[candidate].gh_pr_file_path or vim.b[candidate].gh_pr_path or "")
+      local same_number = candidate_number == ctx.number
+      local same_path = target_path == "" or candidate_path == "" or candidate_path == target_path
+      local cache_path = type(vim.b[candidate].gh_pr_image_cache_path) == "string" and vim.b[candidate].gh_pr_image_cache_path or ""
+      if same_number and same_path and candidate_side == side and file_readable(cache_path) then
+        return {
+          side = side,
+          path = normalize_path(side == "base" and (vim.b[candidate].gh_pr_image_base_path or vim.b[candidate].gh_pr_path or "")
+            or (vim.b[candidate].gh_pr_image_head_path or vim.b[candidate].gh_pr_path or "")),
+          cache_path = cache_path,
+          size = tonumber(vim.b[candidate].gh_pr_image_size) or 0,
+          sha = type(vim.b[candidate].gh_pr_image_sha) == "string" and vim.b[candidate].gh_pr_image_sha or "",
+          ext = type(vim.b[candidate].gh_pr_image_ext) == "string" and vim.b[candidate].gh_pr_image_ext:lower() or "",
+        }
+      end
+    end
+  end
+
+  return nil
+end
+
+local function fetch_and_cache_image_asset(details, ctx, side, images_cfg)
+  local side_path = image_path_for_side(ctx, side)
+  if side_path == "" then
+    return nil, string.format("Missing %s image path", side)
+  end
+
+  local side_ref = side == "base" and details.baseRefName or details.headRefName
+  if type(side_ref) ~= "string" or side_ref == "" then
+    return nil, string.format("Missing %s ref for pull request", side)
+  end
+
+  local repository = resolve_side_repository(details, side, ctx.repo)
+  if not repository then
+    return nil, string.format("Unable to resolve %s repository", side)
+  end
+
+  local api = string.format(
+    "repos/%s/%s/contents/%s?ref=%s",
+    repository.owner,
+    repository.name,
+    encode_path(side_path),
+    url_encode(side_ref)
+  )
+  local payload, payload_err = gh.run_json({ "api", api })
+  if not payload then
+    return nil, payload_err
+  end
+
+  local encoding = type(payload.encoding) == "string" and payload.encoding or ""
+  local content = type(payload.content) == "string" and payload.content or ""
+  if encoding ~= "base64" or content == "" then
+    return nil, string.format("Unable to decode %s image bytes from GitHub contents API", side)
+  end
+
+  local bytes = decode_base64(content)
+  if bytes == "" then
+    return nil, string.format("Unable to decode %s image bytes from base64 payload", side)
+  end
+
+  local size = tonumber(payload.size) or #bytes
+  local sha = type(payload.sha) == "string" and payload.sha or ""
+  local ext = normalize_path(side_path):match("%.([^.]+)$")
+  ext = type(ext) == "string" and ext:lower() or ""
+
+  local cache_path, cache_err = image_renderer.ensure_cache({
+    repository = repository.full_name,
+    pr_number = ctx.number,
+    side = side,
+    path = side_path,
+    sha = sha,
+    size = size,
+    bytes = bytes,
+    images = images_cfg,
+  })
+  if not cache_path then
+    return nil, cache_err
+  end
+
+  return {
+    side = side,
+    path = side_path,
+    cache_path = cache_path,
+    size = size,
+    sha = sha,
+    ext = ext,
+  }, nil
+end
+
+local function ensure_image_side_asset(ctx, side, images_cfg)
+  if not side_present_for_status(ctx.status, side) then
+    return {
+      side = side,
+      present = false,
+      path = image_path_for_side(ctx, side),
+    }, nil
+  end
+
+  local cached = find_cached_image_asset(ctx, side)
+  if cached then
+    cached.present = true
+    return cached, nil
+  end
+
+  local _, details, details_err = resolve_active_pr(ctx.number, { refresh = false })
+  if not details then
+    return nil, details_err
+  end
+
+  local fetched, fetch_err = fetch_and_cache_image_asset(details, ctx, side, images_cfg)
+  if not fetched then
+    return nil, fetch_err
+  end
+
+  fetched.present = true
+  if side == ctx.side and is_valid_buf(ctx.bufnr) then
+    vim.b[ctx.bufnr].gh_pr_image_cache_path = fetched.cache_path
+    vim.b[ctx.bufnr].gh_pr_image_size = tonumber(fetched.size) or 0
+    vim.b[ctx.bufnr].gh_pr_image_sha = fetched.sha
+    vim.b[ctx.bufnr].gh_pr_image_ext = fetched.ext
+  end
+  return fetched, nil
+end
+
+local function ensure_open_target(target, label)
+  if type(target) ~= "string" or target == "" then
+    return false, string.format("Missing %s target", label)
+  end
+  if not vim.ui or type(vim.ui.open) ~= "function" then
+    return false, "vim.ui.open is unavailable in this Neovim build"
+  end
+  local ok, open_err = pcall(vim.ui.open, target)
+  if not ok then
+    return false, tostring(open_err)
+  end
+  return true, nil
+end
+
+local function resolve_image_compare_url(ctx, images_cfg)
+  local pr_url = trim_trailing_slash(ctx.pr_url)
+  local pr_files_url = trim_trailing_slash(ctx.pr_files_url)
+  if pr_url == "" and type(ctx.repo) == "string" and ctx.repo ~= "" then
+    pr_url = string.format("https://github.com/%s/pull/%d", ctx.repo, ctx.number)
+  end
+  if pr_files_url == "" and pr_url ~= "" then
+    pr_files_url = pr_url:find("/files$", 1, true) and pr_url or (pr_url .. "/files")
+  end
+
+  if (type(images_cfg) == "table" and images_cfg.fallback_github_target == "pr") or pr_files_url == "" then
+    return pr_url
+  end
+
+  local base = pr_files_url
+  local anchor_path = normalize_path(ctx.file_path ~= "" and ctx.file_path or ctx.path)
+  if anchor_path ~= "" and vim.fn.exists("*sha256") == 1 then
+    local ok_hash, hash = pcall(vim.fn.sha256, anchor_path)
+    if ok_hash and type(hash) == "string" and hash ~= "" then
+      return base .. "#diff-" .. hash
+    end
+  end
+  return base
+end
+
+local function write_readonly_buffer_lines(bufnr, lines, filetype)
+  if not is_valid_buf(bufnr) then
+    return false, "Invalid buffer"
+  end
+
+  local content = type(lines) == "table" and lines or { tostring(lines or "") }
+  local view = vim.fn.winsaveview()
+  pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = bufnr })
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, content)
+  if type(filetype) == "string" and filetype ~= "" then
+    pcall(vim.api.nvim_set_option_value, "filetype", filetype, { buf = bufnr })
+  end
+  pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "readonly", true, { buf = bufnr })
+  pcall(vim.fn.winrestview, view)
+  return true, nil
+end
+
+local function collect_image_metadata_for_side(ctx, side, images_cfg)
+  local asset, asset_err = ensure_image_side_asset(ctx, side, images_cfg)
+  if not asset then
+    return {
+      side = side,
+      present = side_present_for_status(ctx.status, side),
+      path = image_path_for_side(ctx, side),
+      error = tostring(asset_err or "Unable to load image asset"),
+    }
+  end
+  if asset.present == false then
+    return {
+      side = side,
+      present = false,
+      path = asset.path,
+    }
+  end
+  if not file_readable(asset.cache_path) then
+    return {
+      side = side,
+      present = true,
+      path = asset.path,
+      error = "Cached image file is unavailable locally",
+    }
+  end
+
+  local metadata = image_metadata.collect({
+    path = asset.cache_path,
+    ext = asset.ext,
+    sha = asset.sha,
+    size_bytes = asset.size,
+    strategy = images_cfg.metadata_resolution_strategy,
+    external_command = images_cfg.metadata_external_command,
+  })
+  metadata.side = side
+  metadata.present = true
+  metadata.path = asset.path
+  metadata.local_path = asset.cache_path
+  metadata.sha = type(metadata.sha) == "string" and metadata.sha or (asset.sha or "")
+  metadata.size_bytes = tonumber(metadata.size_bytes) or tonumber(asset.size) or 0
+  metadata.size_human = type(metadata.size_human) == "string" and metadata.size_human ~= ""
+      and metadata.size_human
+    or image_metadata.format_bytes(metadata.size_bytes)
+  return metadata
+end
+
+local function append_side_metadata_lines(lines, prefix, label, entry)
+  if not entry.present then
+    lines[#lines + 1] = string.format("%s %s: (not present in this revision)", prefix, label)
+    return
+  end
+  if type(entry.error) == "string" and entry.error ~= "" then
+    lines[#lines + 1] = string.format("%s %s error: %s", prefix, label, entry.error)
+    return
+  end
+
+  local sha = type(entry.sha) == "string" and entry.sha ~= "" and entry.sha:sub(1, 12) or "-"
+  local bytes = tonumber(entry.size_bytes) or 0
+  local size = type(entry.size_human) == "string" and entry.size_human ~= ""
+      and entry.size_human
+    or image_metadata.format_bytes(bytes)
+  local resolution = type(entry.resolution) == "string" and entry.resolution ~= "" and entry.resolution or "unknown"
+  local path = type(entry.path) == "string" and entry.path ~= "" and entry.path or "(unknown)"
+  lines[#lines + 1] = string.format("%s %s path: %s", prefix, label, path)
+  lines[#lines + 1] = string.format("%s %s resolution: %s", prefix, label, resolution)
+  lines[#lines + 1] = string.format("%s %s size: %s (%d bytes)", prefix, label, size, bytes)
+  lines[#lines + 1] = string.format("%s %s sha: %s", prefix, label, sha)
+end
+
+local function render_image_metadata_diff(bufnr, reason_override)
+  local ctx, ctx_err = resolve_image_buffer_context(bufnr)
+  if not ctx then
+    return false, ctx_err
+  end
+
+  local images_cfg = image_diff_options()
+  local default_action = resolve_image_default_action(images_cfg)
+  local compare_url = resolve_image_compare_url(ctx, images_cfg)
+  local reason = type(reason_override) == "string" and reason_override ~= "" and reason_override or ctx.reason
+  local fallback_key = type(images_cfg.fallback_menu_keymap) == "string" and images_cfg.fallback_menu_keymap or "gf"
+  local base_meta = collect_image_metadata_for_side(ctx, "base", images_cfg)
+  local head_meta = collect_image_metadata_for_side(ctx, "head", images_cfg)
+  local display_path = ctx.file_path ~= "" and ctx.file_path or ctx.path
+
+  local lines = {
+    "gh-pr image metadata diff",
+    "",
+    string.format("path: %s", display_path ~= "" and display_path or "(unknown)"),
+    string.format("status: %s", ctx.status ~= "" and ctx.status or "unknown"),
+    string.format("default action (<CR>): %s", image_action_label(default_action)),
+    string.format("fallback menu (%s): image actions", fallback_key ~= "" and fallback_key or "gf"),
+  }
+  if reason ~= "" then
+    lines[#lines + 1] = string.format("render fallback reason: %s", reason)
+  end
+  if compare_url ~= "" then
+    lines[#lines + 1] = string.format("github compare: %s", compare_url)
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Image metadata"
+  append_side_metadata_lines(lines, "-", "base", base_meta)
+  append_side_metadata_lines(lines, "+", "head", head_meta)
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Tip: use <CR> for default action or open fallback menu for other actions."
+
+  image_renderer.clear(bufnr)
+  local ok_write, write_err = write_readonly_buffer_lines(bufnr, lines, "diff")
+  if not ok_write then
+    return false, write_err
+  end
+
+  vim.b[bufnr].gh_pr_image_fallback = true
+  if reason ~= "" then
+    vim.b[bufnr].gh_pr_image_reason = reason
+  end
+  return true, nil
+end
+
+local function run_image_fallback_action(action, bufnr, opts)
+  opts = type(opts) == "table" and opts or {}
+  local ctx, ctx_err = resolve_image_buffer_context(bufnr)
+  if not ctx then
+    return false, ctx_err
+  end
+
+  local images_cfg = image_diff_options()
+  local requested = normalize_image_action(action, resolve_image_default_action(images_cfg))
+  local reason = type(opts.reason) == "string" and opts.reason ~= "" and opts.reason or ctx.reason
+
+  if requested == "metadata" then
+    return render_image_metadata_diff(ctx.bufnr, reason)
+  end
+
+  if requested == "open_local_current" then
+    local side = current_image_side(ctx)
+    local asset, asset_err = ensure_image_side_asset(ctx, side, images_cfg)
+    if not asset then
+      return false, asset_err
+    end
+    if asset.present == false then
+      return false, string.format("No %s image exists for this pull request file state", side)
+    end
+    if not file_readable(asset.cache_path) then
+      return false, "Unable to resolve a local image file to open"
+    end
+    return ensure_open_target(asset.cache_path, "local image")
+  end
+
+  if requested == "open_local_both" then
+    local opened_paths = {}
+    local opened_count = 0
+    local errors = {}
+    for _, side in ipairs({ "base", "head" }) do
+      local asset, asset_err = ensure_image_side_asset(ctx, side, images_cfg)
+      if not asset then
+        errors[#errors + 1] = string.format("%s: %s", side, tostring(asset_err))
+      elseif asset.present and file_readable(asset.cache_path) then
+        if not opened_paths[asset.cache_path] then
+          local ok_open, open_err = ensure_open_target(asset.cache_path, side .. " image")
+          if ok_open then
+            opened_paths[asset.cache_path] = true
+            opened_count = opened_count + 1
+          else
+            errors[#errors + 1] = string.format("%s: %s", side, tostring(open_err))
+          end
+        end
+      elseif asset.present then
+        errors[#errors + 1] = string.format("%s: local cached file unavailable", side)
+      end
+    end
+
+    if opened_count > 0 then
+      return true, nil
+    end
+    if #errors > 0 then
+      return false, table.concat(errors, " | ")
+    end
+    return false, "No local images available to open"
+  end
+
+  if requested == "open_github" then
+    local url = resolve_image_compare_url(ctx, images_cfg)
+    if url == "" then
+      return false, "Unable to resolve GitHub comparison URL for this image"
+    end
+    return ensure_open_target(url, "GitHub comparison URL")
+  end
+
+  return false, "Unsupported image fallback action: " .. tostring(requested)
+end
+
+local function execute_image_fallback_action(action, bufnr, opts)
+  opts = type(opts) == "table" and opts or {}
+  local requested = normalize_image_action(action, "metadata")
+  local ok_action, action_err = run_image_fallback_action(requested, bufnr, opts)
+  if ok_action then
+    return true, nil
+  end
+
+  local should_fallback_to_metadata = opts.fallback_to_metadata ~= false and requested ~= "metadata"
+  if should_fallback_to_metadata then
+    local ok_metadata, metadata_err = run_image_fallback_action("metadata", bufnr, {
+      reason = type(opts.reason) == "string" and opts.reason ~= "" and opts.reason or tostring(action_err or ""),
+    })
+    if ok_metadata then
+      notify_warn(string.format(
+        "Image fallback action '%s' failed (%s). Rendered metadata diff instead.",
+        requested,
+        tostring(action_err)
+      ))
+      return true, nil
+    end
+    return false, tostring(action_err) .. " | metadata: " .. tostring(metadata_err)
+  end
+
+  return false, action_err
+end
+
+local function close_image_fallback_menu()
+  if type(image_fallback_menu_state) ~= "table" then
+    image_fallback_menu_state = nil
+    return
+  end
+
+  local winid = image_fallback_menu_state.winid
+  image_fallback_menu_state = nil
+  if is_valid_win(winid) then
+    pcall(vim.api.nvim_win_close, winid, true)
+  end
+end
+
+local function current_menu_action(state_value)
+  if type(state_value) ~= "table" or not is_valid_win(state_value.winid) then
+    return nil
+  end
+  local cursor = vim.api.nvim_win_get_cursor(state_value.winid)
+  return state_value.line_actions[cursor[1]]
+end
+
+local function run_menu_action(state_value, action, set_default)
+  local action_id = normalize_image_action(action, resolve_image_default_action(image_diff_options()))
+  if set_default == true then
+    persist_image_default_action(action_id)
+    notify_info("Image fallback default action set to: " .. image_action_label(action_id))
+  end
+
+  local origin_winid = state_value.origin_winid
+  local origin_bufnr = state_value.origin_bufnr
+  close_image_fallback_menu()
+
+  if is_valid_win(origin_winid) then
+    pcall(vim.api.nvim_set_current_win, origin_winid)
+  end
+  local ok_action, action_err = execute_image_fallback_action(action_id, origin_bufnr, {
+    fallback_to_metadata = true,
+  })
+  if not ok_action then
+    notify_error(action_err)
+  end
+end
+
+function M.open_image_fallback_menu()
+  local origin_bufnr = vim.api.nvim_get_current_buf()
+  local ctx, ctx_err = resolve_image_buffer_context(origin_bufnr)
+  if not ctx then
+    return notify_error(ctx_err)
+  end
+
+  local origin_winid = vim.api.nvim_get_current_win()
+  close_image_fallback_menu()
+
+  local images_cfg = image_diff_options()
+  local default_action = resolve_image_default_action(images_cfg)
+  local fallback_key = type(images_cfg.fallback_menu_keymap) == "string" and images_cfg.fallback_menu_keymap or "gf"
+  local reason = type(vim.b[origin_bufnr].gh_pr_image_reason) == "string" and vim.b[origin_bufnr].gh_pr_image_reason or ""
+
+  local lines = {
+    "gh-pr image fallback actions",
+    "Enter/1..4: run action | d: set default | s: set default + run | q: close",
+    string.rep("=", 74),
+    string.format("file: %s", ctx.file_path ~= "" and ctx.file_path or ctx.path),
+    string.format("status: %s", ctx.status ~= "" and ctx.status or "unknown"),
+    string.format("default (<CR>): %s", image_action_label(default_action)),
+    string.format("menu keymap: %s", fallback_key ~= "" and fallback_key or "gf"),
+  }
+  if reason ~= "" then
+    lines[#lines + 1] = "reason: " .. reason
+  end
+  lines[#lines + 1] = ""
+
+  local line_actions = {}
+  for index, action in ipairs(IMAGE_FALLBACK_ACTION_ORDER) do
+    local marker = action == default_action and "*" or " "
+    lines[#lines + 1] = string.format("%d. [%s] %s", index, marker, image_action_label(action))
+    line_actions[#lines] = action
+  end
+
+  local width = 72
+  for _, line in ipairs(lines) do
+    width = math.max(width, vim.fn.strdisplaywidth(line) + 2)
+  end
+  width = math.min(width, math.max(56, vim.o.columns - 6))
+  local height = math.min(#lines + 1, math.max(10, vim.o.lines - vim.o.cmdheight - 4))
+  local row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1)
+  local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+
+  local menu_buf = vim.api.nvim_create_buf(false, true)
+  local menu_win = vim.api.nvim_open_win(menu_buf, true, {
+    relative = "editor",
+    row = row,
+    col = col,
+    width = width,
+    height = height,
+    style = "minimal",
+    border = "rounded",
+    title = "Image Fallback",
+    title_pos = "center",
+    noautocmd = true,
+  })
+
+  vim.api.nvim_buf_set_option(menu_buf, "buftype", "nofile")
+  vim.api.nvim_buf_set_option(menu_buf, "bufhidden", "wipe")
+  vim.api.nvim_buf_set_option(menu_buf, "swapfile", false)
+  vim.api.nvim_buf_set_option(menu_buf, "modifiable", true)
+  vim.api.nvim_buf_set_option(menu_buf, "filetype", "markdown")
+  vim.api.nvim_buf_set_lines(menu_buf, 0, -1, false, lines)
+  vim.api.nvim_buf_set_option(menu_buf, "modifiable", false)
+
+  vim.api.nvim_win_set_option(menu_win, "number", false)
+  vim.api.nvim_win_set_option(menu_win, "relativenumber", false)
+  vim.api.nvim_win_set_option(menu_win, "cursorline", true)
+  vim.api.nvim_win_set_option(menu_win, "wrap", false)
+  vim.api.nvim_win_set_option(menu_win, "signcolumn", "no")
+  vim.api.nvim_win_set_option(menu_win, "winhl", "NormalFloat:NormalFloat,FloatBorder:FloatBorder")
+
+  image_fallback_menu_state = {
+    bufnr = menu_buf,
+    winid = menu_win,
+    origin_winid = origin_winid,
+    origin_bufnr = origin_bufnr,
+    line_actions = line_actions,
+    first_action_line = #lines - #IMAGE_FALLBACK_ACTION_ORDER + 1,
+  }
+
+  local keymap_opts = {
+    buffer = menu_buf,
+    silent = true,
+    nowait = true,
+  }
+
+  vim.keymap.set("n", "q", close_image_fallback_menu, vim.tbl_extend("force", keymap_opts, { desc = "Close image fallback menu" }))
+  vim.keymap.set("n", "<Esc>", close_image_fallback_menu, vim.tbl_extend("force", keymap_opts, { desc = "Close image fallback menu" }))
+  vim.keymap.set("n", "<CR>", function()
+    local active = image_fallback_menu_state
+    local action = current_menu_action(active)
+    if action then
+      run_menu_action(active, action, false)
+    end
+  end, vim.tbl_extend("force", keymap_opts, { desc = "Run selected image fallback action" }))
+  vim.keymap.set("n", "d", function()
+    local active = image_fallback_menu_state
+    local action = current_menu_action(active)
+    if action then
+      persist_image_default_action(action)
+      notify_info("Image fallback default action set to: " .. image_action_label(action))
+      local origin_winid = active.origin_winid
+      close_image_fallback_menu()
+      if is_valid_win(origin_winid) then
+        pcall(vim.api.nvim_set_current_win, origin_winid)
+      end
+      M.open_image_fallback_menu()
+    end
+  end, vim.tbl_extend("force", keymap_opts, { desc = "Set selected action as default" }))
+  vim.keymap.set("n", "s", function()
+    local active = image_fallback_menu_state
+    local action = current_menu_action(active)
+    if action then
+      run_menu_action(active, action, true)
+    end
+  end, vim.tbl_extend("force", keymap_opts, { desc = "Set selected action as default and run it" }))
+
+  for index, action in ipairs(IMAGE_FALLBACK_ACTION_ORDER) do
+    local action_id = action
+    vim.keymap.set("n", tostring(index), function()
+      local active = image_fallback_menu_state
+      if active then
+        run_menu_action(active, action_id, false)
+      end
+    end, vim.tbl_extend("force", keymap_opts, { desc = "Run image fallback action " .. tostring(index) }))
+  end
+
+  vim.api.nvim_create_autocmd("WinClosed", {
+    pattern = tostring(menu_win),
+    once = true,
+    callback = function()
+      image_fallback_menu_state = nil
+    end,
+  })
+
+  pcall(vim.api.nvim_win_set_cursor, menu_win, { image_fallback_menu_state.first_action_line, 0 })
+end
+
+function M.run_image_fallback_default_action()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local _, ctx_err = resolve_image_buffer_context(bufnr)
+  if ctx_err then
+    return notify_error(ctx_err)
+  end
+
+  local images_cfg = image_diff_options()
+  local action = resolve_image_default_action(images_cfg)
+  local ok_action, action_err = execute_image_fallback_action(action, bufnr, {
+    fallback_to_metadata = true,
+  })
+  if not ok_action then
+    notify_error(action_err)
+  end
+end
+
+function M.on_image_render_fallback(bufnr, reason)
+  local ctx, ctx_err = resolve_image_buffer_context(bufnr)
+  if not ctx then
+    return notify_warn(ctx_err)
+  end
+
+  local images_cfg = image_diff_options()
+  local mode = images_cfg.fallback_mode
+  if mode ~= "menu" and mode ~= "metadata_only" and mode ~= "auto_local" and mode ~= "auto_github" then
+    mode = "menu"
+  end
+
+  if type(reason) == "string" and reason ~= "" then
+    vim.b[ctx.bufnr].gh_pr_image_reason = reason
+  end
+
+  if mode == "metadata_only" then
+    local ok_action, action_err = execute_image_fallback_action("metadata", bufnr, {
+      fallback_to_metadata = false,
+      reason = reason,
+    })
+    if not ok_action then
+      notify_warn("Unable to render image metadata fallback: " .. tostring(action_err))
+    end
+    return
+  end
+
+  if mode == "auto_local" then
+    local preferred = resolve_image_default_action(images_cfg)
+    if preferred ~= "open_local_current" and preferred ~= "open_local_both" then
+      preferred = "open_local_current"
+    end
+    local ok_action, action_err = execute_image_fallback_action(preferred, bufnr, {
+      fallback_to_metadata = true,
+      reason = reason,
+    })
+    if not ok_action then
+      notify_warn("Image fallback auto-local failed: " .. tostring(action_err))
+    end
+    return
+  end
+
+  if mode == "auto_github" then
+    local ok_action, action_err = execute_image_fallback_action("open_github", bufnr, {
+      fallback_to_metadata = true,
+      reason = reason,
+    })
+    if not ok_action then
+      notify_warn("Image fallback auto-github failed: " .. tostring(action_err))
+    end
+    return
+  end
+
+  local default_action = resolve_image_default_action(images_cfg)
+  local fallback_key = type(images_cfg.fallback_menu_keymap) == "string" and images_cfg.fallback_menu_keymap or "gf"
+  if vim.api.nvim_get_current_buf() == bufnr then
+    notify_warn(string.format(
+      "Image render fallback: %s. Press <CR> for '%s' or %s for the fallback menu.",
+      type(reason) == "string" and reason ~= "" and reason or "preview unavailable",
+      default_action,
+      fallback_key ~= "" and fallback_key or "gf"
+    ))
+    M.open_image_fallback_menu()
+  end
 end
 
 local function jump_to_line(line)
@@ -976,6 +1901,49 @@ function M.refresh_overview()
     cursor_line = cursor[1],
     overview_limits = current_overview_limits(),
   })
+end
+
+function M.refresh_visible_overview_for_pr(number)
+  local pr_number = tonumber(number)
+  if not pr_number then
+    return 0
+  end
+
+  local current_tab = vim.api.nvim_get_current_tabpage()
+  local refreshed = 0
+  local refreshed_buffers = {}
+
+  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(current_tab)) do
+    if is_valid_win(winid) then
+      local bufnr = vim.api.nvim_win_get_buf(winid)
+      if is_valid_buf(bufnr)
+        and not refreshed_buffers[bufnr]
+        and buffer_filetype(bufnr) == "ghpr_overview"
+        and tonumber(vim.b[bufnr].gh_pr_number) == pr_number then
+        local cursor = vim.api.nvim_win_get_cursor(winid)
+        local cursor_line = type(cursor) == "table" and tonumber(cursor[1]) or nil
+        local limits = type(vim.b[bufnr].gh_pr_overview_limits) == "table" and vim.deepcopy(vim.b[bufnr].gh_pr_overview_limits)
+          or nil
+
+        local ok = pcall(vim.api.nvim_win_call, winid, function()
+          M.open_overview(pr_number, {
+            refresh = true,
+            reuse_buffer = true,
+            bufnr = bufnr,
+            cursor_line = cursor_line,
+            overview_limits = limits,
+          })
+        end)
+
+        if ok then
+          refreshed = refreshed + 1
+          refreshed_buffers[bufnr] = true
+        end
+      end
+    end
+  end
+
+  return refreshed
 end
 
 function M.overview_more(section, count)
@@ -2350,15 +3318,73 @@ function M.checkout(number)
   notify_info(string.format("Checked out PR #%d", pr.number))
 end
 
-function M.mark_file_viewed(file, viewed)
+local function viewed_candidate_path(candidate)
+  if type(candidate) == "string" then
+    return candidate
+  end
+
+  if type(candidate) ~= "table" then
+    return nil
+  end
+
+  if type(candidate.path) == "string" and candidate.path ~= "" then
+    return candidate.path
+  end
+
+  if type(candidate.filename) == "string" and candidate.filename ~= "" then
+    return candidate.filename
+  end
+
+  if type(candidate.file) == "table" then
+    if type(candidate.file.path) == "string" and candidate.file.path ~= "" then
+      return candidate.file.path
+    end
+    if type(candidate.file.filename) == "string" and candidate.file.filename ~= "" then
+      return candidate.file.filename
+    end
+  end
+
+  return nil
+end
+
+local function viewed_candidate_file(candidate)
+  if type(candidate) ~= "table" then
+    return nil
+  end
+
+  if type(candidate.file) == "table" then
+    return candidate.file
+  end
+
+  if type(candidate.path) == "string" or type(candidate.filename) == "string" then
+    return candidate
+  end
+
+  return nil
+end
+
+local function resolve_viewed_targets(details, files)
+  local targets = {}
+  local seen_paths = {}
+  for _, candidate in ipairs(type(files) == "table" and files or {}) do
+    local path = resolve_canonical_file_path(details, viewed_candidate_path(candidate))
+    if path ~= "" and not seen_paths[path] then
+      seen_paths[path] = true
+      targets[#targets + 1] = {
+        path = path,
+        file = viewed_candidate_file(candidate),
+      }
+    end
+  end
+
+  return targets
+end
+
+function M.mark_files_viewed(files, viewed, opts)
+  opts = opts or {}
   local pr, details, err = resolve_active_pr()
   if not pr then
     return notify_error(err)
-  end
-
-  local selected_file = resolve_file(file)
-  if not selected_file then
-    return notify_error("No file selected")
   end
 
   local repository = normalize_repository(details)
@@ -2366,20 +3392,102 @@ function M.mark_file_viewed(file, viewed)
     return notify_error("Unable to resolve repository for viewed state")
   end
 
-  local path = resolve_canonical_file_path(details, selected_file.path or selected_file.filename)
-  if path == "" then
-    return notify_error("Unable to resolve file path")
+  local targets = resolve_viewed_targets(details, files)
+  if vim.tbl_isempty(targets) then
+    return notify_error("No files selected")
   end
 
   if viewed == nil then
-    viewed = not state.is_viewed(repository, pr.number, path)
+    local has_unviewed = false
+    for _, target in ipairs(targets) do
+      if state.is_viewed(repository, pr.number, target.path) ~= true then
+        has_unviewed = true
+        break
+      end
+    end
+    viewed = has_unviewed
   end
 
-  state.set_viewed(repository, pr.number, path, viewed)
-  state.set_active_file(selected_file)
+  local updated_count = 0
+  local unchanged_count = 0
+  local failed_count = 0
 
-  notify_info(string.format("Marked %s as %s", path, viewed and "viewed" or "unviewed"))
-  refresh_pr_sources_after_state_change()
+  for _, target in ipairs(targets) do
+    if state.is_viewed(repository, pr.number, target.path) == viewed then
+      unchanged_count = unchanged_count + 1
+    else
+      local ok = state.set_viewed(repository, pr.number, target.path, viewed)
+      if ok then
+        updated_count = updated_count + 1
+      else
+        failed_count = failed_count + 1
+      end
+    end
+  end
+
+  local first_file = targets[1] and targets[1].file or nil
+  if type(first_file) == "table" then
+    state.set_active_file(first_file)
+  end
+
+  if updated_count > 0 then
+    refresh_pr_sources_after_state_change()
+  end
+
+  if opts.notify ~= false then
+    local viewed_label = viewed and "viewed" or "unviewed"
+    local total = #targets
+    if total == 1 then
+      if failed_count > 0 then
+        notify_error(string.format("Unable to mark %s as %s", targets[1].path, viewed_label))
+      elseif updated_count > 0 then
+        notify_info(string.format("Marked %s as %s", targets[1].path, viewed_label))
+      else
+        notify_info(string.format("%s is already %s", targets[1].path, viewed_label))
+      end
+    else
+      if failed_count > 0 then
+        notify_warn(string.format(
+          "Applied %s to %d/%d files (%d unchanged, %d failed)",
+          viewed_label,
+          updated_count,
+          total,
+          unchanged_count,
+          failed_count
+        ))
+      elseif updated_count == total then
+        notify_info(string.format("Marked %d files as %s", total, viewed_label))
+      elseif updated_count == 0 then
+        notify_info(string.format("All %d files are already %s", total, viewed_label))
+      else
+        notify_info(string.format(
+          "Marked %d/%d files as %s (%d already %s)",
+          updated_count,
+          total,
+          viewed_label,
+          unchanged_count,
+          viewed_label
+        ))
+      end
+    end
+  end
+
+  return {
+    viewed = viewed,
+    total = #targets,
+    updated_count = updated_count,
+    unchanged_count = unchanged_count,
+    failed_count = failed_count,
+  }
+end
+
+function M.mark_file_viewed(file, viewed)
+  local selected_file = resolve_file(file)
+  if not selected_file then
+    return notify_error("No file selected")
+  end
+
+  M.mark_files_viewed({ selected_file }, viewed)
 end
 
 function M.toggle_viewed()
@@ -3335,8 +4443,12 @@ end
 local function diff_shortcut_lines(bufnr)
   local kind = type(vim.b[bufnr].gh_pr_file_kind) == "string" and vim.b[bufnr].gh_pr_file_kind or "head"
   local file_mode = type(vim.b[bufnr].gh_pr_file_mode) == "string" and vim.b[bufnr].gh_pr_file_mode or ""
+  local is_image = vim.b[bufnr].gh_pr_is_image == true
   local prefs = current_diff_view_preferences()
   local shortcuts = diff_view_shortcuts()
+  local image_opts = image_diff_options()
+  local image_default_action = resolve_image_default_action(image_opts)
+  local image_menu_key = type(image_opts.fallback_menu_keymap) == "string" and image_opts.fallback_menu_keymap or "gf"
   local configured_diff = (config.get() or {}).diff_view or {}
   local configured_whitespace = type(configured_diff.whitespace) == "table" and configured_diff.whitespace or {}
   local whitespace_tab = type(configured_whitespace.tab) == "string" and configured_whitespace.tab ~= ""
@@ -3358,6 +4470,9 @@ local function diff_shortcut_lines(bufnr)
   else
     mode_label = "unified"
   end
+  if is_image then
+    mode_label = mode_label .. " (image)"
+  end
 
   local function add_shortcut(lines, key, description)
     if type(key) == "string" and key ~= "" then
@@ -3370,22 +4485,29 @@ local function diff_shortcut_lines(bufnr)
     "",
     "Diff render state",
     shortcut_line("mode", mode_label),
-    shortcut_line("spaces", prefs.ignore_whitespace and "ignored" or "strict"),
-    shortcut_line("render", prefs.render_whitespace and "visible" or "hidden"),
-    shortcut_line("tab", whitespace_tab),
-    shortcut_line("space", whitespace_space),
+    shortcut_line("spaces", is_image and "n/a (image)" or (prefs.ignore_whitespace and "ignored" or "strict")),
+    shortcut_line("render", is_image and "n/a (image)" or (prefs.render_whitespace and "visible" or "hidden")),
+    shortcut_line("tab", is_image and "n/a" or whitespace_tab),
+    shortcut_line("space", is_image and "n/a" or whitespace_space),
     "",
     "General",
-    shortcut_line("K", kind == "unified" and "Not available in unified mode" or "Show line comments popup"),
+    shortcut_line(
+      "K",
+      is_image and "Not available for image files" or (kind == "unified" and "Not available in unified mode" or "Show line comments popup")
+    ),
     shortcut_line("?", "Show this help"),
     shortcut_line("R", "Refresh current diff from GitHub"),
     shortcut_line("q", "Quick close (or close head in 2-way diff)"),
     shortcut_line("Q", "Close view(s) and open PR Review"),
   }
 
-  add_shortcut(lines, shortcuts.toggle_render_whitespace, "Toggle space/tab symbols")
+  if not is_image then
+    add_shortcut(lines, shortcuts.toggle_render_whitespace, "Toggle space/tab symbols")
+  end
 
-  if file_mode ~= "added_single" and file_mode ~= "removed_single" then
+  if is_image then
+    lines[#lines + 1] = shortcut_line("-", "Whitespace and diff layout toggles disabled for image files")
+  elseif file_mode ~= "added_single" and file_mode ~= "removed_single" then
     add_shortcut(lines, shortcuts.toggle_whitespace, "Toggle whitespace changes")
     add_shortcut(lines, shortcuts.cycle_mode, "Cycle diff mode")
     add_shortcut(lines, shortcuts.set_vertical, "Set vertical split")
@@ -3395,10 +4517,20 @@ local function diff_shortcut_lines(bufnr)
     lines[#lines + 1] = shortcut_line("-", "Diff layout toggles disabled for single-file mode")
   end
 
+  if is_image then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Image fallback"
+    lines[#lines + 1] = shortcut_line("<CR>", string.format("Run default fallback action (%s)", image_action_label(image_default_action)))
+    if image_menu_key ~= "" then
+      lines[#lines + 1] = shortcut_line(image_menu_key, "Open fallback actions menu")
+    end
+    lines[#lines + 1] = shortcut_line("-", "Menu allows setting default action (`d`/`s`)")
+  end
+
   lines[#lines + 1] = ""
   lines[#lines + 1] = "Navigation"
-  lines[#lines + 1] = shortcut_line(",n", "Next change")
-  lines[#lines + 1] = shortcut_line(",p", "Previous change")
+  lines[#lines + 1] = shortcut_line(",n", is_image and "Not available for image files" or "Next change")
+  lines[#lines + 1] = shortcut_line(",p", is_image and "Not available for image files" or "Previous change")
   lines[#lines + 1] = shortcut_line(",f", "Next file in PR")
   lines[#lines + 1] = shortcut_line(",F", "Previous file in PR")
   lines[#lines + 1] = shortcut_line(",v", "Next reviewed file")
@@ -3414,7 +4546,9 @@ local function diff_shortcut_lines(bufnr)
   lines[#lines + 1] = ""
   lines[#lines + 1] = "Inline comments"
 
-  if kind == "head" and file_mode == "added_single" then
+  if is_image then
+    lines[#lines + 1] = shortcut_line("gc", "Not available for image files")
+  elseif kind == "head" and file_mode == "added_single" then
     lines[#lines + 1] = shortcut_line("gc", "Create inline comment at cursor (any line)")
     lines[#lines + 1] = shortcut_line("v/V + gc", "Create inline comment on selected range")
   elseif kind == "head" then

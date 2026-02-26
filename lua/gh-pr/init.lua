@@ -255,13 +255,31 @@ local function start_auto_refresh_timer()
   local interval_ms = interval * 1000
   auto_refresh_timer:start(interval_ms, interval_ms, vim.schedule_wrap(function()
     local source_ok, source = pcall(require, "gh-pr.neotree.source")
-    if source_ok and type(source.refresh_if_focused) == "function" then
-      source.refresh_if_focused()
+    if gh_pr_enabled and source_ok and type(source.request_refresh) == "function" then
+      local focused = type(source.is_focused) == "function" and source.is_focused() == true
+      pcall(source.request_refresh, nil, {
+        force = false,
+        notify_error = false,
+        refresh_context = {
+          mode = focused and "ui-refresh" or "cache-only",
+          reason = "timer",
+          notify = focused,
+        },
+      })
     end
 
     local review_ok, review_source = pcall(require, "gh-pr.neotree.review_source")
-    if review_ok and type(review_source.refresh_if_focused) == "function" then
-      review_source.refresh_if_focused()
+    if gh_pr_review_enabled and review_ok and type(review_source.request_refresh) == "function" then
+      local focused = type(review_source.is_focused) == "function" and review_source.is_focused() == true
+      pcall(review_source.request_refresh, nil, {
+        force = false,
+        notify_error = false,
+        refresh_context = {
+          mode = focused and "ui-refresh" or "cache-only",
+          reason = "timer",
+          notify = focused,
+        },
+      })
     end
   end))
 end
