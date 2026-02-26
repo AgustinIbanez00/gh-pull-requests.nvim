@@ -37,12 +37,17 @@ Commands
     Toggles PR Review source (`gh_pr_review`).
     PR Review source sections: Overview, Labels, Files, Reviewers,
     Commits, Checks, Comments.
+    In `Commits`, `<CR>` expands selected commit and lists changed files.
+    In commit file nodes, `<CR>` opens diff scoped to selected commit
+    (`parent[1] -> commit`).
     `Comments` is rendered as tree sections: `By File` and `Global`.
     `By File` groups threads by path/file and uses status badges:
     `[UNRESOLVED]`, `[RESOLVED]`, `[CLOSED]`.
     `Global` includes review events and general PR comments.
     In `Files`, directory nodes show `X/Y VIEWED` in yellow when at least
     one descendant file is viewed (recursive count including subfolders).
+    Marking viewed/unviewed from `gh_pr_review` does not force-focus
+    the `gh_pr` panel.
     Inside `gh_pr_review`, `R` forces refresh from GitHub for active PR.
     `l` opens labels multi-select edit dialog.
     `r` opens reviewers multi-select edit dialog.
@@ -61,6 +66,7 @@ Commands
     `zG` expand `Comments > Global` (including subgroups).
     `zg` collapse `Comments > Global` (including subgroups).
     `s` re-runs start-review flow for selected PR context.
+    `:GhPrOpenCommitPatch` opens the full patch for selected commit.
 
 :GhPrRefresh
     Refreshes PR data in active views.
@@ -173,6 +179,9 @@ Overview buffer keymaps:
 
 :GhPrOpenModified
     Opens virtual readonly head version for active PR file.
+
+:GhPrOpenCommitPatch
+    Opens full patch for selected commit in virtual readonly buffer.
 
 :GhPrToggleReviewed
     Toggles local viewed state for the current PR file.

@@ -10,6 +10,7 @@ A Neovim plugin that brings a GitHub Pull Requests workflow (similar to VSCode) 
 - Pull request overview interactive tabs UI (Snacks-based) with inline markdown rendering in PR description.
 - Overview timeline tab that merges comments, reviews, and review-thread comments in chronological order.
 - Open commit diffs directly from Overview > Commits (virtual patch buffers, no checkout).
+- PR Review > Commits supports per-commit file browsing and opens commit-scoped diffs (`parent[1] -> commit`).
 - Virtual readonly file buffers for base/head versions (no disk writes).
 - Configurable diff rendering for changed files: vertical split, horizontal split, or unified inline.
 - Toggle whitespace-sensitive vs whitespace-ignored diff rendering in file buffers.
@@ -228,6 +229,7 @@ Optional:
 - `:GhPrOpenDiff` open selected file in virtual base/head diff.
 - `:GhPrOpenOriginal` open base version buffer.
 - `:GhPrOpenModified` open head version buffer.
+- `:GhPrOpenCommitPatch` open selected commit patch in virtual buffer.
 - `:GhPrToggleReviewed` toggle local viewed state.
 - `:GhPrNextChange` jump to next diff hunk.
 - `:GhPrPrevChange` jump to previous diff hunk.
@@ -349,7 +351,8 @@ Inside `gh_pr_review` Neo-tree source:
 - `<CR>` actions:
   - `Overview` opens overview buffer
   - `Files` opens diffs
-  - `Commits` opens commit patch diff
+  - `Commits` expands selected commit and lists changed files
+  - `Commit file` opens diff scoped to selected commit (`parent[1] -> commit`)
   - `Checks` opens check URL
   - `Comments` is a tree with `By File` and `Global` sections
   - `By File` groups comment threads by path/file and thread labels show status badges
@@ -360,7 +363,9 @@ Inside `gh_pr_review` Neo-tree source:
 - In `Files`, directory nodes show a yellow prefix `X/Y VIEWED` when at least one descendant file is viewed
   (counts are recursive and include subfolders).
 - `p`/`v` on files toggles viewed state and refreshes PR state immediately.
+- Marking viewed/unviewed from `gh_pr_review` does not force-focus `gh_pr` panel.
 - `R` forces a refresh from GitHub for the active review PR.
+- `:GhPrOpenCommitPatch` opens full patch for selected commit (command-only access).
 - `l` opens labels multi-select edit dialog.
 - `r` opens reviewers multi-select edit dialog.
 - `S` submit pending review as comment.

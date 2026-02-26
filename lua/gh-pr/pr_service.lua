@@ -1357,6 +1357,8 @@ function M.fetch_commit_details(pr_number, oid, opts)
   local committed_at = type(commit_block.committer) == "table" and normalize_string(commit_block.committer.date, "") or authored_at
   local author = normalize_login(payload.author or commit_block.author, "unknown")
   local sha = normalize_string(payload.sha, oid)
+  local parents = type(payload.parents) == "table" and payload.parents or {}
+  local parent_oid = normalize_string(type(parents[1]) == "table" and parents[1].sha or "", "")
 
   local files = normalize_files(payload.files)
   for _, file in ipairs(files) do
@@ -1375,6 +1377,8 @@ function M.fetch_commit_details(pr_number, oid, opts)
     author = author,
     repository = repository.full_name,
     url = normalize_string(payload.html_url, ""),
+    parent_oid = parent_oid,
+    parents_total = #parents,
     files = files,
     files_total = #files,
     additions = tonumber(stats.additions) or 0,

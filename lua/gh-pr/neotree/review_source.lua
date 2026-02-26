@@ -254,6 +254,7 @@ local function new_repo_session(repo_context)
     last_error = nil,
     stale = false,
     follow = {},
+    commit_files_by_key = {},
     loaded_from_disk = false,
   }
 end
@@ -336,6 +337,18 @@ local function ensure_follow_state(session)
     session.follow = {}
   end
   return session.follow
+end
+
+local function ensure_commit_file_cache(session)
+  if type(session) ~= "table" then
+    return {}
+  end
+
+  if type(session.commit_files_by_key) ~= "table" then
+    session.commit_files_by_key = {}
+  end
+
+  return session.commit_files_by_key
 end
 
 local function remember_revealed_node(session, node_id, context)
@@ -685,28 +698,170 @@ local function sanitize_node_id_component(value)
   return raw
 end
 
-local function build_commit_nodes(pr, details)
+local function commit_cache_key(pr_number, oid, fallback_key)
+  if type(oid) == "string" and oid ~= "" then
+    return string.format("%d:%s", pr_number, oid)
+  end
+
+  local fallback = sanitize_node_id_component(fallback_key or "commit")
+  return string.format("%d:unknown:%s", pr_number, fallback)
+end
+
+local function commit_file_status_prefix(status)
+  local normalized = type(status) == "string" and status:lower() or ""
+  if normalized == "added" then
+    return "A"
+  end
+  if normalized == "removed" then
+    return "D"
+  end
+  if normalized == "renamed" then
+    return "R"
+  end
+  if normalized == "copied" then
+    return "C"
+  end
+  return "M"
+end
+
+local function normalize_commit_file_for_node(file)
+  if type(file) ~= "table" then
+    return nil
+  end
+
+  local path = type(file.path) == "string" and file.path or (type(file.filename) == "string" and file.filename or "")
+  if path == "" then
+    return nil
+  end
+
+  local previous = file.previousFilename or file.previous_filename
+  if type(previous) ~= "string" then
+    previous = ""
+  end
+
+  return {
+    path = path,
+    filename = type(file.filename) == "string" and file.filename ~= "" and file.filename or path,
+    previousFilename = previous,
+    previous_filename = previous,
+    status = type(file.status) == "string" and file.status or "",
+    additions = tonumber(file.additions) or 0,
+    deletions = tonumber(file.deletions) or 0,
+    patch = type(file.patch) == "string" and file.patch or "",
+  }
+end
+
+local function commit_file_display_name(file)
+  local path = file.path
+  local previous = file.previous_filename or file.previousFilename or ""
+  local normalized_status = type(file.status) == "string" and file.status:lower() or ""
+  if normalized_status == "renamed" and previous ~= "" and previous ~= path then
+    return string.format("[%s] %s -> %s", commit_file_status_prefix(normalized_status), previous, path)
+  end
+  return string.format("[%s] %s", commit_file_status_prefix(normalized_status), path)
+end
+
+local function build_commit_file_nodes(pr, details, commit_details)
+  local nodes = {}
+  local files = type(commit_details) == "table" and type(commit_details.files) == "table" and commit_details.files or {}
+  local commit_oid = type(commit_details) == "table" and type(commit_details.oid) == "string" and commit_details.oid or ""
+  local commit_context = {
+    oid = commit_oid,
+    parent_oid = type(commit_details) == "table" and type(commit_details.parent_oid) == "string"
+        and commit_details.parent_oid
+      or "",
+    headline = type(commit_details) == "table" and type(commit_details.headline) == "string"
+        and commit_details.headline
+      or "",
+    body = type(commit_details) == "table" and type(commit_details.body) == "string" and commit_details.body or "",
+    url = type(commit_details) == "table" and type(commit_details.url) == "string" and commit_details.url or "",
+    author = type(commit_details) == "table" and type(commit_details.author) == "string" and commit_details.author or nil,
+    repository = type(commit_details) == "table" and type(commit_details.repository) == "string"
+        and commit_details.repository
+      or "",
+  }
+
+  for index, raw_file in ipairs(files) do
+    local file = normalize_commit_file_for_node(raw_file)
+    if file then
+      nodes[#nodes + 1] = {
+        id = string.format(
+          "ghpr-review:%d:commit-file:%s:%s:%d",
+          pr.number,
+          sanitize_node_id_component(commit_oid ~= "" and commit_oid or "commit"),
+          sanitize_node_id_component(file.path),
+          index
+        ),
+        name = commit_file_display_name(file),
+        type = "file",
+        path = file.path,
+        extra = {
+          kind = "commit_file",
+          pr = pr,
+          details = details,
+          file = file,
+          commit = vim.deepcopy(commit_context),
+        },
+      }
+    end
+  end
+
+  if vim.tbl_isempty(nodes) then
+    return {
+      {
+        id = string.format(
+          "ghpr-review:%d:commit:%s:files-empty",
+          pr.number,
+          sanitize_node_id_component(commit_oid ~= "" and commit_oid or "commit")
+        ),
+        name = "No files in commit",
+        type = "message",
+        extra = {
+          kind = "message",
+          pr = pr,
+          details = details,
+        },
+      },
+    }
+  end
+
+  return nodes
+end
+
+local function build_commit_nodes(pr, details, session)
   local nodes = {}
   local seen_commit_ids = {}
+  local commit_cache = ensure_commit_file_cache(session)
   for _, commit in ipairs(type(details.commits) == "table" and details.commits or {}) do
     local oid = type(commit.oid) == "string" and commit.oid or ""
     local headline = type(commit.messageHeadline) == "string" and commit.messageHeadline or "(no commit headline)"
     local commit_key = oid ~= "" and oid or (headline .. ":" .. tostring(type(commit.url) == "string" and commit.url or ""))
     if not seen_commit_ids[commit_key] then
       seen_commit_ids[commit_key] = true
+      local cache_key = commit_cache_key(pr.number, oid, commit_key)
+      local cached = type(commit_cache[cache_key]) == "table" and commit_cache[cache_key] or nil
+      local cached_commit = type(cached) == "table" and type(cached.commit) == "table" and cached.commit or nil
 
       nodes[#nodes + 1] = {
         id = string.format("ghpr-review:%d:commit:%s", pr.number, oid ~= "" and oid or tostring(#nodes + 1)),
         name = string.format("%s %s", short_sha(oid), headline),
-        type = "file",
+        type = "directory",
+        children = type(cached) == "table" and type(cached.nodes) == "table" and vim.deepcopy(cached.nodes) or nil,
         extra = {
           kind = "commit",
           commit = {
             oid = oid,
+            parent_oid = type(commit.parent_oid) == "string" and commit.parent_oid
+              or (type(cached_commit) == "table" and type(cached_commit.parent_oid) == "string" and cached_commit.parent_oid or ""),
             headline = headline,
-            body = type(commit.messageBody) == "string" and commit.messageBody or "",
-            url = type(commit.url) == "string" and commit.url or "",
-            author = type(commit.author) == "table" and commit.author.login or nil,
+            body = type(commit.messageBody) == "string" and commit.messageBody
+              or (type(cached_commit) == "table" and type(cached_commit.body) == "string" and cached_commit.body or ""),
+            url = type(commit.url) == "string" and commit.url
+              or (type(cached_commit) == "table" and type(cached_commit.url) == "string" and cached_commit.url or ""),
+            author = type(commit.author) == "table" and commit.author.login
+              or (type(cached_commit) == "table" and type(cached_commit.author) == "string" and cached_commit.author or nil),
+            cache_key = cache_key,
+            files_total = type(cached) == "table" and tonumber(cached.files_total) or nil,
           },
           pr = pr,
           details = details,
@@ -1709,11 +1864,11 @@ local function build_comment_nodes(pr, details)
   return sections
 end
 
-local function build_root_nodes(pr, details, repo_full_name)
+local function build_root_nodes(pr, details, repo_full_name, session)
   local files_children, viewed_files, total_files = build_file_nodes(pr, details, repo_full_name)
   local labels_children = build_label_nodes(pr, details)
   local reviewers_children = build_reviewer_nodes(pr, details)
-  local commits_children = build_commit_nodes(pr, details)
+  local commits_children = build_commit_nodes(pr, details, session)
   local checks_children = build_check_nodes(pr, details)
   local comments_children = build_comment_nodes(pr, details)
   local files_title = total_files > 0 and string.format("Files %d/%d viewed", viewed_files, total_files) or "Files"
@@ -1888,7 +2043,7 @@ local function build_nodes(session, repo_context)
     )
   end
 
-  append_nodes(nodes, build_root_nodes(details, details, repo_context.repository.full_name))
+  append_nodes(nodes, build_root_nodes(details, details, repo_context.repository.full_name, session))
   return nodes
 end
 
@@ -1944,6 +2099,9 @@ local function apply_runtime_cache(session)
     return
   end
 
+  if tonumber(session.pr_number) ~= review_number then
+    session.commit_files_by_key = {}
+  end
   session.pr_number = review_number
   session.details = review_details
 end
@@ -2071,6 +2229,10 @@ local function finish_refresh(repo_context, payload)
   session.stale = session_is_stale(session)
 
   local current_snapshot = build_review_snapshot(session.pr_number, session.details)
+  if previous_snapshot.pr_number ~= current_snapshot.pr_number
+    or previous_snapshot.commits.signature ~= current_snapshot.commits.signature then
+    session.commit_files_by_key = {}
+  end
   local change_summary = summarize_review_changes(previous_snapshot, current_snapshot)
 
   comments_source.invalidate_cache()
@@ -2185,6 +2347,108 @@ start_background_refresh = function(repo_context, opts)
   end)
 
   return true
+end
+
+function M.ensure_commit_files(state, node)
+  if type(state) ~= "table" or type(state.tree) ~= "table" then
+    return false, "Unable to resolve PR Review state"
+  end
+
+  local commit_node = type(node) == "table" and node or state.tree:get_node()
+  local extra = type(commit_node) == "table" and type(commit_node.extra) == "table" and commit_node.extra or nil
+  if type(extra) ~= "table" or extra.kind ~= "commit" then
+    return false, "Selected node is not a commit"
+  end
+
+  local commit = type(extra.commit) == "table" and extra.commit or nil
+  if type(commit) ~= "table" or type(commit.oid) ~= "string" or commit.oid == "" then
+    return false, "Selected commit has no oid"
+  end
+
+  local pr = type(extra.pr) == "table" and extra.pr or nil
+  local details = type(extra.details) == "table" and extra.details or nil
+  local pr_number = tonumber(type(pr) == "table" and pr.number or nil) or tonumber(type(details) == "table" and details.number or nil)
+  if not pr_number then
+    return false, "Unable to resolve pull request number for selected commit"
+  end
+
+  local repo_key = type(state.gh_pr_review_repo_key) == "string" and state.gh_pr_review_repo_key or nil
+  local session = type(repo_key) == "string" and runtime_cache.repos[repo_key] or nil
+  if not session then
+    local repo_context, context_err = resolve_repo_context()
+    if not repo_context then
+      return false, "Unable to resolve repository context: " .. tostring(context_err)
+    end
+    session = ensure_repo_session(repo_context)
+  end
+
+  if type(details) ~= "table" or not has_full_details(details) then
+    if tonumber(session.pr_number) == pr_number and has_full_details(session.details) then
+      details = session.details
+    end
+  end
+  if type(details) ~= "table" then
+    return false, "Unable to resolve pull request details for selected commit"
+  end
+
+  local cache_key = type(commit.cache_key) == "string" and commit.cache_key ~= ""
+      and commit.cache_key
+    or commit_cache_key(pr_number, commit.oid, commit.headline or commit.url or commit.oid)
+  local commit_cache = ensure_commit_file_cache(session)
+  local cached = type(commit_cache[cache_key]) == "table" and commit_cache[cache_key] or nil
+  if type(cached) == "table" and type(cached.nodes) == "table" then
+    commit_node.type = "directory"
+    commit_node.children = vim.deepcopy(cached.nodes)
+    if type(commit_node.extra) == "table" and type(commit_node.extra.commit) == "table" then
+      commit_node.extra.commit.cache_key = cache_key
+      commit_node.extra.commit.parent_oid = type(cached.commit) == "table"
+          and type(cached.commit.parent_oid) == "string"
+          and cached.commit.parent_oid
+        or ""
+      commit_node.extra.commit.files_total = tonumber(cached.files_total) or nil
+    end
+    return true, nil, false
+  end
+
+  local repository = repository_full_name(details)
+  if repository == "" and type(session.repository) == "table" and type(session.repository.full_name) == "string" then
+    repository = session.repository.full_name
+  end
+
+  local commit_details, commit_err = pr_service.fetch_commit_details(pr_number, commit.oid, {
+    repository = repository ~= "" and repository or nil,
+  })
+  if not commit_details then
+    return false, commit_err
+  end
+
+  local effective_pr = pr or details
+  local child_nodes = build_commit_file_nodes(effective_pr, details, commit_details)
+  local cached_commit = {
+    oid = commit_details.oid,
+    parent_oid = commit_details.parent_oid,
+    headline = commit_details.headline,
+    body = commit_details.body,
+    url = commit_details.url,
+    author = commit_details.author,
+    repository = commit_details.repository,
+  }
+  commit_cache[cache_key] = {
+    commit = cached_commit,
+    files_total = tonumber(commit_details.files_total) or (type(commit_details.files) == "table" and #commit_details.files or 0),
+    nodes = vim.deepcopy(child_nodes),
+  }
+
+  commit_node.type = "directory"
+  commit_node.children = vim.deepcopy(child_nodes)
+  if type(commit_node.extra) == "table" and type(commit_node.extra.commit) == "table" then
+    commit_node.extra.commit.cache_key = cache_key
+    commit_node.extra.commit.parent_oid = type(commit_details.parent_oid) == "string" and commit_details.parent_oid or ""
+    commit_node.extra.commit.files_total = tonumber(commit_details.files_total)
+      or (type(commit_details.files) == "table" and #commit_details.files or 0)
+  end
+
+  return true, nil, true
 end
 
 local function show_message(state, id, message)

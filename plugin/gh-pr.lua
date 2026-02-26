@@ -76,6 +76,10 @@ vim.api.nvim_create_user_command("GhPrOpenModified", function()
   require("gh-pr").open_modified()
 end, { desc = "Open active file head version" })
 
+vim.api.nvim_create_user_command("GhPrOpenCommitPatch", function()
+  require("gh-pr").open_commit_patch()
+end, { desc = "Open selected commit patch in virtual buffer" })
+
 vim.api.nvim_create_user_command("GhPrToggleReviewed", function()
   require("gh-pr").toggle_reviewed()
 end, { desc = "Toggle viewed state for active PR file" })

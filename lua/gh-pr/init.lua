@@ -495,6 +495,10 @@ function M.open_modified()
   actions.open_modified()
 end
 
+function M.open_commit_patch()
+  actions.open_commit_diff()
+end
+
 function M.toggle_reviewed()
   actions.toggle_viewed()
 end

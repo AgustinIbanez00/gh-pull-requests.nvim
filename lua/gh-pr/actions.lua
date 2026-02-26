@@ -189,11 +189,16 @@ local function refresh_pr_sources_after_state_change(opts)
 
   local source_ok, source = pcall(require, "gh-pr.neotree.source")
   if source_ok then
-    if type(source.render_cached_states) == "function" then
-      pcall(source.render_cached_states)
-    end
     if type(source.request_refresh) == "function" then
-      pcall(source.request_refresh, nil, { force = force, notify_error = false })
+      pcall(source.request_refresh, nil, {
+        force = force,
+        notify_error = false,
+        refresh_context = {
+          mode = "cache-only",
+          reason = "state-change",
+          notify = false,
+        },
+      })
     end
   end
 
@@ -203,13 +208,20 @@ local function refresh_pr_sources_after_state_change(opts)
       pcall(review_source.render_cached_states)
     end
     if type(review_source.request_refresh) == "function" then
-      pcall(review_source.request_refresh, nil, { force = force, notify_error = false })
+      pcall(review_source.request_refresh, nil, {
+        force = force,
+        notify_error = false,
+        refresh_context = {
+          mode = "ui-refresh",
+          reason = "state-change",
+          notify = false,
+        },
+      })
     end
   end
 
   local manager_ok, manager = pcall(require, "neo-tree.sources.manager")
   if manager_ok then
-    pcall(manager.refresh, "gh_pr")
     pcall(manager.refresh, "gh_pr_review")
   end
 end
@@ -2827,6 +2839,25 @@ local function resolve_commit(commit)
   end
 
   local bufnr = vim.api.nvim_get_current_buf()
+  if buffer_filetype(bufnr) == "neo-tree" and vim.b[bufnr].neo_tree_source == "gh_pr_review" then
+    local manager_ok, manager = pcall(require, "neo-tree.sources.manager")
+    if manager_ok and type(manager.get_state_for_window) == "function" then
+      local winid = vim.api.nvim_get_current_win()
+      local ok_state, tree_state = pcall(manager.get_state_for_window, winid)
+      if ok_state and type(tree_state) == "table" and type(tree_state.tree) == "table" then
+        local node = tree_state.tree:get_node()
+        local extra = type(node) == "table" and type(node.extra) == "table" and node.extra or nil
+        local kind = type(extra) == "table" and extra.kind or nil
+        if (kind == "commit" or kind == "commit_file")
+          and type(extra.commit) == "table"
+          and type(extra.commit.oid) == "string"
+          and extra.commit.oid ~= "" then
+          return extra.commit
+        end
+      end
+    end
+  end
+
   local oid = vim.b[bufnr].gh_pr_commit_oid
   if type(oid) == "string" and oid ~= "" then
     return {
@@ -2836,6 +2867,96 @@ local function resolve_commit(commit)
   end
 
   return nil
+end
+
+local function open_commit_url(commit)
+  if type(commit) == "table"
+    and type(commit.url) == "string"
+    and commit.url ~= ""
+    and vim.ui
+    and type(vim.ui.open) == "function" then
+    vim.ui.open(commit.url)
+    return true
+  end
+  return false
+end
+
+local function fetch_commit_details_for_pr(pr, details, selected_commit)
+  local repository = normalize_repository(details) or ""
+  return pr_service.fetch_commit_details(pr.number, selected_commit.oid, {
+    repository = repository,
+  })
+end
+
+local function normalize_commit_file_for_diff(file)
+  if type(file) ~= "table" then
+    return nil
+  end
+
+  local path = file.path or file.filename
+  if type(path) ~= "string" or path == "" then
+    return nil
+  end
+
+  local previous = file.previous_filename or file.previousFilename
+  if type(previous) ~= "string" then
+    previous = ""
+  end
+
+  return {
+    path = path,
+    filename = type(file.filename) == "string" and file.filename ~= "" and file.filename or path,
+    previous_filename = previous,
+    previousFilename = previous,
+    status = type(file.status) == "string" and file.status or "",
+    additions = tonumber(file.additions) or 0,
+    deletions = tonumber(file.deletions) or 0,
+    patch = type(file.patch) == "string" and file.patch or "",
+  }
+end
+
+local function repository_object_from_full_name(full_name)
+  local parsed = parse_repo_full_name(full_name)
+  if not parsed then
+    return nil
+  end
+
+  return {
+    owner = {
+      login = parsed.owner,
+    },
+    name = parsed.name,
+    nameWithOwner = parsed.full_name,
+  }
+end
+
+local function build_commit_diff_details(details, commit_details)
+  local diff_details = vim.deepcopy(type(details) == "table" and details or {})
+  diff_details.baseRefName = type(commit_details.parent_oid) == "string" and commit_details.parent_oid or ""
+  diff_details.headRefName = type(commit_details.oid) == "string" and commit_details.oid or ""
+
+  local repository = repository_object_from_full_name(commit_details.repository)
+  if type(diff_details.baseRepository) ~= "table" and repository then
+    diff_details.baseRepository = vim.deepcopy(repository)
+  end
+  if type(diff_details.headRepository) ~= "table" then
+    if repository then
+      diff_details.headRepository = vim.deepcopy(repository)
+    elseif type(diff_details.baseRepository) == "table" then
+      diff_details.headRepository = vim.deepcopy(diff_details.baseRepository)
+    end
+  end
+  if type(diff_details.baseRepository) ~= "table" and type(diff_details.headRepository) == "table" then
+    diff_details.baseRepository = vim.deepcopy(diff_details.headRepository)
+  end
+
+  if (type(diff_details.url) ~= "string" or diff_details.url == "")
+    and type(commit_details.url) == "string"
+    and commit_details.url ~= "" then
+    diff_details.url = commit_details.url
+  end
+
+  return diff_details
 end
 
 function M.open_commit_diff(commit)
@@ -2849,13 +2970,9 @@ function M.open_commit_diff(commit)
     return notify_error("No commit selected")
   end
 
-  local repository = normalize_repository(details) or ""
-  local commit_details, commit_err = pr_service.fetch_commit_details(pr.number, selected_commit.oid, {
-    repository = repository,
-  })
+  local commit_details, commit_err = fetch_commit_details_for_pr(pr, details, selected_commit)
   if not commit_details then
-    if type(selected_commit.url) == "string" and selected_commit.url ~= "" and vim.ui and type(vim.ui.open) == "function" then
-      vim.ui.open(selected_commit.url)
+    if open_commit_url(selected_commit) then
       return
     end
     return notify_error(commit_err)
@@ -2863,11 +2980,76 @@ function M.open_commit_diff(commit)
 
   local _, open_err = virtual_files.open_commit_patch(details, pr, commit_details)
   if open_err then
-    if type(commit_details.url) == "string" and commit_details.url ~= "" and vim.ui and type(vim.ui.open) == "function" then
-      vim.ui.open(commit_details.url)
+    if open_commit_url(commit_details) then
       return
     end
     return notify_error(open_err)
+  end
+end
+
+function M.open_commit_file_diff(commit, file, opts)
+  opts = opts or {}
+  local pr, details, err = resolve_active_pr()
+  if not pr then
+    return notify_error(err)
+  end
+
+  local selected_commit = resolve_commit(commit)
+  if not selected_commit then
+    return notify_error("No commit selected")
+  end
+
+  local selected_file = normalize_commit_file_for_diff(file)
+  if not selected_file then
+    return notify_error("No commit file selected for diff")
+  end
+
+  local commit_details = selected_commit
+  if type(commit_details.parent_oid) ~= "string" or commit_details.parent_oid == "" then
+    local fetched_commit, fetch_err = fetch_commit_details_for_pr(pr, details, selected_commit)
+    if not fetched_commit then
+      if open_commit_url(selected_commit) then
+        return
+      end
+      return notify_error(fetch_err)
+    end
+    commit_details = fetched_commit
+  end
+
+  if type(commit_details.parent_oid) ~= "string" or commit_details.parent_oid == "" then
+    return notify_error("Selected commit has no parent commit to diff against")
+  end
+
+  local commit_diff_details = build_commit_diff_details(details, commit_details)
+  if type(commit_diff_details.baseRefName) ~= "string" or commit_diff_details.baseRefName == "" then
+    return notify_error("Unable to resolve base ref for selected commit diff")
+  end
+  if type(commit_diff_details.headRefName) ~= "string" or commit_diff_details.headRefName == "" then
+    return notify_error("Unable to resolve head ref for selected commit diff")
+  end
+
+  state.set_active_file(selected_file)
+  local diff_view = current_diff_view_preferences({
+    mode = opts.view_mode,
+    ignore_whitespace = opts.ignore_whitespace,
+    render_whitespace = opts.render_whitespace,
+  })
+
+  local diff_result, diff_err = virtual_files.open_diff(commit_diff_details, pr, selected_file, {
+    line_comments = nil,
+    view_mode = diff_view.mode,
+    ignore_whitespace = diff_view.ignore_whitespace,
+    render_whitespace = diff_view.render_whitespace,
+    new_tab = opts.new_tab,
+  })
+  if diff_err then
+    return notify_error(diff_err)
+  end
+
+  if type(diff_result) == "table" and diff_result.file_mode == "added_single" then
+    notify_info("File is new in selected commit. Opened single MODIFIED buffer (diff layouts disabled).")
+  elseif type(diff_result) == "table" and diff_result.file_mode == "removed_single" then
+    notify_info("File was removed in selected commit. Opened single ORIGINAL buffer (diff layouts disabled).")
   end
 end
 
