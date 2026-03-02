@@ -3,6 +3,8 @@ local M = {}
 local comment_composer = require("gh-pr.comment_composer")
 local comment_popup = require("gh-pr.comment_popup")
 local config = require("gh-pr.config")
+local diff_shortcuts_config = require("gh-pr.diff_shortcuts")
+local gh = require("gh-pr.gh")
 local image_metadata = require("gh-pr.image_metadata")
 local line_comments = require("gh-pr.line_comments")
 local multi_select = require("gh-pr.multi_select")
@@ -11,6 +13,7 @@ local pr_service = require("gh-pr.pr_service")
 local state = require("gh-pr.state")
 local thread_popup = require("gh-pr.thread_popup")
 local virtual_files = require("gh-pr.virtual_files")
+local uv = vim.uv or vim.loop
 
 local function normalize_repository(details)
   local repository = details.baseRepository or details.headRepository
@@ -78,6 +81,16 @@ end
 
 local function is_valid_win(winid)
   return type(winid) == "number" and winid > 0 and vim.api.nvim_win_is_valid(winid)
+end
+
+local function sanitize_modal_window(winid)
+  if not is_valid_win(winid) then
+    return
+  end
+
+  pcall(vim.api.nvim_set_option_value, "scrollbind", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "cursorbind", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "diff", false, { win = winid })
 end
 
 local function buffer_filetype(bufnr)
@@ -236,17 +249,8 @@ end
 
 local function diff_view_shortcuts()
   local diff_view = (config.get() or {}).diff_view or {}
-  local shortcuts = type(diff_view.shortcuts) == "table" and diff_view.shortcuts or {}
-  return {
-    toggle_whitespace = type(shortcuts.toggle_whitespace) == "string" and shortcuts.toggle_whitespace or ",dw",
-    toggle_render_whitespace = type(shortcuts.toggle_render_whitespace) == "string"
-        and shortcuts.toggle_render_whitespace
-      or ",dt",
-    cycle_mode = type(shortcuts.cycle_mode) == "string" and shortcuts.cycle_mode or ",dm",
-    set_vertical = type(shortcuts.set_vertical) == "string" and shortcuts.set_vertical or ",dv",
-    set_horizontal = type(shortcuts.set_horizontal) == "string" and shortcuts.set_horizontal or ",dh",
-    set_unified = type(shortcuts.set_unified) == "string" and shortcuts.set_unified or ",du",
-  }
+  local resolved = diff_shortcuts_config.resolve(diff_view.shortcuts)
+  return diff_shortcuts_config.expand_localleader(resolved)
 end
 
 local function current_diff_view_preferences(overrides)
@@ -256,11 +260,13 @@ local function current_diff_view_preferences(overrides)
     mode = normalize_diff_view_mode(config_defaults.mode),
     ignore_whitespace = config_defaults.ignore_whitespace == true,
     render_whitespace = config_defaults.render_whitespace ~= false,
+    render_endlines = config_defaults.render_endlines == true,
   }, type(persisted) == "table" and persisted or {})
 
   prefs.mode = normalize_diff_view_mode(prefs.mode)
   prefs.ignore_whitespace = prefs.ignore_whitespace == true
   prefs.render_whitespace = prefs.render_whitespace ~= false
+  prefs.render_endlines = prefs.render_endlines == true
 
   if type(overrides) == "table" then
     if overrides.mode ~= nil then
@@ -272,6 +278,9 @@ local function current_diff_view_preferences(overrides)
     if type(overrides.render_whitespace) == "boolean" then
       prefs.render_whitespace = overrides.render_whitespace
     end
+    if type(overrides.render_endlines) == "boolean" then
+      prefs.render_endlines = overrides.render_endlines
+    end
   end
 
   return prefs
@@ -282,6 +291,7 @@ local function persist_diff_view_preferences(prefs)
     mode = normalize_diff_view_mode(prefs and prefs.mode),
     ignore_whitespace = prefs and prefs.ignore_whitespace == true,
     render_whitespace = not (prefs and prefs.render_whitespace == false),
+    render_endlines = prefs and prefs.render_endlines == true,
   }
   if type(state.set_diff_view_prefs) == "function" then
     state.set_diff_view_prefs(sanitized)
@@ -869,14 +879,728 @@ local function ensure_open_target(target, label)
   if type(target) ~= "string" or target == "" then
     return false, string.format("Missing %s target", label)
   end
-  if not vim.ui or type(vim.ui.open) ~= "function" then
-    return false, "vim.ui.open is unavailable in this Neovim build"
+
+  local is_url = target:match("^https?://") ~= nil
+  local gh_err = nil
+  if is_url and type(pr_service.open_url_in_browser) == "function" then
+    local ok_gh, browser_err = pr_service.open_url_in_browser(target)
+    if ok_gh then
+      return true, nil
+    end
+    gh_err = browser_err
   end
-  local ok, open_err = pcall(vim.ui.open, target)
-  if not ok then
-    return false, tostring(open_err)
+
+  local ui_err = nil
+  if vim.ui and type(vim.ui.open) == "function" then
+    local ok, open_result, open_err = pcall(vim.ui.open, target)
+    if ok then
+      if open_result ~= false and not (open_result == nil and type(open_err) == "string" and open_err ~= "") then
+        return true, nil
+      end
+      ui_err = type(open_err) == "string" and open_err ~= "" and open_err or "vim.ui.open returned without opening target"
+    else
+      ui_err = tostring(open_result)
+    end
+  else
+    ui_err = "vim.ui.open is unavailable in this Neovim build"
   end
+
+  local is_windows = vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
+  local is_mac = vim.fn.has("mac") == 1 or vim.fn.has("macunix") == 1
+  local commands = {}
+  if is_windows then
+    local escaped_target = target:gsub('"', '""')
+    local quoted_target = '"' .. escaped_target .. '"'
+    commands = {
+      { "cmd.exe", "/c", "start", "", quoted_target },
+      { "rundll32", "url.dll,FileProtocolHandler", target },
+      { "explorer.exe", target },
+    }
+  elseif is_mac then
+    commands = {
+      { "open", target },
+    }
+  else
+    commands = {
+      { "xdg-open", target },
+    }
+  end
+
+  for _, command in ipairs(commands) do
+    local executable = command[1]
+    if type(executable) == "string" and executable ~= "" and vim.fn.executable(executable) == 1 then
+      local ok_job, jobid = pcall(vim.fn.jobstart, command, {
+        detach = true,
+      })
+      if ok_job and type(jobid) == "number" and jobid > 0 then
+        return true, nil
+      end
+    end
+  end
+
+  local errors = {}
+  if type(gh_err) == "string" and gh_err ~= "" then
+    errors[#errors + 1] = "gh browse failed: " .. gh_err
+  end
+  if type(ui_err) == "string" and ui_err ~= "" then
+    errors[#errors + 1] = "vim.ui.open failed: " .. ui_err
+  end
+  if vim.tbl_isempty(errors) then
+    return false, "Unable to open target using system opener"
+  end
+  return false, table.concat(errors, " | ")
+end
+
+local function joinpath(...)
+  if vim.fs and vim.fs.joinpath then
+    return vim.fs.joinpath(...)
+  end
+  local separator = package.config:sub(1, 1)
+  return table.concat({ ... }, separator)
+end
+
+local function url_decode(value)
+  if type(value) ~= "string" then
+    return ""
+  end
+  return (value:gsub("%%(%x%x)", function(hex)
+    return string.char(tonumber(hex, 16))
+  end))
+end
+
+local function sanitize_filename(value)
+  local name = type(value) == "string" and value or ""
+  name = url_decode(name)
+  name = name:gsub("[<>:\"/\\|%?%*]", "_")
+  name = name:gsub("[%c]", "_")
+  name = name:gsub("^%s+", "")
+  name = name:gsub("%s+$", "")
+  if name == "" then
+    name = "attachment"
+  end
+  if #name > 120 then
+    local ext = name:match("(%.[^.]+)$")
+    if type(ext) == "string" and ext ~= "" and #ext < 40 then
+      local head = name:sub(1, 120 - #ext)
+      name = head .. ext
+    else
+      name = name:sub(1, 120)
+    end
+  end
+  return name
+end
+
+local function extension_from_name(name)
+  local ext = type(name) == "string" and name:match("%.([^.]+)$") or nil
+  if type(ext) ~= "string" then
+    return ""
+  end
+  return ext:lower()
+end
+
+local function filename_from_url(url)
+  if type(url) ~= "string" then
+    return ""
+  end
+  local path = url:match("^https?://[^/]+(/[^?#]*)") or ""
+  local name = path:match("([^/]+)$") or ""
+  return sanitize_filename(name)
+end
+
+local function list_to_set(list)
+  local set = {}
+  for _, value in ipairs(type(list) == "table" and list or {}) do
+    if type(value) == "string" and value ~= "" then
+      set[value] = true
+    end
+  end
+  return set
+end
+
+local function normalize_extension_list(values, fallback)
+  local source = type(values) == "table" and values or fallback
+  local normalized = {}
+  local seen = {}
+  for _, value in ipairs(source) do
+    if type(value) == "string" and value ~= "" then
+      local ext = value:lower():gsub("^%.+", "")
+      if ext ~= "" and not seen[ext] then
+        seen[ext] = true
+        normalized[#normalized + 1] = ext
+      end
+    end
+  end
+  if vim.tbl_isempty(normalized) then
+    return vim.deepcopy(fallback)
+  end
+  return normalized
+end
+
+local function overview_markdown_link_preview_options()
+  local markdown = (((config.get() or {}).overview or {}).markdown or {})
+  local renderable = normalize_extension_list(
+    markdown.link_preview_renderable_extensions,
+    { "txt", "md", "markdown", "json", "yaml", "yml", "csv", "log" }
+  )
+  local disallowed = normalize_extension_list(markdown.link_preview_disallowed_extensions, { "zip" })
+
+  local max_bytes = positive_integer(markdown.link_preview_max_bytes, 10485760)
+  if max_bytes < 1024 then
+    max_bytes = 10485760
+  end
+
+  return {
+    keymap = type(markdown.link_preview_keymap) == "string" and markdown.link_preview_keymap or "gp",
+    max_bytes = max_bytes,
+    open_local = markdown.link_preview_open_local == "system" and "system" or "system",
+    renderable_extensions = renderable,
+    disallowed_extensions = disallowed,
+    renderable_set = list_to_set(renderable),
+    disallowed_set = list_to_set(disallowed),
+  }
+end
+
+local function build_overview_link_temp_path(filename)
+  local root = joinpath(vim.fn.stdpath("cache"), "gh-pr", "overview-links")
+  local created = vim.fn.mkdir(root, "p")
+  if created == 0 and vim.fn.isdirectory(root) ~= 1 then
+    return nil, "Unable to prepare overview link preview cache directory"
+  end
+
+  local suffix = string.format("%d-%d", os.time(), math.floor((uv.hrtime and uv.hrtime() or 0) % 100000))
+  return joinpath(root, suffix .. "-" .. sanitize_filename(filename)), nil
+end
+
+local function read_file_bytes(path)
+  local fd, open_err = uv.fs_open(path, "r", 438)
+  if not fd then
+    return nil, tostring(open_err or "Unable to open downloaded file")
+  end
+
+  local stat, stat_err = uv.fs_fstat(fd)
+  if not stat then
+    uv.fs_close(fd)
+    return nil, tostring(stat_err or "Unable to inspect downloaded file")
+  end
+
+  local size = tonumber(stat.size) or 0
+  local data = size > 0 and uv.fs_read(fd, size, 0) or ""
+  uv.fs_close(fd)
+  if type(data) ~= "string" then
+    return nil, "Unable to read downloaded file bytes"
+  end
+
+  return data, nil
+end
+
+local function is_probably_binary(content)
+  if type(content) ~= "string" or content == "" then
+    return false
+  end
+  if content:find("\0", 1, true) then
+    return true
+  end
+
+  local sample = content:sub(1, 4096)
+  local invalid = 0
+  for index = 1, #sample do
+    local byte = sample:byte(index)
+    if byte < 9 or (byte > 13 and byte < 32) then
+      invalid = invalid + 1
+    end
+  end
+
+  return invalid > 0 and (invalid / #sample) > 0.12
+end
+
+local function filetype_for_extension(ext)
+  if ext == "md" or ext == "markdown" then
+    return "markdown"
+  end
+  if ext == "json" then
+    return "json"
+  end
+  if ext == "yaml" or ext == "yml" then
+    return "yaml"
+  end
+  if ext == "csv" then
+    return "csv"
+  end
+  if ext == "log" or ext == "txt" then
+    return "text"
+  end
+  return "text"
+end
+
+local function looks_like_json(content)
+  if type(content) ~= "string" then
+    return false
+  end
+  local trimmed = vim.trim(content)
+  if trimmed == "" then
+    return false
+  end
+
+  local first = trimmed:sub(1, 1)
+  local last = trimmed:sub(-1)
+  if not ((first == "{" and last == "}") or (first == "[" and last == "]")) then
+    return false
+  end
+
+  local ok, _ = pcall(vim.json.decode, trimmed)
+  return ok
+end
+
+local function detect_preview_filetype(filename, content)
+  if vim.filetype and type(vim.filetype.match) == "function" then
+    local ok, detected = pcall(vim.filetype.match, {
+      filename = filename,
+    })
+    if ok and type(detected) == "string" and detected ~= "" then
+      return detected
+    end
+  end
+
+  local ext = extension_from_name(filename)
+  local fallback = filetype_for_extension(ext)
+  if fallback == "text" and looks_like_json(content) then
+    return "json"
+  end
+  return fallback
+end
+
+local function open_overview_link_preview_window(opts)
+  local filename = sanitize_filename(type(opts.filename) == "string" and opts.filename or "attachment")
+  local content = type(opts.content) == "string" and opts.content or ""
+  content = content:gsub("\r\n", "\n"):gsub("\r", "\n")
+  local preview_filetype = detect_preview_filetype(filename, content)
+  local lines = vim.split(content, "\n", { plain = true })
+  if vim.tbl_isempty(lines) then
+    lines = { "" }
+  end
+
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  local name = string.format("ghpr://overview/link-preview/%d/%s", tonumber(os.time()) or 0, filename)
+  pcall(vim.api.nvim_buf_set_name, bufnr, name)
+  vim.api.nvim_set_option_value("buftype", "nofile", { buf = bufnr })
+  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = bufnr })
+  vim.api.nvim_set_option_value("swapfile", false, { buf = bufnr })
+  vim.api.nvim_set_option_value("modifiable", true, { buf = bufnr })
+  vim.api.nvim_set_option_value("readonly", false, { buf = bufnr })
+  vim.bo[bufnr].filetype = preview_filetype
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  vim.api.nvim_set_option_value("modifiable", false, { buf = bufnr })
+  vim.api.nvim_set_option_value("readonly", true, { buf = bufnr })
+
+  local max_width = math.max(20, vim.o.columns - 2)
+  local max_height = math.max(6, vim.o.lines - vim.o.cmdheight - 2)
+  local width = math.min(math.max(60, vim.o.columns - 4), max_width)
+  local height = math.min(math.max(10, vim.o.lines - vim.o.cmdheight - 4), max_height)
+  local row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1)
+  local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+
+  local ok_win, winid = pcall(vim.api.nvim_open_win, bufnr, true, {
+    relative = "editor",
+    row = row,
+    col = col,
+    width = width,
+    height = height,
+    style = "minimal",
+    border = "rounded",
+    title = "PR Link Preview",
+    title_pos = "center",
+    noautocmd = true,
+  })
+  if not ok_win or not is_valid_win(winid) then
+    return false, "Unable to open preview window"
+  end
+
+  sanitize_modal_window(winid)
+  vim.api.nvim_set_option_value("number", true, { win = winid })
+  vim.api.nvim_set_option_value("relativenumber", false, { win = winid })
+  vim.api.nvim_set_option_value("signcolumn", "no", { win = winid })
+  vim.api.nvim_set_option_value("wrap", true, { win = winid })
+  vim.api.nvim_set_option_value("linebreak", true, { win = winid })
+  vim.api.nvim_set_option_value("cursorline", true, { win = winid })
+  if type(preview_filetype) == "string" and preview_filetype ~= "" and preview_filetype ~= "text" then
+    pcall(vim.api.nvim_set_option_value, "syntax", preview_filetype, { win = winid })
+  end
+
+  local key_opts = { buffer = bufnr, silent = true, nowait = true }
+  vim.keymap.set("n", "q", function()
+    if is_valid_win(winid) then
+      pcall(vim.api.nvim_win_close, winid, true)
+    end
+  end, vim.tbl_extend("force", key_opts, { desc = "Close PR link preview" }))
+  vim.keymap.set("n", "<Esc>", function()
+    if is_valid_win(winid) then
+      pcall(vim.api.nvim_win_close, winid, true)
+    end
+  end, vim.tbl_extend("force", key_opts, { desc = "Close PR link preview" }))
+
   return true, nil
+end
+
+local function select_open_local(prompt, callback, confirm_item)
+  local function normalize_confirm_label(value)
+    if type(value) ~= "string" then
+      return ""
+    end
+    return vim.trim(value):lower()
+  end
+
+  local function did_confirm_select_choice(choice, confirm_label)
+    local normalized_confirm = normalize_confirm_label(confirm_label)
+    if normalized_confirm == "" then
+      return false
+    end
+
+    if type(choice) == "string" then
+      return normalize_confirm_label(choice) == normalized_confirm
+    end
+
+    if type(choice) == "number" then
+      return choice == 1
+    end
+
+    if type(choice) == "table" then
+      local candidate_keys = { "value", "text", "label", "name", "id", 1 }
+      for _, key in ipairs(candidate_keys) do
+        local value = choice[key]
+        if type(value) == "string" and normalize_confirm_label(value) == normalized_confirm then
+          return true
+        end
+      end
+
+      local index = tonumber(choice.idx) or tonumber(choice.index)
+      if index == 1 then
+        return true
+      end
+    end
+
+    return false
+  end
+
+  callback = callback or function() end
+  local confirm_label = type(confirm_item) == "string" and confirm_item ~= "" and confirm_item or "open local"
+  if vim.ui and type(vim.ui.select) == "function" then
+    vim.ui.select({ confirm_label, "cancel" }, {
+      prompt = prompt,
+      format_item = function(item)
+        return item
+      end,
+    }, function(choice)
+      vim.schedule(function()
+        callback(did_confirm_select_choice(choice, confirm_label))
+      end)
+    end)
+    return
+  end
+
+  local choice = vim.fn.confirm(prompt, "&" .. confirm_label .. "\n&Cancel", 2)
+  callback(choice == 1)
+end
+
+local gh_auth_token_cache = {
+  attempted = false,
+  token = nil,
+}
+
+local function url_host(url)
+  if type(url) ~= "string" then
+    return ""
+  end
+  local host = url:match("^https?://([^/%?#]+)") or ""
+  return host:lower()
+end
+
+local function is_github_attachment_url(url)
+  local host = url_host(url)
+  local path = type(url) == "string" and (url:match("^https?://[^/]+(/[^?#]*)") or "") or ""
+
+  if host == "github.com" then
+    return path:match("^/user%-attachments/files/") ~= nil
+      or path:match("^/user%-attachments/assets/") ~= nil
+  end
+
+  if host == "objects.githubusercontent.com" then
+    return true
+  end
+
+  if host == "user-images.githubusercontent.com" or host == "private-user-images.githubusercontent.com" then
+    return true
+  end
+
+  if host:match("%.githubusercontent%.com$") ~= nil then
+    return path:match("/user%-attachments/") ~= nil
+      or path:match("github%-production%-user%-asset") ~= nil
+      or path:match("github%-production%-release%-asset") ~= nil
+  end
+
+  return false
+end
+
+local function resolve_gh_auth_token()
+  if gh_auth_token_cache.attempted then
+    return gh_auth_token_cache.token
+  end
+
+  gh_auth_token_cache.attempted = true
+  local output, err = gh.run_command({ "gh", "auth", "token" })
+  if not output then
+    notify_warn("Unable to resolve gh auth token for link download: " .. tostring(err))
+    gh_auth_token_cache.token = nil
+    return nil
+  end
+
+  local token = vim.trim(output)
+  if token == "" then
+    gh_auth_token_cache.token = nil
+    return nil
+  end
+
+  gh_auth_token_cache.token = token
+  return token
+end
+
+local function downloader_command(url, output_path)
+  local auth_token = nil
+  if is_github_attachment_url(url) then
+    auth_token = resolve_gh_auth_token()
+  end
+
+  if vim.fn.executable("curl") == 1 then
+    local command = {
+      "curl",
+      "-L",
+      "--fail",
+      "--silent",
+      "--show-error",
+    }
+    if type(auth_token) == "string" and auth_token ~= "" then
+      command[#command + 1] = "--header"
+      command[#command + 1] = "Authorization: Bearer " .. auth_token
+      command[#command + 1] = "--header"
+      command[#command + 1] = "Accept: application/octet-stream"
+    end
+    command[#command + 1] = "--output"
+    command[#command + 1] = output_path
+    command[#command + 1] = url
+    return command, nil
+  end
+
+  if vim.fn.executable("wget") == 1 then
+    local command = { "wget", "-q" }
+    if type(auth_token) == "string" and auth_token ~= "" then
+      command[#command + 1] = "--header=Authorization: Bearer " .. auth_token
+      command[#command + 1] = "--header=Accept: application/octet-stream"
+    end
+    command[#command + 1] = "-O"
+    command[#command + 1] = output_path
+    command[#command + 1] = url
+    return command, nil
+  end
+
+  local is_windows = vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
+  if is_windows and vim.fn.executable("pwsh") == 1 then
+    return {
+      "pwsh",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$ProgressPreference='SilentlyContinue'; "
+          .. "$headers=@{}; "
+          .. "if ($args.Count -ge 3 -and $args[2] -ne '') { "
+          .. "$headers['Authorization']='Bearer ' + $args[2]; "
+          .. "$headers['Accept']='application/octet-stream' "
+          .. "}; "
+          .. "Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri $args[0] -OutFile $args[1]",
+      url,
+      output_path,
+      type(auth_token) == "string" and auth_token or "",
+    }, nil
+  end
+  if is_windows and vim.fn.executable("powershell") == 1 then
+    return {
+      "powershell",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$ProgressPreference='SilentlyContinue'; "
+          .. "$headers=@{}; "
+          .. "if ($args.Count -ge 3 -and $args[2] -ne '') { "
+          .. "$headers['Authorization']='Bearer ' + $args[2]; "
+          .. "$headers['Accept']='application/octet-stream' "
+          .. "}; "
+          .. "Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri $args[0] -OutFile $args[1]",
+      url,
+      output_path,
+      type(auth_token) == "string" and auth_token or "",
+    }, nil
+  end
+
+  return nil, "No supported downloader found (curl/wget/powershell)"
+end
+
+local function download_link_to_path_async(url, output_path, callback)
+  callback = callback or function() end
+  local command, cmd_err = downloader_command(url, output_path)
+  if not command then
+    callback(nil, cmd_err)
+    return
+  end
+
+  gh.run_command_async(command, nil, function(_, run_err)
+    if run_err then
+      callback(nil, run_err)
+      return
+    end
+
+    if vim.fn.filereadable(output_path) ~= 1 then
+      callback(nil, "Downloaded file is unavailable on disk")
+      return
+    end
+
+    callback(output_path, nil)
+  end)
+end
+
+local function prompt_open_downloaded_file(path, filename, reason)
+  local prompt = string.format(
+    "Preview unavailable for '%s' (%s). Open downloaded file locally?",
+    filename,
+    reason
+  )
+  select_open_local(prompt, function(should_open)
+    if not should_open then
+      return
+    end
+    local ok_open, open_err = ensure_open_target(path, "downloaded file")
+    if not ok_open then
+      notify_error("Unable to open downloaded file: " .. tostring(open_err))
+    end
+  end)
+end
+
+local function prompt_download_and_open_local(url, filename, reason)
+  local prompt = string.format(
+    "Cannot preview '%s' (%s). Download and open locally?",
+    filename,
+    reason
+  )
+  select_open_local(prompt, function(should_open)
+    if not should_open then
+      return
+    end
+
+    local target_path, target_err = build_overview_link_temp_path(filename)
+    if not target_path then
+      notify_error(target_err)
+      return
+    end
+
+    notify_info("Downloading link attachment to open locally...")
+    download_link_to_path_async(url, target_path, function(downloaded_path, download_err)
+      if not downloaded_path then
+        notify_error("Unable to download link: " .. tostring(download_err))
+        return
+      end
+      local ok_open, open_err = ensure_open_target(downloaded_path, "downloaded file")
+      if not ok_open then
+        notify_error("Unable to open downloaded file: " .. tostring(open_err))
+      end
+    end)
+  end)
+end
+
+function M.overview_preview_markdown_link(action)
+  local url = type(action) == "table" and type(action.url) == "string" and vim.trim(action.url) or ""
+  if url == "" then
+    return notify_error("Missing markdown link URL")
+  end
+  if not url:match("^https?://") then
+    return notify_warn("Only http/https links can be previewed")
+  end
+  if not is_github_attachment_url(url) then
+    local prompt = string.format(
+      "This markdown link is not a GitHub attachment.\nOpen in browser?\n%s",
+      url
+    )
+    select_open_local(prompt, function(should_open)
+      if not should_open then
+        return
+      end
+
+      local ok_open, open_err = ensure_open_target(url, "URL")
+      if not ok_open then
+        notify_error("Unable to open URL: " .. tostring(open_err))
+      end
+    end, "open link")
+    return
+  end
+
+  local options = overview_markdown_link_preview_options()
+  local action_label = type(action) == "table" and type(action.label) == "string" and action.label or ""
+  local filename = filename_from_url(url)
+  if filename == "" and action_label ~= "" then
+    filename = sanitize_filename(action_label)
+  end
+  if filename == "" then
+    filename = "attachment"
+  end
+
+  local extension = extension_from_name(filename)
+  if extension ~= "" and options.disallowed_set[extension] then
+    prompt_download_and_open_local(url, filename, "extension ." .. extension .. " is not previewable")
+    return
+  end
+  if extension ~= "" and not options.renderable_set[extension] then
+    prompt_download_and_open_local(url, filename, "extension ." .. extension .. " is not configured as renderable")
+    return
+  end
+
+  local target_path, target_err = build_overview_link_temp_path(filename)
+  if not target_path then
+    return notify_error(target_err)
+  end
+
+  notify_info("Downloading GitHub attachment for preview...")
+  download_link_to_path_async(url, target_path, function(downloaded_path, download_err)
+    if not downloaded_path then
+      notify_error("Unable to download link: " .. tostring(download_err))
+      return
+    end
+
+    local stat = uv.fs_stat(downloaded_path)
+    local size = tonumber(stat and stat.size) or 0
+    if size > options.max_bytes then
+      prompt_open_downloaded_file(
+        downloaded_path,
+        filename,
+        string.format("file exceeds preview limit (%d > %d bytes)", size, options.max_bytes)
+      )
+      return
+    end
+
+    local bytes, read_err = read_file_bytes(downloaded_path)
+    if not bytes then
+      notify_error("Unable to inspect downloaded file: " .. tostring(read_err))
+      return
+    end
+
+    if is_probably_binary(bytes) then
+      prompt_open_downloaded_file(downloaded_path, filename, "binary content is not renderable")
+      return
+    end
+
+    local ok_preview, preview_err = open_overview_link_preview_window({
+      filename = filename,
+      content = bytes,
+    })
+    if not ok_preview then
+      notify_error("Unable to render link preview: " .. tostring(preview_err))
+    end
+  end)
 end
 
 local function resolve_image_compare_url(ctx, images_cfg)
@@ -999,10 +1723,13 @@ local function render_image_metadata_diff(bufnr, reason_override)
   end
 
   local images_cfg = image_diff_options()
+  local diff_shortcuts = diff_view_shortcuts()
   local default_action = resolve_image_default_action(images_cfg)
   local compare_url = resolve_image_compare_url(ctx, images_cfg)
   local reason = type(reason_override) == "string" and reason_override ~= "" and reason_override or ctx.reason
-  local fallback_key = type(images_cfg.fallback_menu_keymap) == "string" and images_cfg.fallback_menu_keymap or "gf"
+  local default_key = type(diff_shortcuts.image_default_action) == "string" and diff_shortcuts.image_default_action or "<localleader>io"
+  local fallback_key = type(diff_shortcuts.image_fallback_menu) == "string" and diff_shortcuts.image_fallback_menu
+    or "<localleader>im"
   local base_meta = collect_image_metadata_for_side(ctx, "base", images_cfg)
   local head_meta = collect_image_metadata_for_side(ctx, "head", images_cfg)
   local display_path = ctx.file_path ~= "" and ctx.file_path or ctx.path
@@ -1012,8 +1739,8 @@ local function render_image_metadata_diff(bufnr, reason_override)
     "",
     string.format("path: %s", display_path ~= "" and display_path or "(unknown)"),
     string.format("status: %s", ctx.status ~= "" and ctx.status or "unknown"),
-    string.format("default action (<CR>): %s", image_action_label(default_action)),
-    string.format("fallback menu (%s): image actions", fallback_key ~= "" and fallback_key or "gf"),
+    string.format("default action (%s): %s", default_key ~= "" and default_key or "<localleader>io", image_action_label(default_action)),
+    string.format("fallback menu (%s): image actions", fallback_key ~= "" and fallback_key or "<localleader>im"),
   }
   if reason ~= "" then
     lines[#lines + 1] = string.format("render fallback reason: %s", reason)
@@ -1026,7 +1753,11 @@ local function render_image_metadata_diff(bufnr, reason_override)
   append_side_metadata_lines(lines, "-", "base", base_meta)
   append_side_metadata_lines(lines, "+", "head", head_meta)
   lines[#lines + 1] = ""
-  lines[#lines + 1] = "Tip: use <CR> for default action or open fallback menu for other actions."
+  lines[#lines + 1] = string.format(
+    "Tip: use %s for default action or %s for fallback menu actions.",
+    default_key ~= "" and default_key or "<localleader>io",
+    fallback_key ~= "" and fallback_key or "<localleader>im"
+  )
 
   image_renderer.clear(bufnr)
   local ok_write, write_err = write_readonly_buffer_lines(bufnr, lines, "diff")
@@ -1195,8 +1926,11 @@ function M.open_image_fallback_menu()
   close_image_fallback_menu()
 
   local images_cfg = image_diff_options()
+  local diff_shortcuts = diff_view_shortcuts()
   local default_action = resolve_image_default_action(images_cfg)
-  local fallback_key = type(images_cfg.fallback_menu_keymap) == "string" and images_cfg.fallback_menu_keymap or "gf"
+  local default_key = type(diff_shortcuts.image_default_action) == "string" and diff_shortcuts.image_default_action or "<localleader>io"
+  local fallback_key = type(diff_shortcuts.image_fallback_menu) == "string" and diff_shortcuts.image_fallback_menu
+    or "<localleader>im"
   local reason = type(vim.b[origin_bufnr].gh_pr_image_reason) == "string" and vim.b[origin_bufnr].gh_pr_image_reason or ""
 
   local lines = {
@@ -1205,8 +1939,8 @@ function M.open_image_fallback_menu()
     string.rep("=", 74),
     string.format("file: %s", ctx.file_path ~= "" and ctx.file_path or ctx.path),
     string.format("status: %s", ctx.status ~= "" and ctx.status or "unknown"),
-    string.format("default (<CR>): %s", image_action_label(default_action)),
-    string.format("menu keymap: %s", fallback_key ~= "" and fallback_key or "gf"),
+    string.format("default (%s): %s", default_key ~= "" and default_key or "<localleader>io", image_action_label(default_action)),
+    string.format("menu keymap: %s", fallback_key ~= "" and fallback_key or "<localleader>im"),
   }
   if reason ~= "" then
     lines[#lines + 1] = "reason: " .. reason
@@ -1243,6 +1977,7 @@ function M.open_image_fallback_menu()
     noautocmd = true,
   })
 
+  sanitize_modal_window(menu_win)
   vim.api.nvim_buf_set_option(menu_buf, "buftype", "nofile")
   vim.api.nvim_buf_set_option(menu_buf, "bufhidden", "wipe")
   vim.api.nvim_buf_set_option(menu_buf, "swapfile", false)
@@ -1395,14 +2130,18 @@ function M.on_image_render_fallback(bufnr, reason)
     return
   end
 
+  local diff_shortcuts = diff_view_shortcuts()
   local default_action = resolve_image_default_action(images_cfg)
-  local fallback_key = type(images_cfg.fallback_menu_keymap) == "string" and images_cfg.fallback_menu_keymap or "gf"
+  local default_key = type(diff_shortcuts.image_default_action) == "string" and diff_shortcuts.image_default_action or "<localleader>io"
+  local fallback_key = type(diff_shortcuts.image_fallback_menu) == "string" and diff_shortcuts.image_fallback_menu
+    or "<localleader>im"
   if vim.api.nvim_get_current_buf() == bufnr then
     notify_warn(string.format(
-      "Image render fallback: %s. Press <CR> for '%s' or %s for the fallback menu.",
+      "Image render fallback: %s. Press %s for '%s' or %s for the fallback menu.",
       type(reason) == "string" and reason ~= "" and reason or "preview unavailable",
+      default_key ~= "" and default_key or "<localleader>io",
       default_action,
-      fallback_key ~= "" and fallback_key or "gf"
+      fallback_key ~= "" and fallback_key or "<localleader>im"
     ))
     M.open_image_fallback_menu()
   end
@@ -1843,6 +2582,9 @@ local function build_overview_callbacks(pr_number)
     end,
     open_file_modified = function(file)
       M.open_modified(file)
+    end,
+    preview_markdown_link = function(action)
+      M.overview_preview_markdown_link(action)
     end,
     toggle_review_tree = function()
       M.toggle_review_tree()
@@ -3033,6 +3775,7 @@ function M.open_commit_file_diff(commit, file, opts)
     mode = opts.view_mode,
     ignore_whitespace = opts.ignore_whitespace,
     render_whitespace = opts.render_whitespace,
+    render_endlines = opts.render_endlines,
   })
 
   local diff_result, diff_err = virtual_files.open_diff(commit_diff_details, pr, selected_file, {
@@ -3040,6 +3783,7 @@ function M.open_commit_file_diff(commit, file, opts)
     view_mode = diff_view.mode,
     ignore_whitespace = diff_view.ignore_whitespace,
     render_whitespace = diff_view.render_whitespace,
+    render_endlines = diff_view.render_endlines,
     new_tab = opts.new_tab,
   })
   if diff_err then
@@ -3071,6 +3815,7 @@ function M.open_diff(file, opts)
     mode = opts.view_mode,
     ignore_whitespace = opts.ignore_whitespace,
     render_whitespace = opts.render_whitespace,
+    render_endlines = opts.render_endlines,
   })
 
   local diff_result, diff_err = virtual_files.open_diff(details, pr, selected_file, {
@@ -3078,6 +3823,7 @@ function M.open_diff(file, opts)
     view_mode = diff_view.mode,
     ignore_whitespace = diff_view.ignore_whitespace,
     render_whitespace = diff_view.render_whitespace,
+    render_endlines = diff_view.render_endlines,
     new_tab = opts.new_tab,
   })
   if diff_err then
@@ -3167,6 +3913,7 @@ local function reopen_current_diff_with_preferences_impl(opts)
     mode = opts.view_mode,
     ignore_whitespace = opts.ignore_whitespace,
     render_whitespace = opts.render_whitespace,
+    render_endlines = opts.render_endlines,
   })
 
   local _, open_err = virtual_files.open_diff(details, pr, selected_file, {
@@ -3174,6 +3921,7 @@ local function reopen_current_diff_with_preferences_impl(opts)
     view_mode = diff_view.mode,
     ignore_whitespace = diff_view.ignore_whitespace,
     render_whitespace = diff_view.render_whitespace,
+    render_endlines = diff_view.render_endlines,
     new_tab = opts.new_tab,
   })
   if open_err then
@@ -3245,6 +3993,8 @@ end
 local find_diff_pair_windows_for_current_file
 local close_current_diff_view
 local open_review_tree_after_close
+local close_window_if_valid
+local delete_buffer_if_valid
 
 function M.close_quick()
   local kind = vim.b.gh_pr_file_kind
@@ -3354,7 +4104,7 @@ find_diff_pair_windows_for_current_file = function()
   return base_win, head_win
 end
 
-local function close_window_if_valid(winid)
+close_window_if_valid = function(winid)
   if not valid_window(winid) then
     return false
   end
@@ -3362,7 +4112,7 @@ local function close_window_if_valid(winid)
   return pcall(vim.api.nvim_win_close, winid, true)
 end
 
-local function delete_buffer_if_valid(bufnr)
+delete_buffer_if_valid = function(bufnr)
   if not is_valid_buf(bufnr) then
     return false
   end
@@ -3453,6 +4203,7 @@ local function open_file_for_navigation(file)
     view_mode = diff_view.mode,
     ignore_whitespace = diff_view.ignore_whitespace,
     render_whitespace = diff_view.render_whitespace,
+    render_endlines = diff_view.render_endlines,
   })
 end
 
@@ -3753,6 +4504,99 @@ function M.start_review(number)
 
   local current_pr = state.get_active_review(repository)
 
+  local function extract_login(entity)
+    if type(entity) == "string" and entity ~= "" then
+      return entity
+    end
+
+    if type(entity) ~= "table" then
+      return nil
+    end
+
+    if type(entity.login) == "string" and entity.login ~= "" then
+      return entity.login
+    end
+
+    if type(entity.author) == "table" and type(entity.author.login) == "string" and entity.author.login ~= "" then
+      return entity.author.login
+    end
+
+    if type(entity.requestedReviewer) == "table"
+      and type(entity.requestedReviewer.login) == "string"
+      and entity.requestedReviewer.login ~= "" then
+      return entity.requestedReviewer.login
+    end
+
+    if type(entity.user) == "table" and type(entity.user.login) == "string" and entity.user.login ~= "" then
+      return entity.user.login
+    end
+
+    return nil
+  end
+
+  local function active_review_matches_pr()
+    local current_number = tonumber(type(current_pr) == "table" and current_pr.number or nil)
+    local target_number = tonumber(type(pr) == "table" and pr.number or nil)
+    return current_number ~= nil and target_number ~= nil and current_number == target_number
+  end
+
+  local function resolve_pr_author_login()
+    local author_login = extract_login(type(details) == "table" and details.author or nil)
+    if author_login then
+      return author_login
+    end
+    return extract_login(type(pr) == "table" and pr.author or nil)
+  end
+
+  local function is_user_requested_reviewer(login)
+    if type(login) ~= "string" or login == "" then
+      return false
+    end
+
+    for _, reviewer in ipairs(type(details) == "table" and type(details.reviewRequests) == "table" and details.reviewRequests or {}) do
+      if extract_login(reviewer) == login then
+        return true
+      end
+    end
+
+    return false
+  end
+
+  local function should_prompt_start_review()
+    if active_review_matches_pr() then
+      return false, nil
+    end
+
+    if type(pr_service.get_current_user_login) ~= "function" then
+      return true, "Unable to verify current GitHub user. Showing confirmation dialog."
+    end
+
+    local login, login_err = pr_service.get_current_user_login()
+    if type(login) ~= "string" or login == "" then
+      return true, "Unable to resolve current GitHub user (" .. tostring(login_err) .. "). Showing confirmation dialog."
+    end
+
+    local author_login = resolve_pr_author_login()
+    if type(author_login) == "string" and author_login ~= "" and author_login == login then
+      return false, nil
+    end
+
+    if not is_user_requested_reviewer(login) then
+      return false, nil
+    end
+
+    local pending_review, pending_err = pr_service.find_pending_review(pr.number)
+    if pending_err then
+      return true, "Unable to verify pending review (" .. tostring(pending_err) .. "). Showing confirmation dialog."
+    end
+
+    if type(pending_review) == "table" and type(pending_review.id) == "string" and pending_review.id ~= "" then
+      return false, nil
+    end
+
+    return true, nil
+  end
+
   local function finalize_start()
     local stored, store_err = M.set_active_review(pr, details)
     if not stored then
@@ -3790,6 +4634,20 @@ function M.start_review(number)
     end)
   end
 
+  local function continue_start_flow()
+    local should_prompt, warning_message = should_prompt_start_review()
+    if warning_message then
+      notify_warn(warning_message)
+    end
+
+    if should_prompt then
+      prompt_remote_review()
+      return
+    end
+
+    finalize_start()
+  end
+
   if current_pr and tonumber(current_pr.number) and tonumber(current_pr.number) ~= tonumber(pr.number) then
     vim.ui.select({ "replace", "cancel" }, {
       prompt = string.format(
@@ -3803,12 +4661,12 @@ function M.start_review(number)
         notify_info("Start review cancelled")
         return
       end
-      prompt_remote_review()
+      continue_start_flow()
     end)
     return
   end
 
-  prompt_remote_review()
+  continue_start_flow()
 end
 
 local function add_unique_path(target, seen, path)
@@ -4223,7 +5081,8 @@ local function summarize_review_body(body)
   return first_line
 end
 
-local function confirm_inline_comment(pr_number, path, start_line, line, body, callback)
+local function confirm_inline_comment(pr_number, path, start_line, line, body, callback, opts)
+  opts = type(opts) == "table" and opts or {}
   local location
   if start_line then
     location = string.format("%s:%d-%d", path, start_line, line)
@@ -4231,8 +5090,14 @@ local function confirm_inline_comment(pr_number, path, start_line, line, body, c
     location = string.format("%s:%d", path, line)
   end
 
+  local action_label = type(opts.action_label) == "string" and vim.trim(opts.action_label) or ""
+  if action_label == "" then
+    action_label = "Create inline comment"
+  end
+
   local prompt = string.format(
-    "Create inline comment on PR #%d at %s? Message: %s",
+    "%s on PR #%d at %s? Message: %s",
+    action_label,
     pr_number,
     location,
     summarize_review_body(body)
@@ -4245,38 +5110,44 @@ local function confirm_inline_comment(pr_number, path, start_line, line, body, c
   end)
 end
 
-function M.add_inline_comment(opts)
+function M._open_inline_comment_composer(pr, details, target, opts)
   opts = type(opts) == "table" and opts or {}
-
-  local pr, details, err = resolve_active_pr()
-  if not pr then
-    return notify_error(err)
-  end
-
-  local selected_file = resolve_file(opts.file)
-  local target, target_err = resolve_inline_comment_target(pr, details, selected_file, opts)
-  if not target then
-    return notify_error(target_err)
-  end
+  local title = type(opts.title) == "string" and opts.title ~= ""
+      and opts.title
+    or string.format("PR #%d inline comment", pr.number)
+  local initial_lines = type(opts.initial_lines) == "table" and opts.initial_lines or { "" }
+  local cancel_message = type(opts.cancel_message) == "string" and opts.cancel_message ~= ""
+      and opts.cancel_message
+    or "Inline comment cancelled"
+  local empty_cancel_message = type(opts.empty_cancel_message) == "string" and opts.empty_cancel_message ~= ""
+      and opts.empty_cancel_message
+    or "Inline comment cancelled (empty message)"
+  local success_message = type(opts.success_message) == "string" and opts.success_message ~= ""
+      and opts.success_message
+    or string.format("Inline comment added to pending review on %s", target.path)
+  local confirm_action_label = type(opts.confirm_action_label) == "string" and opts.confirm_action_label ~= ""
+      and opts.confirm_action_label
+    or "Create inline comment"
+  local composer_filetype = type(opts.filetype) == "string" and opts.filetype ~= "" and opts.filetype or "markdown"
 
   comment_composer.open({
-    title = string.format("PR #%d inline comment", pr.number),
-    filetype = "markdown",
+    title = title,
+    filetype = composer_filetype,
     border = "rounded",
-    initial_lines = { "" },
+    initial_lines = initial_lines,
     enter = true,
     on_cancel = function()
-      notify_info("Inline comment cancelled")
+      notify_info(cancel_message)
     end,
     on_submit = function(text)
       if vim.trim(text) == "" then
-        notify_info("Inline comment cancelled (empty message)")
+        notify_info(empty_cancel_message)
         return
       end
 
       confirm_inline_comment(pr.number, target.path, target.start_line, target.line, text, function(confirmed)
         if not confirmed then
-          notify_info("Inline comment cancelled")
+          notify_info(cancel_message)
           return
         end
 
@@ -4293,10 +5164,31 @@ function M.add_inline_comment(opts)
           return
         end
 
-        notify_info(string.format("Inline comment added to pending review on %s", target.path))
+        notify_info(success_message)
         refresh_line_comments_for_pr(pr.number, details)
-      end)
+      end, {
+        action_label = confirm_action_label,
+      })
     end,
+  })
+end
+
+function M.add_inline_comment(opts)
+  opts = type(opts) == "table" and opts or {}
+
+  local pr, details, err = resolve_active_pr()
+  if not pr then
+    return notify_error(err)
+  end
+
+  local selected_file = resolve_file(opts.file)
+  local target, target_err = resolve_inline_comment_target(pr, details, selected_file, opts)
+  if not target then
+    return notify_error(target_err)
+  end
+
+  M._open_inline_comment_composer(pr, details, target, {
+    title = string.format("PR #%d inline comment", pr.number),
   })
 end
 
@@ -4308,6 +5200,103 @@ function M.add_inline_comment_visual()
   end
 
   M.add_inline_comment({
+    start_line = start_line,
+    line = line,
+  })
+end
+
+function M._resolve_inline_selection_lines(opts)
+  opts = type(opts) == "table" and opts or {}
+  local start_line, line = resolve_requested_inline_range(opts)
+  if not line then
+    return nil, "Unable to resolve selected range for inline suggestion"
+  end
+
+  local first = start_line or line
+  local last = line
+  if first > last then
+    first, last = last, first
+  end
+
+  local bufnr = vim.api.nvim_get_current_buf()
+  local max_line = vim.api.nvim_buf_line_count(bufnr)
+  if first < 1 or last < 1 or first > max_line or last > max_line then
+    return nil, "Selected range for inline suggestion is outside this buffer"
+  end
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, first - 1, last, false)
+  local kind = type(vim.b.gh_pr_file_kind) == "string" and vim.b.gh_pr_file_kind or ""
+  for index, raw in ipairs(lines) do
+    local text = type(raw) == "string" and raw:gsub("\r$", "") or ""
+    if kind == "unified" then
+      if vim.startswith(text, "+ ") then
+        text = text:sub(3)
+      elseif vim.startswith(text, "  ") or vim.startswith(text, "- ") then
+        text = text:sub(3)
+      end
+    end
+    lines[index] = text
+  end
+
+  if vim.tbl_isempty(lines) then
+    lines = { "" }
+  end
+
+  return lines, nil
+end
+
+function M._build_suggestion_initial_lines(selected_lines)
+  local body = type(selected_lines) == "table" and selected_lines or { "" }
+  if vim.tbl_isempty(body) then
+    body = { "" }
+  end
+
+  local initial = { "```suggestion" }
+  for _, line in ipairs(body) do
+    initial[#initial + 1] = type(line) == "string" and line or ""
+  end
+  initial[#initial + 1] = "```"
+  return initial
+end
+
+function M.add_inline_suggestion(opts)
+  opts = type(opts) == "table" and opts or {}
+
+  local pr, details, err = resolve_active_pr()
+  if not pr then
+    return notify_error(err)
+  end
+
+  local selected_lines, selection_err = M._resolve_inline_selection_lines(opts)
+  if not selected_lines then
+    return notify_error(selection_err)
+  end
+
+  local selected_file = resolve_file(opts.file)
+  local target, target_err = resolve_inline_comment_target(pr, details, selected_file, opts)
+  if not target then
+    return notify_error(target_err)
+  end
+
+  M._open_inline_comment_composer(pr, details, target, {
+    title = string.format("PR #%d inline suggestion", pr.number),
+    filetype = "text",
+    initial_lines = M._build_suggestion_initial_lines(selected_lines),
+    cancel_message = "Inline suggestion cancelled",
+    empty_cancel_message = "Inline suggestion cancelled (empty message)",
+    success_message = string.format("Inline suggestion added to pending review on %s", target.path),
+    confirm_action_label = "Create inline suggestion",
+  })
+end
+
+function M.add_inline_suggestion_visual()
+  local start_line, line = visual_line_range()
+  leave_visual_mode()
+  if not line then
+    return notify_error("Unable to resolve selected range for inline suggestion")
+  end
+
+  M.add_inline_suggestion({
     start_line = start_line,
     line = line,
   })
@@ -4390,6 +5379,50 @@ function M.review(event)
       notify_info(string.format("%s review submitted for PR #%d", label:gsub("^%l", string.upper), pr.number))
     end)
   end)
+end
+
+function M.comment_pr()
+  local pr, _, err = resolve_active_pr()
+  if not pr then
+    return notify_error(err)
+  end
+
+  comment_composer.open({
+    title = string.format("PR #%d comment", pr.number),
+    filetype = "markdown",
+    border = "rounded",
+    initial_lines = { "" },
+    enter = true,
+    on_cancel = function()
+      notify_info("PR comment cancelled")
+    end,
+    on_submit = function(text)
+      local message = vim.trim(type(text) == "string" and text or "")
+      if message == "" then
+        notify_info("PR comment cancelled (empty message)")
+        return
+      end
+
+      local prompt = string.format("Publish PR comment on #%d? Message: %s", pr.number, summarize_review_body(message))
+      vim.ui.select({ "confirm", "cancel" }, {
+        prompt = prompt,
+      }, function(choice)
+        if choice ~= "confirm" then
+          notify_info("PR comment cancelled")
+          return
+        end
+
+        local ok, comment_err = pr_service.comment(pr.number, message)
+        if not ok then
+          notify_error(comment_err)
+          return
+        end
+
+        notify_info(string.format("PR comment published on #%d", pr.number))
+        refresh_pr_sources_after_state_change({ force = true })
+      end)
+    end,
+  })
 end
 
 function M.submit_pending_review(event)
@@ -4566,6 +5599,21 @@ function M.toggle_diff_render_whitespace()
   notify_info(string.format("Whitespace/tab rendering: %s", prefs.render_whitespace and "enabled" or "disabled"))
 end
 
+function M.toggle_diff_render_endlines()
+  local prefs = current_diff_view_preferences()
+  prefs.render_endlines = not prefs.render_endlines
+  prefs = persist_diff_view_preferences(prefs)
+
+  local reopened = M.reopen_current_diff_with_preferences({
+    new_tab = false,
+  })
+  if not reopened then
+    return
+  end
+
+  notify_info(string.format("Endline rendering: %s", prefs.render_endlines and "enabled" or "disabled"))
+end
+
 function M.cycle_diff_view_mode()
   local order = { "vertical", "horizontal", "unified" }
   local prefs = current_diff_view_preferences()
@@ -4630,7 +5678,6 @@ local function diff_shortcut_lines(bufnr)
   local shortcuts = diff_view_shortcuts()
   local image_opts = image_diff_options()
   local image_default_action = resolve_image_default_action(image_opts)
-  local image_menu_key = type(image_opts.fallback_menu_keymap) == "string" and image_opts.fallback_menu_keymap or "gf"
   local configured_diff = (config.get() or {}).diff_view or {}
   local configured_whitespace = type(configured_diff.whitespace) == "table" and configured_diff.whitespace or {}
   local whitespace_tab = type(configured_whitespace.tab) == "string" and configured_whitespace.tab ~= ""
@@ -4669,22 +5716,25 @@ local function diff_shortcut_lines(bufnr)
     shortcut_line("mode", mode_label),
     shortcut_line("spaces", is_image and "n/a (image)" or (prefs.ignore_whitespace and "ignored" or "strict")),
     shortcut_line("render", is_image and "n/a (image)" or (prefs.render_whitespace and "visible" or "hidden")),
+    shortcut_line("endline", is_image and "n/a (image)" or (prefs.render_endlines and "visible" or "hidden")),
     shortcut_line("tab", is_image and "n/a" or whitespace_tab),
     shortcut_line("space", is_image and "n/a" or whitespace_space),
     "",
     "General",
-    shortcut_line(
-      "K",
-      is_image and "Not available for image files" or (kind == "unified" and "Not available in unified mode" or "Show line comments popup")
-    ),
-    shortcut_line("?", "Show this help"),
-    shortcut_line("R", "Refresh current diff from GitHub"),
-    shortcut_line("q", "Quick close (or close head in 2-way diff)"),
-    shortcut_line("Q", "Close view(s) and open PR Review"),
   }
+  if is_image then
+    lines[#lines + 1] = shortcut_line("-", "Line comments popup not available for image files")
+  else
+    add_shortcut(lines, shortcuts.line_comments_popup, kind == "unified" and "Not available in unified mode" or "Show line comments popup")
+  end
+  add_shortcut(lines, shortcuts.help, "Show this help")
+  add_shortcut(lines, shortcuts.refresh, "Refresh current diff from GitHub")
+  add_shortcut(lines, shortcuts.close_quick, "Quick close (or close head in 2-way diff)")
+  add_shortcut(lines, shortcuts.close_all_open_review, "Close view(s) and open PR Review")
 
   if not is_image then
-    add_shortcut(lines, shortcuts.toggle_render_whitespace, "Toggle space/tab symbols")
+    add_shortcut(lines, shortcuts.toggle_render_whitespace, "Toggle leading/trailing space/tab symbols")
+    add_shortcut(lines, shortcuts.toggle_render_endlines, "Toggle LF/CRLF endline markers")
   end
 
   if is_image then
@@ -4702,45 +5752,55 @@ local function diff_shortcut_lines(bufnr)
   if is_image then
     lines[#lines + 1] = ""
     lines[#lines + 1] = "Image fallback"
-    lines[#lines + 1] = shortcut_line("<CR>", string.format("Run default fallback action (%s)", image_action_label(image_default_action)))
-    if image_menu_key ~= "" then
-      lines[#lines + 1] = shortcut_line(image_menu_key, "Open fallback actions menu")
-    end
+    add_shortcut(lines, shortcuts.image_default_action, string.format("Run default fallback action (%s)", image_action_label(image_default_action)))
+    add_shortcut(lines, shortcuts.image_fallback_menu, "Open fallback actions menu")
     lines[#lines + 1] = shortcut_line("-", "Menu allows setting default action (`d`/`s`)")
   end
 
   lines[#lines + 1] = ""
   lines[#lines + 1] = "Navigation"
-  lines[#lines + 1] = shortcut_line(",n", is_image and "Not available for image files" or "Next change")
-  lines[#lines + 1] = shortcut_line(",p", is_image and "Not available for image files" or "Previous change")
-  lines[#lines + 1] = shortcut_line(",f", "Next file in PR")
-  lines[#lines + 1] = shortcut_line(",F", "Previous file in PR")
-  lines[#lines + 1] = shortcut_line(",v", "Next reviewed file")
-  lines[#lines + 1] = shortcut_line(",V", "Previous reviewed file")
+  if is_image then
+    lines[#lines + 1] = shortcut_line("-", "Change navigation disabled for image files")
+  else
+    add_shortcut(lines, shortcuts.next_change, "Next change")
+    add_shortcut(lines, shortcuts.prev_change, "Previous change")
+  end
+  add_shortcut(lines, shortcuts.next_file, "Next file in PR")
+  add_shortcut(lines, shortcuts.prev_file, "Previous file in PR")
+  add_shortcut(lines, shortcuts.next_reviewed_file, "Next reviewed file")
+  add_shortcut(lines, shortcuts.prev_reviewed_file, "Previous reviewed file")
   lines[#lines + 1] = ""
   lines[#lines + 1] = "Pending review"
-  lines[#lines + 1] = shortcut_line(",rs", "Submit pending review as comment")
-  lines[#lines + 1] = shortcut_line(",ra", "Submit pending review as approve")
-  lines[#lines + 1] = shortcut_line(",rr", "Submit pending review as request changes")
-  lines[#lines + 1] = shortcut_line(",rd", "Discard pending review")
-  lines[#lines + 1] = shortcut_line(",x", "Toggle PR Review source")
+  add_shortcut(lines, shortcuts.submit_pending_comment, "Submit pending review as comment")
+  add_shortcut(lines, shortcuts.submit_pending_approve, "Submit pending review as approve")
+  add_shortcut(lines, shortcuts.submit_pending_request_changes, "Submit pending review as request changes")
+  add_shortcut(lines, shortcuts.discard_pending_review, "Discard pending review")
+  add_shortcut(lines, shortcuts.toggle_review_tree, "Toggle PR Review source")
 
   lines[#lines + 1] = ""
   lines[#lines + 1] = "Inline comments"
 
   if is_image then
-    lines[#lines + 1] = shortcut_line("gc", "Not available for image files")
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_comment, "Not available for image files")
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_suggestion, "Not available for image files")
   elseif kind == "head" and file_mode == "added_single" then
-    lines[#lines + 1] = shortcut_line("gc", "Create inline comment at cursor (any line)")
-    lines[#lines + 1] = shortcut_line("v/V + gc", "Create inline comment on selected range")
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_comment, "Create inline comment at cursor (any line)")
+    lines[#lines + 1] = shortcut_line("Visual + " .. shortcuts.inline_comment, "Create inline comment on selected range")
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_suggestion, "Create inline suggestion at cursor (any line)")
+    lines[#lines + 1] = shortcut_line("Visual + " .. shortcuts.inline_suggestion, "Create inline suggestion on selected range")
   elseif kind == "head" then
-    lines[#lines + 1] = shortcut_line("gc", "Create inline comment at cursor")
-    lines[#lines + 1] = shortcut_line("v/V + gc", "Create inline comment on selected range")
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_comment, "Create inline comment at cursor")
+    lines[#lines + 1] = shortcut_line("Visual + " .. shortcuts.inline_comment, "Create inline comment on selected range")
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_suggestion, "Create inline suggestion at cursor")
+    lines[#lines + 1] = shortcut_line("Visual + " .. shortcuts.inline_suggestion, "Create inline suggestion on selected range")
   elseif kind == "unified" then
-    lines[#lines + 1] = shortcut_line("gc", "Create inline comment on added (+) line")
-    lines[#lines + 1] = shortcut_line("v/V + gc", "Create inline comment on added (+) range")
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_comment, "Create inline comment on added (+) line")
+    lines[#lines + 1] = shortcut_line("Visual + " .. shortcuts.inline_comment, "Create inline comment on added (+) range")
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_suggestion, "Create inline suggestion on added (+) line")
+    lines[#lines + 1] = shortcut_line("Visual + " .. shortcuts.inline_suggestion, "Create inline suggestion on added (+) range")
   else
-    lines[#lines + 1] = shortcut_line("gc", "Only available on MODIFIED (head) or unified")
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_comment, "Only available on MODIFIED (head) or unified")
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_suggestion, "Only available on MODIFIED (head) or unified")
   end
 
   lines[#lines + 1] = ""

@@ -103,6 +103,10 @@ local function get_user_login_async(callback)
   end)
 end
 
+function M.get_current_user_login()
+  return get_user_login()
+end
+
 local function append_repo_filter(query, repository)
   if query:find("repo:", 1, true) then
     return query
@@ -1524,6 +1528,23 @@ function M.open_in_browser(number)
   return true, nil
 end
 
+function M.open_url_in_browser(url)
+  local target = type(url) == "string" and vim.trim(url) or ""
+  if target == "" then
+    return false, "Missing URL"
+  end
+  if not target:match("^https?://") then
+    return false, "Only http/https URLs are supported"
+  end
+
+  local _, err = gh.run({ "browse", target })
+  if err then
+    return false, err
+  end
+
+  return true, nil
+end
+
 function M.review(number, event, body)
   local args = { "pr", "review", tostring(number) }
 
@@ -1546,6 +1567,26 @@ function M.review(number, event, body)
   end
 
   local _, err = gh.run(args)
+  if err then
+    return false, err
+  end
+
+  return true, nil
+end
+
+function M.comment(number, body)
+  local message = type(body) == "string" and vim.trim(body) or ""
+  if message == "" then
+    return false, "Comment message cannot be empty"
+  end
+
+  local _, err = gh.run({
+    "pr",
+    "comment",
+    tostring(number),
+    "--body",
+    message,
+  })
   if err then
     return false, err
   end

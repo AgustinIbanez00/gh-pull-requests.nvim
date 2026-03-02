@@ -1,5 +1,12 @@
 local M = {}
 
+local function normalize_line_endings(text)
+  if type(text) ~= "string" then
+    return ""
+  end
+  return text:gsub("\r\n", "\n"):gsub("\r", "\n")
+end
+
 function M.safe_string(value, fallback)
   if type(value) == "string" and value ~= "" then
     return value
@@ -11,7 +18,7 @@ function M.split_lines(text)
   if type(text) ~= "string" then
     return {}
   end
-  return vim.split(text, "\n", { plain = true })
+  return vim.split(normalize_line_endings(text), "\n", { plain = true })
 end
 
 function M.first_non_empty_line(text, fallback)
@@ -316,11 +323,49 @@ function M.sanitize_markdown_opts(input)
     max_lines = 4000
   end
 
+  local function normalize_extensions(values, fallback)
+    local source_list = type(values) == "table" and values or fallback
+    local normalized = {}
+    local seen = {}
+    for _, ext in ipairs(source_list) do
+      if type(ext) == "string" and ext ~= "" then
+        local token = ext:lower():gsub("^%.+", "")
+        if token ~= "" and not seen[token] then
+          seen[token] = true
+          normalized[#normalized + 1] = token
+        end
+      end
+    end
+    if vim.tbl_isempty(normalized) then
+      return vim.deepcopy(fallback)
+    end
+    return normalized
+  end
+
+  local link_preview_max_bytes = math.floor(tonumber(source.link_preview_max_bytes) or 10485760)
+  if link_preview_max_bytes < 1 then
+    link_preview_max_bytes = 10485760
+  end
+
+  local link_preview_renderable_extensions = normalize_extensions(
+    source.link_preview_renderable_extensions,
+    { "txt", "md", "markdown", "json", "yaml", "yml", "csv", "log" }
+  )
+  local link_preview_disallowed_extensions = normalize_extensions(
+    source.link_preview_disallowed_extensions,
+    { "zip" }
+  )
+
   return {
     enabled = M.bool_or_default(source.enabled, true),
     provider = provider,
     max_lines = max_lines,
     code_block_border = M.bool_or_default(source.code_block_border, false),
+    link_preview_keymap = type(source.link_preview_keymap) == "string" and source.link_preview_keymap or "gp",
+    link_preview_max_bytes = link_preview_max_bytes,
+    link_preview_renderable_extensions = link_preview_renderable_extensions,
+    link_preview_disallowed_extensions = link_preview_disallowed_extensions,
+    link_preview_open_local = source.link_preview_open_local == "system" and "system" or "system",
   }
 end
 

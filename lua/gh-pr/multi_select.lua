@@ -25,6 +25,16 @@ local function valid_buf(bufnr)
   return type(bufnr) == "number" and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr)
 end
 
+local function sanitize_modal_window(winid)
+  if not valid_win(winid) then
+    return
+  end
+
+  pcall(vim.api.nvim_set_option_value, "scrollbind", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "cursorbind", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "diff", false, { win = winid })
+end
+
 local function normalize_items(items)
   local result = {}
   local seen = {}
@@ -288,6 +298,7 @@ function M.open(opts)
     noautocmd = true,
   })
 
+  sanitize_modal_window(winid)
   local state = {
     bufnr = bufnr,
     winid = winid,

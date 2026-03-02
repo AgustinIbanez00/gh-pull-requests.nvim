@@ -4,6 +4,119 @@ local runtime_state = require("gh-pr.state")
 
 local M = {}
 local dynamic_label_highlights = {}
+local CHECK_RUNNING_STATES = {
+  QUEUED = true,
+  IN_PROGRESS = true,
+  PENDING = true,
+  EXPECTED = true,
+  WAITING = true,
+  REQUESTED = true,
+}
+local CHECK_FAILURE_STATES = {
+  FAILURE = true,
+  FAIL = true,
+  ERROR = true,
+  TIMED_OUT = true,
+  CANCELLED = true,
+  ACTION_REQUIRED = true,
+  STARTUP_FAILURE = true,
+  STALE = true,
+}
+local CHECK_SUCCESS_STATES = {
+  SUCCESS = true,
+  PASS = true,
+  PASSED = true,
+  NEUTRAL = true,
+  SKIPPED = true,
+}
+
+local function uppercase(value)
+  if type(value) ~= "string" then
+    return ""
+  end
+  return value:upper()
+end
+
+local function normalize_login(value)
+  if type(value) == "table" and type(value.login) == "string" and value.login ~= "" then
+    return value.login
+  end
+  if type(value) == "string" and value ~= "" then
+    return value
+  end
+  return nil
+end
+
+local function resolve_pr_context(node)
+  local extra = type(node.extra) == "table" and node.extra or {}
+  local pr = type(extra.pr) == "table" and extra.pr or nil
+  local details = type(extra.details) == "table" and extra.details or nil
+  return pr, details
+end
+
+local function title_for_pr_node(node, pr)
+  if type(pr) ~= "table" then
+    return node.name or ""
+  end
+
+  local number = tonumber(pr.number)
+  local title = type(pr.title) == "string" and pr.title or ""
+  if title == "" then
+    title = "(untitled)"
+  end
+  if number then
+    return string.format("#%d %s", number, title)
+  end
+  return title
+end
+
+local function normalize_check_state(check)
+  local status = uppercase(check.status ~= "" and check.status or check.state)
+  local conclusion = uppercase(check.conclusion)
+
+  if CHECK_RUNNING_STATES[status] then
+    return "running"
+  end
+  if CHECK_FAILURE_STATES[conclusion] or CHECK_FAILURE_STATES[status] then
+    return "failed"
+  end
+  if CHECK_SUCCESS_STATES[conclusion] or CHECK_SUCCESS_STATES[status] then
+    return "success"
+  end
+
+  return "none"
+end
+
+local function check_state_for_pr(node)
+  local pr, details = resolve_pr_context(node)
+  local source = type(details) == "table" and details or pr
+  local checks = type(source) == "table" and source.statusCheckRollup or nil
+  if type(checks) ~= "table" or vim.tbl_isempty(checks) then
+    return "none"
+  end
+
+  local has_failed = false
+  local has_success = false
+  for _, check in ipairs(checks) do
+    local state = normalize_check_state(type(check) == "table" and check or {})
+    if state == "running" then
+      return "running"
+    end
+    if state == "failed" then
+      has_failed = true
+    elseif state == "success" then
+      has_success = true
+    end
+  end
+
+  if has_failed then
+    return "failed"
+  end
+  if has_success then
+    return "success"
+  end
+  return "none"
+end
 
 local function normalize_hex_color(value)
   if type(value) ~= "string" then
@@ -182,9 +295,80 @@ M.name = function(config, node, _)
     end
   end
 
+  if node.type == "pr" and type(node.extra) == "table" and type(node.extra.pr) == "table" and node.extra.pr.isDraft == true then
+    hl = "GhPrPrDraft"
+  end
+
   return {
     text = text,
     highlight = hl,
+  }
+end
+
+M.pr_title = function(config, node, _)
+  local pr = select(1, resolve_pr_context(node))
+  return {
+    text = title_for_pr_node(node, pr),
+    highlight = config.highlight or highlights.DIRECTORY_NAME,
+  }
+end
+
+M.pr_draft_badge = function(_, node, _)
+  local pr, details = resolve_pr_context(node)
+  local is_draft = (type(pr) == "table" and pr.isDraft == true) or (type(details) == "table" and details.isDraft == true)
+  if not is_draft then
+    return { text = "", highlight = "GhPrPrDraft" }
+  end
+
+  return {
+    text = " [DRAFT]",
+    highlight = "GhPrPrDraft",
+  }
+end
+
+M.pr_author_badge = function(_, node, _)
+  local pr, details = resolve_pr_context(node)
+  local author = normalize_login(type(pr) == "table" and pr.author or nil)
+    or normalize_login(type(details) == "table" and details.author or nil)
+  if not author then
+    return { text = "", highlight = "GhPrPrAuthor" }
+  end
+
+  local login = author:gsub("^@", "")
+  if login == "" then
+    return { text = "", highlight = "GhPrPrAuthor" }
+  end
+
+  return {
+    text = " @" .. login,
+    highlight = "GhPrPrAuthor",
+  }
+end
+
+M.pr_checks_badge = function(_, node, _)
+  local state = check_state_for_pr(node)
+  if state == "running" then
+    return {
+      text = " ●",
+      highlight = "GhPrCheckRunning",
+    }
+  end
+  if state == "success" then
+    return {
+      text = " ✓",
+      highlight = "GhPrCheckSuccess",
+    }
+  end
+  if state == "failed" then
+    return {
+      text = " ✗",
+      highlight = "GhPrCheckFailed",
+    }
+  end
+
+  return {
+    text = "",
+    highlight = "GhPrCheckRunning",
   }
 end
 

@@ -36,7 +36,16 @@ local DEFAULT_RENDERERS = {
   pr = {
     { "indent", with_expanders = true },
     { "kind_icon" },
-    { "container", width = "100%", content = { { "name", zindex = 10 } } },
+    {
+      "container",
+      width = "100%",
+      content = {
+        { "pr_title", zindex = 10 },
+        { "pr_draft_badge", zindex = 11 },
+        { "pr_author_badge", zindex = 12 },
+        { "pr_checks_badge", zindex = 13 },
+      },
+    },
   },
   files = {
     { "indent", with_expanders = true },
@@ -522,7 +531,6 @@ local function get_query_node(query, results, session, opts)
 
       local pr_prefix = string.format("%s:pr:%d", query_prefix, pr.number)
       local details = session.details_by_pr[tostring(pr.number)]
-      local detail_err = session.detail_errors[tostring(pr.number)]
       local pr_children = {
         {
           id = string.format("%s:overview", pr_prefix),
@@ -536,42 +544,9 @@ local function get_query_node(query, results, session, opts)
         },
       }
 
-      if details then
-        local file_children = build_file_nodes(pr_prefix, pr, details)
-        table.insert(pr_children, {
-          id = string.format("%s:files", pr_prefix),
-          name = "Files",
-          type = "files",
-          children = file_children,
-          extra = {
-            kind = "files",
-            pr = pr,
-            details = details,
-          },
-        })
-      else
-        local message = "Loading files..."
-        if detail_err then
-          message = "Unable to load files: " .. detail_err
-        elseif not session.loading then
-          message = "Files are not available yet"
-        end
-
-        table.insert(pr_children, {
-          id = string.format("%s:error", pr_prefix),
-          name = message,
-          type = "message",
-          extra = {
-            kind = "message",
-            pr = pr,
-            details = nil,
-          },
-        })
-      end
-
       table.insert(children, {
         id = pr_prefix,
-        name = string.format("#%d %s", pr.number, pr.title),
+        name = string.format("#%d %s%s", pr.number, pr.title, pr.isDraft == true and " [DRAFT]" or ""),
         type = "pr",
         children = pr_children,
         extra = {
@@ -1105,6 +1080,12 @@ function M.follow_current_file_if_visible(opts)
 end
 
 M.setup = function(source_config, _)
+  vim.api.nvim_set_hl(0, "GhPrPrDraft", { default = true, link = "DiagnosticWarn" })
+  vim.api.nvim_set_hl(0, "GhPrPrAuthor", { default = true, link = "Comment" })
+  vim.api.nvim_set_hl(0, "GhPrCheckRunning", { default = true, link = "DiagnosticWarn" })
+  vim.api.nvim_set_hl(0, "GhPrCheckSuccess", { default = true, link = "DiagnosticOk" })
+  vim.api.nvim_set_hl(0, "GhPrCheckFailed", { default = true, link = "DiagnosticError" })
+
   local commands = require("gh-pr.neotree.commands")
   local components = require("gh-pr.neotree.components")
   source_config.commands = vim.tbl_deep_extend("force", source_config.commands or {}, commands)
@@ -1115,30 +1096,16 @@ M.setup = function(source_config, _)
   source_config.window.mappings = source_config.window.mappings or {}
 
   local default_mappings = {
-    ["<space>"] = "toggle_node",
     ["<CR>"] = "gh_pr_open",
     ["R"] = "refresh",
-    ["o"] = "open_overview",
-    ["C"] = "open_comments_tree",
-    ["D"] = "open_diff",
-    ["O"] = "open_original",
-    ["M"] = "open_modified",
-    ["r"] = "approve_review",
-    ["a"] = "comment_review",
-    ["d"] = "request_changes_review",
+    ["b"] = "open_pr_browser",
+    ["r"] = "start_review",
+    ["ra"] = "approve_review",
+    ["rc"] = "comment_review",
+    ["rr"] = "request_changes_review",
+    ["rd"] = "discard_pending_review",
     ["m"] = "merge_pr",
-    ["S"] = "start_review",
-    ["c"] = "checkout_pr",
-    ["p"] = "toggle_viewed",
-    ["v"] = "toggle_viewed",
-    ["A"] = "noop",
-    ["x"] = "noop",
-    ["y"] = "noop",
-    ["<C-r>"] = "noop",
-    ["s"] = "noop",
-    ["t"] = "noop",
-    ["w"] = "noop",
-    ["e"] = "toggle_auto_expand_width",
+    ["k"] = "checkout_pr",
     ["q"] = "close_window",
     ["?"] = "show_help",
     ["<"] = "prev_source",

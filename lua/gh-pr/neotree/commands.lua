@@ -106,6 +106,18 @@ M.open_overview = function(state)
   actions.open_overview()
 end
 
+M.open_pr_browser = function(state)
+  local node = current_node(state)
+  if not node or not has_pr_context(node) then
+    vim.notify("Selected node has no pull request context", vim.log.levels.INFO)
+    return
+  end
+
+  apply_context(node)
+  local pr = node.extra and node.extra.pr or nil
+  actions.open_overview_url(pr and pr.number or nil)
+end
+
 M.open_comments_tree = function(state)
   local node = current_node(state)
   if not node then
@@ -114,6 +126,21 @@ M.open_comments_tree = function(state)
 
   apply_context(node)
   vim.cmd("GhPrComments")
+end
+
+M.open_telescope_actions = function(state)
+  local node = current_node(state)
+  if node then
+    apply_context(node)
+  end
+
+  local ok, telescope = pcall(require, "gh-pr.telescope")
+  if not ok then
+    vim.notify("Unable to load Telescope fallback actions", vim.log.levels.ERROR)
+    return
+  end
+
+  telescope.open_context_actions()
 end
 
 M.checkout_pr = function(state)
@@ -184,6 +211,15 @@ M.comment_review = function(state)
 
   apply_context(node)
   actions.review("comment")
+end
+
+M.discard_pending_review = function(state)
+  local node = current_node(state)
+  if node then
+    apply_context(node)
+  end
+
+  actions.discard_pending_review()
 end
 
 M.merge_pr = function(state)

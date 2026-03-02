@@ -13,6 +13,18 @@ vim.api.nvim_create_user_command("GhPrList", function()
   require("gh-pr.telescope").pull_requests()
 end, { desc = "List pull requests using Telescope" })
 
+vim.api.nvim_create_user_command("GhPrTelescope", function()
+  require("gh-pr").open_telescope()
+end, { desc = "Open Telescope fallback query/PR picker" })
+
+vim.api.nvim_create_user_command("GhPrTelescopeActions", function()
+  require("gh-pr").open_telescope_actions()
+end, { desc = "Open Telescope contextual PR/Review actions" })
+
+vim.api.nvim_create_user_command("GhPrTelescopeReview", function()
+  require("gh-pr").open_telescope_review_actions()
+end, { desc = "Open Telescope PR Review actions" })
+
 vim.api.nvim_create_user_command("GhPrComments", function(command)
   require("gh-pr").open_comments(command.args ~= "" and command.args or nil)
 end, { nargs = "?", desc = "Open PR Review source (Comments section)" })
@@ -28,6 +40,14 @@ end, { desc = "Toggle PR Review source" })
 vim.api.nvim_create_user_command("GhPrRefresh", function()
   require("gh-pr").refresh()
 end, { desc = "Refresh pull request data" })
+
+vim.api.nvim_create_user_command("GhPRReviewRefresh", function()
+  require("gh-pr").refresh_review()
+end, { desc = "Force refresh PR Review data (background)" })
+
+vim.api.nvim_create_user_command("GhPrReviewRefresh", function()
+  require("gh-pr").refresh_review()
+end, { desc = "Force refresh PR Review data (background)" })
 
 vim.api.nvim_create_user_command("GhPrOverview", function()
   require("gh-pr").open_overview()

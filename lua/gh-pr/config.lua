@@ -1,4 +1,5 @@
 local M = {}
+local diff_shortcuts = require("gh-pr.diff_shortcuts")
 
 local defaults = {
   remotes = { "origin", "upstream" },
@@ -90,6 +91,22 @@ local defaults = {
       provider = "auto",
       max_lines = 500,
       code_block_border = false,
+      link_preview_keymap = "gp",
+      link_preview_max_bytes = 10485760,
+      link_preview_renderable_extensions = {
+        "txt",
+        "md",
+        "markdown",
+        "json",
+        "yaml",
+        "yml",
+        "csv",
+        "log",
+      },
+      link_preview_disallowed_extensions = {
+        "zip",
+      },
+      link_preview_open_local = "system",
     },
     tabs = {
       "summary",
@@ -146,6 +163,7 @@ local defaults = {
     mode = "vertical",
     ignore_whitespace = false,
     render_whitespace = true,
+    render_endlines = false,
     whitespace = {
       tab = ">-",
       space = ".",
@@ -154,14 +172,14 @@ local defaults = {
       color = nil,
       highlight_group = "GhPrDiffWhitespace",
     },
-    shortcuts = {
-      toggle_whitespace = ",dw",
-      toggle_render_whitespace = ",dt",
-      cycle_mode = ",dm",
-      set_vertical = ",dv",
-      set_horizontal = ",dh",
-      set_unified = ",du",
+    endlines = {
+      lf = "LF",
+      crlf = "CRLF",
+      cr = "CR",
+      color = "#d16969",
+      highlight_group = "GhPrDiffEndline",
     },
+    shortcuts = vim.deepcopy(diff_shortcuts.defaults),
     images = {
       enabled = true,
       backend = "snacks",
@@ -338,6 +356,28 @@ local function sanitize_overview_tabs(tabs)
   return result
 end
 
+local function sanitize_extension_list(input, fallback)
+  local source = type(input) == "table" and input or fallback
+  local result = {}
+  local seen = {}
+
+  for _, value in ipairs(source) do
+    if type(value) == "string" and value ~= "" then
+      local normalized = value:lower():gsub("^%.+", "")
+      if normalized ~= "" and not seen[normalized] then
+        seen[normalized] = true
+        result[#result + 1] = normalized
+      end
+    end
+  end
+
+  if vim.tbl_isempty(result) then
+    return vim.deepcopy(fallback)
+  end
+
+  return result
+end
+
 local function sanitize_overview(overview)
   if type(overview) ~= "table" then
     return vim.deepcopy(defaults.overview)
@@ -427,6 +467,24 @@ local function sanitize_overview(overview)
   end
   if type(result.markdown.code_block_border) ~= "boolean" then
     result.markdown.code_block_border = defaults.overview.markdown.code_block_border
+  end
+  if type(result.markdown.link_preview_keymap) ~= "string" then
+    result.markdown.link_preview_keymap = defaults.overview.markdown.link_preview_keymap
+  end
+  result.markdown.link_preview_max_bytes = sanitize_positive_integer(
+    result.markdown.link_preview_max_bytes,
+    defaults.overview.markdown.link_preview_max_bytes
+  )
+  result.markdown.link_preview_renderable_extensions = sanitize_extension_list(
+    result.markdown.link_preview_renderable_extensions,
+    defaults.overview.markdown.link_preview_renderable_extensions
+  )
+  result.markdown.link_preview_disallowed_extensions = sanitize_extension_list(
+    result.markdown.link_preview_disallowed_extensions,
+    defaults.overview.markdown.link_preview_disallowed_extensions
+  )
+  if result.markdown.link_preview_open_local ~= "system" then
+    result.markdown.link_preview_open_local = defaults.overview.markdown.link_preview_open_local
   end
 
   result.tabs = sanitize_overview_tabs(result.tabs)
@@ -753,6 +811,9 @@ local function sanitize_diff_view(diff_view)
   if type(result.render_whitespace) ~= "boolean" then
     result.render_whitespace = defaults.diff_view.render_whitespace
   end
+  if type(result.render_endlines) ~= "boolean" then
+    result.render_endlines = defaults.diff_view.render_endlines
+  end
 
   result.whitespace = type(result.whitespace) == "table" and result.whitespace or {}
   result.whitespace.tab = sanitize_listchars_token(result.whitespace.tab, defaults.diff_view.whitespace.tab)
@@ -768,21 +829,28 @@ local function sanitize_diff_view(diff_view)
     result.whitespace.highlight_group = defaults.diff_view.whitespace.highlight_group
   end
 
-  result.shortcuts = type(result.shortcuts) == "table" and result.shortcuts or {}
-  result.shortcuts.toggle_whitespace = type(result.shortcuts.toggle_whitespace) == "string"
-      and result.shortcuts.toggle_whitespace
-    or defaults.diff_view.shortcuts.toggle_whitespace
-  result.shortcuts.toggle_render_whitespace = type(result.shortcuts.toggle_render_whitespace) == "string"
-      and result.shortcuts.toggle_render_whitespace
-    or defaults.diff_view.shortcuts.toggle_render_whitespace
-  result.shortcuts.cycle_mode = type(result.shortcuts.cycle_mode) == "string" and result.shortcuts.cycle_mode
-    or defaults.diff_view.shortcuts.cycle_mode
-  result.shortcuts.set_vertical = type(result.shortcuts.set_vertical) == "string" and result.shortcuts.set_vertical
-    or defaults.diff_view.shortcuts.set_vertical
-  result.shortcuts.set_horizontal = type(result.shortcuts.set_horizontal) == "string" and result.shortcuts.set_horizontal
-    or defaults.diff_view.shortcuts.set_horizontal
-  result.shortcuts.set_unified = type(result.shortcuts.set_unified) == "string" and result.shortcuts.set_unified
-    or defaults.diff_view.shortcuts.set_unified
+  result.endlines = type(result.endlines) == "table" and result.endlines or {}
+  local function sanitize_endline_marker(value, fallback)
+    if type(value) ~= "string" or value == "" then
+      return fallback
+    end
+    local trimmed = value:gsub("[%c]", "")
+    if trimmed == "" then
+      return fallback
+    end
+    return trimmed
+  end
+  result.endlines.lf = sanitize_endline_marker(result.endlines.lf, defaults.diff_view.endlines.lf)
+  result.endlines.crlf = sanitize_endline_marker(result.endlines.crlf, defaults.diff_view.endlines.crlf)
+  result.endlines.cr = sanitize_endline_marker(result.endlines.cr, defaults.diff_view.endlines.cr)
+  if type(result.endlines.color) ~= "string" or result.endlines.color == "" then
+    result.endlines.color = defaults.diff_view.endlines.color
+  end
+  if type(result.endlines.highlight_group) ~= "string" or result.endlines.highlight_group == "" then
+    result.endlines.highlight_group = defaults.diff_view.endlines.highlight_group
+  end
+
+  result.shortcuts = diff_shortcuts.resolve(result.shortcuts)
 
   result.images = type(result.images) == "table" and result.images or {}
   if type(result.images.enabled) ~= "boolean" then

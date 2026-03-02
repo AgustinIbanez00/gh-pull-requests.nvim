@@ -1,6 +1,7 @@
 local M = {}
 
 local config = require("gh-pr.config")
+local diff_shortcuts_config = require("gh-pr.diff_shortcuts")
 local gh = require("gh-pr.gh")
 local image_renderer = require("gh-pr.image_renderer")
 local line_comments = require("gh-pr.line_comments")
@@ -9,6 +10,8 @@ local state = require("gh-pr.state")
 local base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 local unified_highlight_ns = vim.api.nvim_create_namespace("gh-pr-unified-diff")
 local unified_syntax_ns = vim.api.nvim_create_namespace("gh-pr-unified-syntax")
+local endline_render_ns = vim.api.nvim_create_namespace("gh-pr-endline-render")
+local whitespace_render_ns = vim.api.nvim_create_namespace("gh-pr-whitespace-render")
 
 local function decode_base64_fallback(data)
   data = data:gsub("[^" .. base64_chars .. "=]", "")
@@ -274,6 +277,56 @@ local function set_buffer_content(bufnr, lines)
   end
 end
 
+local function split_text_with_endings(content)
+  local text = type(content) == "string" and content or ""
+  if text == "" then
+    return {}, {}
+  end
+
+  local lines = {}
+  local endings = {}
+  local current = {}
+  local index = 1
+  local length = #text
+
+  while index <= length do
+    local char = text:sub(index, index)
+    if char == "\r" then
+      lines[#lines + 1] = table.concat(current)
+      current = {}
+      if index < length and text:sub(index + 1, index + 1) == "\n" then
+        endings[#lines] = "crlf"
+        index = index + 2
+      else
+        endings[#lines] = "cr"
+        index = index + 1
+      end
+    elseif char == "\n" then
+      lines[#lines + 1] = table.concat(current)
+      current = {}
+      endings[#lines] = "lf"
+      index = index + 1
+    else
+      current[#current + 1] = char
+      index = index + 1
+    end
+  end
+
+  if #current > 0 then
+    lines[#lines + 1] = table.concat(current)
+  end
+
+  return lines, endings
+end
+
+local function split_buffer_text_with_endings(content)
+  local lines, endings = split_text_with_endings(content)
+  if vim.tbl_isempty(lines) then
+    return { "" }, {}
+  end
+  return lines, endings
+end
+
 local function virtual_uri(kind, repository, pr_number, path)
   local repo_name = repository.full_name:gsub("/", "-")
   return string.format("ghpr://%s/%d/%s/%s", repo_name, pr_number, kind, path)
@@ -446,11 +499,13 @@ end
 local function resolve_configured_diff_view()
   local options = (config.get() or {}).diff_view or {}
   local whitespace = type(options.whitespace) == "table" and options.whitespace or {}
+  local endlines = type(options.endlines) == "table" and options.endlines or {}
   local images = resolve_image_options()
   return {
     mode = normalize_diff_mode(options.mode, "vertical"),
     ignore_whitespace = options.ignore_whitespace == true,
     render_whitespace = options.render_whitespace ~= false,
+    render_endlines = options.render_endlines == true,
     whitespace = {
       tab = type(whitespace.tab) == "string" and whitespace.tab ~= "" and whitespace.tab or ">-",
       space = type(whitespace.space) == "string" and whitespace.space ~= "" and whitespace.space or ".",
@@ -461,6 +516,15 @@ local function resolve_configured_diff_view()
           and whitespace.highlight_group
         or "GhPrDiffWhitespace",
     },
+    endlines = {
+      lf = type(endlines.lf) == "string" and endlines.lf ~= "" and endlines.lf or "LF",
+      crlf = type(endlines.crlf) == "string" and endlines.crlf ~= "" and endlines.crlf or "CRLF",
+      cr = type(endlines.cr) == "string" and endlines.cr ~= "" and endlines.cr or "CR",
+      color = type(endlines.color) == "string" and endlines.color ~= "" and endlines.color or nil,
+      highlight_group = type(endlines.highlight_group) == "string" and endlines.highlight_group ~= ""
+          and endlines.highlight_group
+        or "GhPrDiffEndline",
+    },
     images = images,
     shortcuts = type(options.shortcuts) == "table" and options.shortcuts or {},
   }
@@ -468,17 +532,65 @@ end
 
 local function resolve_diff_view_shortcuts()
   local configured = resolve_configured_diff_view()
-  local shortcuts = configured.shortcuts
-  return {
-    toggle_whitespace = type(shortcuts.toggle_whitespace) == "string" and shortcuts.toggle_whitespace or ",dw",
-    toggle_render_whitespace = type(shortcuts.toggle_render_whitespace) == "string"
-        and shortcuts.toggle_render_whitespace
-      or ",dt",
-    cycle_mode = type(shortcuts.cycle_mode) == "string" and shortcuts.cycle_mode or ",dm",
-    set_vertical = type(shortcuts.set_vertical) == "string" and shortcuts.set_vertical or ",dv",
-    set_horizontal = type(shortcuts.set_horizontal) == "string" and shortcuts.set_horizontal or ",dh",
-    set_unified = type(shortcuts.set_unified) == "string" and shortcuts.set_unified or ",du",
-  }
+  local resolved = diff_shortcuts_config.resolve(configured.shortcuts)
+  return diff_shortcuts_config.expand_localleader(resolved)
+end
+
+local function display_keybinding(key)
+  if type(key) ~= "string" or key == "" then
+    return ""
+  end
+
+  local localleader = type(vim.g.maplocalleader) == "string" and vim.g.maplocalleader or ","
+  if localleader == "" then
+    localleader = ","
+  end
+
+  local expanded = key:gsub("<[Ll]ocal[Ll]eader>", function()
+    return localleader
+  end)
+  return vim.fn.keytrans(vim.api.nvim_replace_termcodes(expanded, true, true, true))
+end
+
+local function should_show_diff_open_hint(bufnr, file_kind, shortcuts)
+  if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  if vim.b[bufnr].gh_pr_diff_open_hint_shown == true then
+    return false
+  end
+  if shortcuts.show_open_hint == false then
+    return false
+  end
+  return file_kind == "base" or file_kind == "head" or file_kind == "unified"
+end
+
+local function maybe_notify_diff_open_hint(bufnr, file_kind, shortcuts)
+  if not should_show_diff_open_hint(bufnr, file_kind, shortcuts) then
+    return
+  end
+
+  vim.b[bufnr].gh_pr_diff_open_hint_shown = true
+  local quick = display_keybinding(shortcuts.close_quick)
+  local close_review = display_keybinding(shortcuts.close_all_open_review)
+  if quick == "" and close_review == "" then
+    return
+  end
+
+  local message
+  if quick ~= "" and close_review ~= "" then
+    message = string.format("gh-pr diff: close with %s (quick) or %s (close + PR Review)", quick, close_review)
+  elseif quick ~= "" then
+    message = string.format("gh-pr diff: close with %s (quick)", quick)
+  else
+    message = string.format("gh-pr diff: close with %s (close + PR Review)", close_review)
+  end
+
+  vim.schedule(function()
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      vim.notify(message, vim.log.levels.INFO)
+    end
+  end)
 end
 
 function M.resolve_diff_view_options(overrides)
@@ -488,7 +600,9 @@ function M.resolve_diff_view_options(overrides)
   options.mode = normalize_diff_mode(options.mode, configured.mode)
   options.ignore_whitespace = options.ignore_whitespace == true
   options.render_whitespace = options.render_whitespace ~= false
+  options.render_endlines = options.render_endlines == true
   options.whitespace = type(options.whitespace) == "table" and options.whitespace or configured.whitespace
+  options.endlines = type(options.endlines) == "table" and options.endlines or configured.endlines
   options.images = type(options.images) == "table" and options.images or configured.images
 
   if type(overrides) == "table" then
@@ -501,6 +615,9 @@ function M.resolve_diff_view_options(overrides)
     if type(overrides.render_whitespace) == "boolean" then
       options.render_whitespace = overrides.render_whitespace
     end
+    if type(overrides.render_endlines) == "boolean" then
+      options.render_endlines = overrides.render_endlines
+    end
   end
 
   return options
@@ -509,8 +626,6 @@ end
 local function set_pr_buffer_keymaps(bufnr, keymap_opts)
   keymap_opts = type(keymap_opts) == "table" and keymap_opts or {}
   local image_mode = keymap_opts.is_image == true
-  local images_cfg = type(keymap_opts.images) == "table" and keymap_opts.images or resolve_image_options()
-  local fallback_menu_key = type(images_cfg.fallback_menu_keymap) == "string" and images_cfg.fallback_menu_keymap or "gf"
 
   local function remove_buffer_keymap(mode, lhs)
     if type(lhs) == "string" and lhs ~= "" then
@@ -529,148 +644,151 @@ local function set_pr_buffer_keymaps(bufnr, keymap_opts)
 
   local opts = { buffer = bufnr, silent = true, nowait = true }
   local diff_shortcuts = resolve_diff_view_shortcuts()
-  if not image_mode then
-    vim.keymap.set("n", "gc", call_action("add_inline_comment"), vim.tbl_extend("force", opts, {
-      desc = "Add inline PR comment",
-    }))
-    vim.keymap.set("x", "gc", call_action("add_inline_comment_visual"), vim.tbl_extend("force", opts, {
-      desc = "Add inline PR comment for selection",
-    }))
+  local configured_lc = (config.get() or {}).line_comments or {}
+  local line_comment_key = type(configured_lc.keymap) == "string" and configured_lc.keymap or "K"
+  local file_kind = type(vim.b[bufnr].gh_pr_file_kind) == "string" and vim.b[bufnr].gh_pr_file_kind or ""
+  local function set_buffer_keymap(mode, lhs, rhs, desc)
+    if type(lhs) ~= "string" or lhs == "" then
+      return
+    end
+    vim.keymap.set(mode, lhs, rhs, vim.tbl_extend("force", opts, { desc = desc }))
   end
-  vim.keymap.set(
-    "n",
+
+  local managed_normal = {
+    diff_shortcuts.inline_comment,
+    diff_shortcuts.inline_suggestion,
+    diff_shortcuts.line_comments_popup,
+    diff_shortcuts.refresh,
+    diff_shortcuts.close_quick,
+    diff_shortcuts.close_all_open_review,
+    diff_shortcuts.help,
+    diff_shortcuts.next_change,
+    diff_shortcuts.prev_change,
+    diff_shortcuts.next_file,
+    diff_shortcuts.prev_file,
+    diff_shortcuts.next_reviewed_file,
+    diff_shortcuts.prev_reviewed_file,
+    diff_shortcuts.toggle_whitespace,
+    diff_shortcuts.toggle_render_whitespace,
+    diff_shortcuts.toggle_render_endlines,
+    diff_shortcuts.cycle_mode,
+    diff_shortcuts.set_vertical,
+    diff_shortcuts.set_horizontal,
+    diff_shortcuts.set_unified,
+    diff_shortcuts.submit_pending_comment,
+    diff_shortcuts.submit_pending_approve,
+    diff_shortcuts.submit_pending_request_changes,
+    diff_shortcuts.discard_pending_review,
+    diff_shortcuts.toggle_review_tree,
+    diff_shortcuts.image_default_action,
+    diff_shortcuts.image_fallback_menu,
+  }
+  for _, lhs in ipairs(managed_normal) do
+    remove_buffer_keymap("n", lhs)
+  end
+  remove_buffer_keymap("x", diff_shortcuts.inline_comment)
+  remove_buffer_keymap("x", diff_shortcuts.inline_suggestion)
+  remove_buffer_keymap("n", line_comment_key)
+
+  -- Clean legacy single-key mappings to avoid collisions with native Neovim keys.
+  for _, lhs in ipairs({
+    "c",
+    "s",
     "R",
-    call_action("refresh_current_diff_buffer"),
-    vim.tbl_extend("force", opts, { desc = "Refresh current diff from GitHub" })
-  )
-  vim.keymap.set("n", "q", call_action("close_quick"), vim.tbl_extend("force", opts, { desc = "Close quick diff view" }))
-  vim.keymap.set(
-    "n",
+    "q",
     "Q",
-    call_action("close_all_and_open_review"),
-    vim.tbl_extend("force", opts, { desc = "Close diff views and open PR Review" })
-  )
-  vim.keymap.set("n", "?", call_action("show_diff_shortcuts"), vim.tbl_extend("force", opts, { desc = "Show PR diff shortcuts" }))
-  if not image_mode then
-    vim.keymap.set("n", ",n", call_action("next_change"), vim.tbl_extend("force", opts, { desc = "Next PR change" }))
-    vim.keymap.set("n", ",p", call_action("prev_change"), vim.tbl_extend("force", opts, { desc = "Previous PR change" }))
-  end
-  vim.keymap.set("n", ",f", call_action("next_file"), vim.tbl_extend("force", opts, { desc = "Next PR file" }))
-  vim.keymap.set("n", ",F", call_action("prev_file"), vim.tbl_extend("force", opts, { desc = "Previous PR file" }))
-  vim.keymap.set("n", ",v", call_action("next_reviewed_file"), vim.tbl_extend("force", opts, { desc = "Next reviewed PR file" }))
-  vim.keymap.set("n", ",V", call_action("prev_reviewed_file"), vim.tbl_extend("force", opts, { desc = "Previous reviewed PR file" }))
-  if image_mode then
-    local configured_lc = (config.get() or {}).line_comments or {}
-    local line_comment_key = type(configured_lc.keymap) == "string" and configured_lc.keymap or "K"
-    remove_buffer_keymap("n", "gc")
-    remove_buffer_keymap("x", "gc")
-    remove_buffer_keymap("n", ",n")
-    remove_buffer_keymap("n", ",p")
-    remove_buffer_keymap("n", line_comment_key)
-    remove_buffer_keymap("n", diff_shortcuts.toggle_whitespace)
-    remove_buffer_keymap("n", diff_shortcuts.toggle_render_whitespace)
-    remove_buffer_keymap("n", diff_shortcuts.cycle_mode)
-    remove_buffer_keymap("n", diff_shortcuts.set_vertical)
-    remove_buffer_keymap("n", diff_shortcuts.set_horizontal)
-    remove_buffer_keymap("n", diff_shortcuts.set_unified)
-    vim.keymap.set(
-      "n",
-      "<CR>",
-      call_action("run_image_fallback_default_action"),
-      vim.tbl_extend("force", opts, { desc = "Run default image fallback action" })
-    )
-    if fallback_menu_key ~= "" then
-      vim.keymap.set(
-        "n",
-        fallback_menu_key,
-        call_action("open_image_fallback_menu"),
-        vim.tbl_extend("force", opts, { desc = "Open image fallback actions menu" })
-      )
-    end
-  else
-    remove_buffer_keymap("n", "<CR>")
-    if fallback_menu_key ~= "" then
-      remove_buffer_keymap("n", fallback_menu_key)
-    end
-  end
-  if not image_mode and diff_shortcuts.toggle_whitespace ~= "" then
-    vim.keymap.set(
-      "n",
-      diff_shortcuts.toggle_whitespace,
-      call_action("toggle_diff_whitespace"),
-      vim.tbl_extend("force", opts, { desc = "Toggle whitespace diff mode" })
-    )
-  end
-  if not image_mode and diff_shortcuts.toggle_render_whitespace ~= "" then
-    vim.keymap.set(
-      "n",
-      diff_shortcuts.toggle_render_whitespace,
-      call_action("toggle_diff_render_whitespace"),
-      vim.tbl_extend("force", opts, { desc = "Toggle whitespace/tab rendering" })
-    )
-  end
-  if not image_mode and diff_shortcuts.cycle_mode ~= "" then
-    vim.keymap.set(
-      "n",
-      diff_shortcuts.cycle_mode,
-      call_action("cycle_diff_view_mode"),
-      vim.tbl_extend("force", opts, { desc = "Cycle diff render mode" })
-    )
-  end
-  if not image_mode and diff_shortcuts.set_vertical ~= "" then
-    vim.keymap.set(
-      "n",
-      diff_shortcuts.set_vertical,
-      call_action("set_diff_view_mode_vertical"),
-      vim.tbl_extend("force", opts, { desc = "Set vertical diff mode" })
-    )
-  end
-  if not image_mode and diff_shortcuts.set_horizontal ~= "" then
-    vim.keymap.set(
-      "n",
-      diff_shortcuts.set_horizontal,
-      call_action("set_diff_view_mode_horizontal"),
-      vim.tbl_extend("force", opts, { desc = "Set horizontal diff mode" })
-    )
-  end
-  if not image_mode and diff_shortcuts.set_unified ~= "" then
-    vim.keymap.set(
-      "n",
-      diff_shortcuts.set_unified,
-      call_action("set_diff_view_mode_unified"),
-      vim.tbl_extend("force", opts, { desc = "Set unified diff mode" })
-    )
-  end
-  vim.keymap.set(
+    "?",
     "n",
-    ",rs",
-    call_action("submit_pending_comment_review"),
-    vim.tbl_extend("force", opts, { desc = "Submit pending comment review" })
-  )
-  vim.keymap.set(
+    "p",
+    "f",
+    "F",
+    "v",
+    "V",
+    "w",
+    "t",
+    "e",
+    "m",
+    "i",
+    "h",
+    "u",
+    "rc",
+    "ra",
+    "rr",
+    "rd",
+    "x",
+    "<CR>",
+    "gf",
+  }) do
+    remove_buffer_keymap("n", lhs)
+  end
+  remove_buffer_keymap("x", "c")
+  remove_buffer_keymap("x", "s")
+
+  set_buffer_keymap("n", diff_shortcuts.refresh, call_action("refresh_current_diff_buffer"), "Refresh current diff from GitHub")
+  set_buffer_keymap("n", diff_shortcuts.close_quick, call_action("close_quick"), "Close quick diff view")
+  set_buffer_keymap("n", diff_shortcuts.close_all_open_review, call_action("close_all_and_open_review"), "Close diff views and open PR Review")
+  set_buffer_keymap("n", diff_shortcuts.help, call_action("show_diff_shortcuts"), "Show PR diff shortcuts")
+  set_buffer_keymap("n", diff_shortcuts.next_file, call_action("next_file"), "Next PR file")
+  set_buffer_keymap("n", diff_shortcuts.prev_file, call_action("prev_file"), "Previous PR file")
+  set_buffer_keymap("n", diff_shortcuts.next_reviewed_file, call_action("next_reviewed_file"), "Next reviewed PR file")
+  set_buffer_keymap("n", diff_shortcuts.prev_reviewed_file, call_action("prev_reviewed_file"), "Previous reviewed PR file")
+  set_buffer_keymap("n", diff_shortcuts.submit_pending_comment, call_action("submit_pending_comment_review"), "Submit pending comment review")
+  set_buffer_keymap("n", diff_shortcuts.submit_pending_approve, call_action("submit_pending_approve_review"), "Submit pending approve review")
+  set_buffer_keymap(
     "n",
-    ",ra",
-    call_action("submit_pending_approve_review"),
-    vim.tbl_extend("force", opts, { desc = "Submit pending approve review" })
-  )
-  vim.keymap.set(
-    "n",
-    ",rr",
+    diff_shortcuts.submit_pending_request_changes,
     call_action("submit_pending_request_changes_review"),
-    vim.tbl_extend("force", opts, { desc = "Submit pending request changes review" })
+    "Submit pending request changes review"
   )
-  vim.keymap.set(
+  set_buffer_keymap("n", diff_shortcuts.discard_pending_review, call_action("discard_pending_review"), "Discard pending review")
+  set_buffer_keymap("n", diff_shortcuts.toggle_review_tree, call_action("toggle_review_tree"), "Toggle PR Review source")
+
+  if image_mode then
+    set_buffer_keymap(
+      "n",
+      diff_shortcuts.image_default_action,
+      call_action("run_image_fallback_default_action"),
+      "Run default image fallback action"
+    )
+    set_buffer_keymap("n", diff_shortcuts.image_fallback_menu, call_action("open_image_fallback_menu"), "Open image fallback actions menu")
+    maybe_notify_diff_open_hint(bufnr, file_kind, diff_shortcuts)
+    return
+  end
+
+  set_buffer_keymap("n", diff_shortcuts.inline_comment, call_action("add_inline_comment"), "Add inline PR comment")
+  set_buffer_keymap("x", diff_shortcuts.inline_comment, call_action("add_inline_comment_visual"), "Add inline PR comment for selection")
+  set_buffer_keymap("n", diff_shortcuts.inline_suggestion, call_action("add_inline_suggestion"), "Add inline PR suggestion")
+  set_buffer_keymap(
+    "x",
+    diff_shortcuts.inline_suggestion,
+    call_action("add_inline_suggestion_visual"),
+    "Add inline PR suggestion for selection"
+  )
+  if file_kind ~= "unified" then
+    set_buffer_keymap("n", diff_shortcuts.line_comments_popup, function()
+      line_comments.show_at_cursor(bufnr)
+    end, "Show line comments popup")
+  end
+  set_buffer_keymap("n", diff_shortcuts.next_change, call_action("next_change"), "Next PR change")
+  set_buffer_keymap("n", diff_shortcuts.prev_change, call_action("prev_change"), "Previous PR change")
+  set_buffer_keymap("n", diff_shortcuts.toggle_whitespace, call_action("toggle_diff_whitespace"), "Toggle whitespace diff mode")
+  set_buffer_keymap(
     "n",
-    ",rd",
-    call_action("discard_pending_review"),
-    vim.tbl_extend("force", opts, { desc = "Discard pending review" })
+    diff_shortcuts.toggle_render_whitespace,
+    call_action("toggle_diff_render_whitespace"),
+    "Toggle whitespace/tab rendering"
   )
-  vim.keymap.set(
+  set_buffer_keymap(
     "n",
-    ",x",
-    call_action("toggle_review_tree"),
-    vim.tbl_extend("force", opts, { desc = "Toggle PR Review source" })
+    diff_shortcuts.toggle_render_endlines,
+    call_action("toggle_diff_render_endlines"),
+    "Toggle endline rendering (LF/CRLF/CR)"
   )
+  set_buffer_keymap("n", diff_shortcuts.cycle_mode, call_action("cycle_diff_view_mode"), "Cycle diff render mode")
+  set_buffer_keymap("n", diff_shortcuts.set_vertical, call_action("set_diff_view_mode_vertical"), "Set vertical diff mode")
+  set_buffer_keymap("n", diff_shortcuts.set_horizontal, call_action("set_diff_view_mode_horizontal"), "Set horizontal diff mode")
+  set_buffer_keymap("n", diff_shortcuts.set_unified, call_action("set_diff_view_mode_unified"), "Set unified diff mode")
+  maybe_notify_diff_open_hint(bufnr, file_kind, diff_shortcuts)
 end
 
 local function apply_line_highlights(bufnr, highlights)
@@ -875,6 +993,7 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
 
   local bufnr = existing or vim.api.nvim_create_buf(true, true)
   local lines
+  local endline_map = nil
   if is_image then
     lines = image_renderer.build_placeholder_lines({
       path = path,
@@ -886,7 +1005,7 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
       reason = image_reason,
     })
   else
-    lines = vim.split(content or "", "\n", { plain = true })
+    lines, endline_map = split_buffer_text_with_endings(content or "")
   end
   local ft = type(buffer_opts.filetype) == "string" and buffer_opts.filetype
     or (is_image and "markdown" or ((kind == "patch" or kind == "unified") and "diff" or resolve_path_filetype(path)))
@@ -933,6 +1052,7 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
   vim.b[bufnr].gh_pr_image_fallback_notified_reason = nil
   vim.b[bufnr].gh_pr_comment_side = nil
   vim.b[bufnr].gh_pr_unified_line_map = nil
+  vim.b[bufnr].gh_pr_endline_map = is_image and nil or endline_map
 
   if (not is_image) and type(comment_ctx) == "table" then
     local side = comment_ctx.side
@@ -966,6 +1086,10 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
     is_image = is_image,
     images = images_cfg,
   })
+
+  if is_image then
+    vim.api.nvim_buf_clear_namespace(bufnr, endline_render_ns, 0, -1)
+  end
 
   if is_image and not vim.b[bufnr].gh_pr_image_cleanup_attached then
     vim.b[bufnr].gh_pr_image_cleanup_attached = true
@@ -1127,7 +1251,7 @@ local function normalize_commit_file(file)
 end
 
 local function append_lines(lines, text)
-  local chunks = vim.split(text, "\n", { plain = true })
+  local chunks = split_text_with_endings(text)
   for _, chunk in ipairs(chunks) do
     lines[#lines + 1] = chunk
   end
@@ -1213,12 +1337,9 @@ local function prepare_diff_workspace(new_tab)
 end
 
 local function split_content_lines(content)
-  local lines = vim.split(content or "", "\n", { plain = true })
+  local lines = split_text_with_endings(content or "")
   if #lines == 1 and lines[1] == "" then
     return {}
-  end
-  if #lines > 0 and lines[#lines] == "" then
-    table.remove(lines, #lines)
   end
   return lines
 end
@@ -1346,60 +1467,152 @@ local function apply_window_diffopt(winid, ignore_whitespace)
   pcall(vim.api.nvim_set_option_value, "diffopt", table.concat(entries, ","), { win = winid })
 end
 
+local function first_marker_char(value, fallback)
+  local marker = type(value) == "string" and value or ""
+  if marker == "" then
+    marker = fallback
+  end
+  if type(marker) ~= "string" or marker == "" then
+    marker = fallback
+  end
+  if type(marker) ~= "string" or marker == "" then
+    return ""
+  end
+  return vim.fn.strcharpart(marker, 0, 1)
+end
+
 local function apply_window_whitespace_render(winid, enabled)
   if type(winid) ~= "number" or winid < 1 or not vim.api.nvim_win_is_valid(winid) then
     return
   end
 
-  local diff_view = resolve_configured_diff_view()
-  local whitespace = diff_view.whitespace or {}
-  local token_tab = whitespace.tab or ">-"
-  local token_space = whitespace.space or "."
-  local token_trail = whitespace.trail or "~"
-  local token_nbsp = whitespace.nbsp or "+"
+  local bufnr = vim.api.nvim_win_get_buf(winid)
+  if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
 
-  pcall(vim.api.nvim_set_option_value, "list", enabled == true, { win = winid })
+  vim.api.nvim_buf_clear_namespace(bufnr, whitespace_render_ns, 0, -1)
+
+  -- Keep diff buffers independent from global `list` rendering.
+  pcall(vim.api.nvim_set_option_value, "list", false, { win = winid })
 
   local winvars = vim.w[winid]
   local previous_winhl = winvars.gh_pr_whitespace_prev_winhl
-  local group = type(whitespace.highlight_group) == "string" and whitespace.highlight_group ~= ""
-      and whitespace.highlight_group
-    or nil
-  local color = type(whitespace.color) == "string" and whitespace.color ~= "" and whitespace.color or nil
-
-  if enabled then
-    local listchars = string.format("tab:%s,trail:%s,nbsp:%s,space:%s", token_tab, token_trail, token_nbsp, token_space)
-    pcall(vim.api.nvim_set_option_value, "listchars", listchars, { win = winid })
-
-    if group then
-      if color then
-        pcall(vim.api.nvim_set_hl, 0, group, { fg = color, nocombine = true })
-      elseif group ~= "Whitespace" and vim.fn.hlexists(group) == 0 then
-        pcall(vim.api.nvim_set_hl, 0, group, { link = "Whitespace", default = true })
-      end
-
-      local current_winhl = vim.api.nvim_get_option_value("winhl", { win = winid }) or ""
-      if winvars.gh_pr_whitespace_prev_winhl == nil then
-        winvars.gh_pr_whitespace_prev_winhl = current_winhl
-      end
-
-      local entries = {}
-      local has_mapping = false
-      for item in tostring(current_winhl):gmatch("[^,]+") do
-        if not item:match("^Whitespace:") then
-          entries[#entries + 1] = item
-        else
-          has_mapping = true
-        end
-      end
-      entries[#entries + 1] = "Whitespace:" .. group
-      if has_mapping or current_winhl == "" or not current_winhl:find("Whitespace:", 1, true) then
-        pcall(vim.api.nvim_set_option_value, "winhl", table.concat(entries, ","), { win = winid })
-      end
-    end
-  elseif previous_winhl ~= nil then
+  if previous_winhl ~= nil then
     pcall(vim.api.nvim_set_option_value, "winhl", previous_winhl, { win = winid })
     winvars.gh_pr_whitespace_prev_winhl = nil
+  end
+
+  if enabled ~= true or vim.b[bufnr].gh_pr_is_image == true then
+    return
+  end
+
+  local diff_view = resolve_configured_diff_view()
+  local whitespace = type(diff_view.whitespace) == "table" and diff_view.whitespace or {}
+  local token_tab = first_marker_char(whitespace.tab, ">")
+  local token_space = first_marker_char(whitespace.space, ".")
+  local token_trail = first_marker_char(whitespace.trail, "~")
+
+  local group = type(whitespace.highlight_group) == "string" and whitespace.highlight_group ~= ""
+      and whitespace.highlight_group
+    or "GhPrDiffWhitespace"
+  local color = type(whitespace.color) == "string" and whitespace.color ~= "" and whitespace.color or nil
+  if color then
+    pcall(vim.api.nvim_set_hl, 0, group, { fg = color, nocombine = true })
+  elseif group ~= "Whitespace" and vim.fn.hlexists(group) == 0 then
+    pcall(vim.api.nvim_set_hl, 0, group, { link = "Whitespace", default = true })
+  end
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  for line_index, line in ipairs(lines) do
+    if line ~= "" then
+      local leading_start, leading_end = line:find("^[ \t]+")
+      local trailing_start, trailing_end = line:find("[ \t]+$")
+
+      local function mark_range(start_col, end_col, use_trailing_token)
+        if type(start_col) ~= "number" or type(end_col) ~= "number" or start_col > end_col then
+          return
+        end
+        for byte_col = start_col, end_col do
+          local char = line:sub(byte_col, byte_col)
+          local marker = (char == "\t") and token_tab or (use_trailing_token and token_trail or token_space)
+          if marker ~= "" then
+            pcall(vim.api.nvim_buf_set_extmark, bufnr, whitespace_render_ns, line_index - 1, byte_col - 1, {
+              virt_text = { { marker, group } },
+              virt_text_pos = "overlay",
+              hl_mode = "combine",
+              priority = 125,
+            })
+          end
+        end
+      end
+
+      if leading_start and leading_end then
+        mark_range(leading_start, leading_end, false)
+      end
+
+      if trailing_start and trailing_end then
+        local start_col = trailing_start
+        if leading_end and start_col <= leading_end then
+          start_col = leading_end + 1
+        end
+        mark_range(start_col, trailing_end, true)
+      end
+    end
+  end
+end
+
+local function apply_window_endline_render(winid, enabled)
+  if type(winid) ~= "number" or winid < 1 or not vim.api.nvim_win_is_valid(winid) then
+    return
+  end
+
+  local bufnr = vim.api.nvim_win_get_buf(winid)
+  if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  vim.api.nvim_buf_clear_namespace(bufnr, endline_render_ns, 0, -1)
+  if enabled ~= true or vim.b[bufnr].gh_pr_is_image == true then
+    return
+  end
+
+  local endline_map = vim.b[bufnr].gh_pr_endline_map
+  if type(endline_map) ~= "table" or vim.tbl_isempty(endline_map) then
+    return
+  end
+
+  local diff_view = resolve_configured_diff_view()
+  local endline_cfg = type(diff_view.endlines) == "table" and diff_view.endlines or {}
+  local group = type(endline_cfg.highlight_group) == "string" and endline_cfg.highlight_group ~= ""
+      and endline_cfg.highlight_group
+    or "GhPrDiffEndline"
+  local color = type(endline_cfg.color) == "string" and endline_cfg.color ~= "" and endline_cfg.color or nil
+
+  if color then
+    pcall(vim.api.nvim_set_hl, 0, group, { fg = color, nocombine = true })
+  elseif group ~= "Comment" and vim.fn.hlexists(group) == 0 then
+    pcall(vim.api.nvim_set_hl, 0, group, { link = "Comment", default = true })
+  end
+
+  local markers = {
+    lf = type(endline_cfg.lf) == "string" and endline_cfg.lf or "LF",
+    crlf = type(endline_cfg.crlf) == "string" and endline_cfg.crlf or "CRLF",
+    cr = type(endline_cfg.cr) == "string" and endline_cfg.cr or "CR",
+  }
+
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  for line_index = 1, line_count do
+    local ending = endline_map[line_index]
+    local marker = markers[ending]
+    if type(marker) == "string" and marker ~= "" then
+      pcall(vim.api.nvim_buf_set_extmark, bufnr, endline_render_ns, line_index - 1, -1, {
+        virt_text = { { " " .. marker, group } },
+        virt_text_pos = "eol",
+        hl_mode = "combine",
+        priority = 130,
+      })
+    end
   end
 end
 
@@ -1697,8 +1910,11 @@ function M.open_diff(details, pr, file, opts)
     vim.api.nvim_win_set_buf(target_win, single_buf)
     if data.is_image then
       render_image_in_window(single_buf, target_win, details, pr, single_kind, data.status, single_asset, data.image_options)
+      apply_window_whitespace_render(target_win, false)
+      apply_window_endline_render(target_win, false)
     else
       apply_window_whitespace_render(target_win, diff_view.render_whitespace)
+      apply_window_endline_render(target_win, diff_view.render_endlines)
     end
     pcall(vim.api.nvim_set_current_win, target_win)
     return {
@@ -1747,6 +1963,7 @@ function M.open_diff(details, pr, file, opts)
     clear_diff_window_state(target_win)
     vim.api.nvim_win_set_buf(target_win, unified_buf)
     apply_window_whitespace_render(target_win, diff_view.render_whitespace)
+    apply_window_endline_render(target_win, diff_view.render_endlines)
     pcall(vim.api.nvim_set_current_win, target_win)
     return { unified_buf = unified_buf, mode = render_mode }, nil
   end
@@ -1807,6 +2024,8 @@ function M.open_diff(details, pr, file, opts)
     local existing_head_window = find_window_for_buffer(existing_head, current_tab)
     if existing_head_window and existing_head_window.winid ~= target_win then
       head_win = existing_head_window.winid
+      pcall(vim.api.nvim_win_close, head_win, true)
+      head_win = nil
     end
   end
 
@@ -1858,6 +2077,10 @@ function M.open_diff(details, pr, file, opts)
     clear_diff_window_state(head_win)
     render_image_in_window(base_buf, target_win, details, pr, "base", data.status, data.base_asset, data.image_options)
     render_image_in_window(head_buf, head_win, details, pr, "head", data.status, data.head_asset, data.image_options)
+    apply_window_whitespace_render(target_win, false)
+    apply_window_whitespace_render(head_win, false)
+    apply_window_endline_render(target_win, false)
+    apply_window_endline_render(head_win, false)
   else
     pcall(vim.api.nvim_set_current_win, target_win)
     vim.cmd("diffthis")
@@ -1867,6 +2090,8 @@ function M.open_diff(details, pr, file, opts)
     apply_window_diffopt(head_win, diff_view.ignore_whitespace)
     apply_window_whitespace_render(target_win, diff_view.render_whitespace)
     apply_window_whitespace_render(head_win, diff_view.render_whitespace)
+    apply_window_endline_render(target_win, diff_view.render_endlines)
+    apply_window_endline_render(head_win, diff_view.render_endlines)
     apply_diff_window_sync(target_win, head_win)
   end
   pcall(vim.api.nvim_set_current_win, target_win)
@@ -1963,6 +2188,7 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
   local is_image_buffer = false
   local line_highlights = nil
   local unified_line_map = nil
+  local endline_map = nil
   local file_mode = data.file_mode == "added_single" and "added_single"
     or (data.file_mode == "removed_single" and "removed_single" or "diff_pair")
   if kind == "base" then
@@ -2025,7 +2251,7 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
       reason = "",
     })
   else
-    lines = vim.split(content, "\n", { plain = true })
+    lines, endline_map = split_buffer_text_with_endings(content or "")
   end
   set_buffer_content(bufnr, lines)
   apply_line_highlights(bufnr, is_image_buffer and nil or line_highlights)
@@ -2051,6 +2277,7 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
   vim.b[bufnr].gh_pr_image_fallback = is_image_buffer and false or nil
   vim.b[bufnr].gh_pr_image_fallback_notified_reason = nil
   vim.b[bufnr].gh_pr_unified_line_map = nil
+  vim.b[bufnr].gh_pr_endline_map = is_image_buffer and nil or endline_map
   if (not is_image_buffer) and kind == "unified" and type(unified_line_map) == "table" then
     vim.b[bufnr].gh_pr_unified_line_map = unified_line_map
     apply_unified_syntax_highlights(bufnr, canonical_path ~= "" and canonical_path or next_path, unified_line_map)
@@ -2060,12 +2287,19 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
 
   if is_image_buffer then
     set_pr_buffer_keymaps(bufnr, { is_image = true, images = data.image_options })
+    vim.api.nvim_buf_clear_namespace(bufnr, whitespace_render_ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(bufnr, endline_render_ns, 0, -1)
     for _, win in ipairs(windows_showing_buffer(bufnr)) do
       render_image_in_window(bufnr, win.winid, details, pr, image_side, data.status, image_asset, data.image_options)
     end
   else
     image_renderer.clear(bufnr)
     set_pr_buffer_keymaps(bufnr, { is_image = false, images = data.image_options })
+    local diff_view = M.resolve_diff_view_options()
+    for _, win in ipairs(windows_showing_buffer(bufnr)) do
+      apply_window_whitespace_render(win.winid, diff_view.render_whitespace)
+      apply_window_endline_render(win.winid, diff_view.render_endlines)
+    end
   end
 
   if repository then

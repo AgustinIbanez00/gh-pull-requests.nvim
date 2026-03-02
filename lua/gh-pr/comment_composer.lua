@@ -19,6 +19,16 @@ local function valid_buf(bufnr)
   return type(bufnr) == "number" and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr)
 end
 
+local function sanitize_modal_window(winid)
+  if not valid_win(winid) then
+    return
+  end
+
+  pcall(vim.api.nvim_set_option_value, "scrollbind", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "cursorbind", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "diff", false, { win = winid })
+end
+
 local function compute_size(opts)
   local editor_width = math.max(40, vim.o.columns)
   local editor_height = math.max(12, vim.o.lines - vim.o.cmdheight - 1)
@@ -105,6 +115,7 @@ function M.open(opts)
     noautocmd = true,
   })
 
+  sanitize_modal_window(winid)
   vim.api.nvim_win_set_option(winid, "wrap", true)
   vim.api.nvim_win_set_option(winid, "linebreak", true)
   vim.api.nvim_win_set_option(winid, "cursorline", true)

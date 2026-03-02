@@ -19,13 +19,25 @@ local function notify_info(message)
   vim.notify(message, vim.log.levels.INFO)
 end
 
-local function open_telescope_fallback()
+local function with_telescope(handler_name, opts)
   local ok, telescope = pcall(require, "gh-pr.telescope")
   if not ok then
     notify_error("Unable to load Telescope fallback")
-    return
+    return false
   end
-  telescope.pull_requests()
+
+  local handler = telescope[handler_name]
+  if type(handler) ~= "function" then
+    notify_error("Telescope fallback action is not available: " .. tostring(handler_name))
+    return false
+  end
+
+  handler(opts)
+  return true
+end
+
+local function open_telescope_fallback()
+  with_telescope("pull_requests")
 end
 
 local function ensure_neotree_source(source_name, source_module_name)
@@ -437,6 +449,18 @@ function M.open_pull_requests()
   open_default_view()
 end
 
+function M.open_telescope()
+  open_telescope_fallback()
+end
+
+function M.open_telescope_actions(opts)
+  with_telescope("open_context_actions", opts or {})
+end
+
+function M.open_telescope_review_actions(opts)
+  with_telescope("open_review_actions", opts or {})
+end
+
 function M.open_comments(number)
   open_comments_view(number)
 end
@@ -453,6 +477,50 @@ end
 function M.refresh()
   refresh_views()
   notify_info("Refreshed gh-pr views")
+end
+
+function M.refresh_review()
+  local ok_source, review_source = pcall(require, "gh-pr.neotree.review_source")
+  if not ok_source or type(review_source.request_refresh) ~= "function" then
+    notify_error("Unable to load PR Review source refresh handler")
+    return
+  end
+
+  local started = review_source.request_refresh(nil, {
+    force = true,
+    notify_error = true,
+    refresh_context = {
+      mode = "ui-refresh",
+      reason = "manual",
+      notify = false,
+    },
+  })
+
+  if started then
+    notify_info("Refreshing PR Review in background...")
+    return
+  end
+
+  local repo_ok, pr_service = pcall(require, "gh-pr.pr_service")
+  if not repo_ok or type(pr_service.resolve_repository) ~= "function" then
+    notify_error("Unable to refresh PR Review: no active review for current repository")
+    return
+  end
+
+  local repository = pr_service.resolve_repository()
+  local repo_name = type(repository) == "table" and type(repository.full_name) == "string" and repository.full_name or nil
+  if not repo_name or repo_name == "" then
+    notify_error("Unable to refresh PR Review: no active review for current repository")
+    return
+  end
+
+  local review_pr = runtime_state.get_active_review(repo_name)
+  if type(review_pr) ~= "table" or type(review_pr.number) ~= "number" then
+    notify_error("Unable to refresh PR Review: no active review for current repository")
+    return
+  end
+
+  notify_info("PR Review refresh is already in progress")
 end
 
 function M.add_query()

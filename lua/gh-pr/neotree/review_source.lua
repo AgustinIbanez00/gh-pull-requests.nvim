@@ -1348,6 +1348,205 @@ local function normalize_thread_status(raw_thread)
   return "UNRESOLVED", is_resolved, is_outdated
 end
 
+local REVIEWER_SUMMARY_ORDER = { "APPROVED", "REQUEST_CHANGES", "PENDING", "COMMENTED" }
+local CHECK_SUMMARY_ORDER = { "FAIL", "PENDING", "PASS" }
+local THREAD_SUMMARY_ORDER = { "UNRESOLVED", "RESOLVED", "CLOSED" }
+local REVIEW_EVENT_SUMMARY_ORDER = { "REQUEST_CHANGES", "APPROVED", "COMMENTED" }
+
+local function normalize_summary_state_label(state)
+  local value = type(state) == "string" and state:upper() or ""
+  if value == "CHANGES_REQUESTED" then
+    return "REQUEST_CHANGES"
+  end
+  return value
+end
+
+local function count_entries_by_state(items, state_resolver)
+  local counts = {}
+  local total = 0
+  local list = type(items) == "table" and items or {}
+  if type(state_resolver) ~= "function" then
+    return counts, total
+  end
+
+  for _, item in ipairs(list) do
+    local state = normalize_summary_state_label(state_resolver(item))
+    if state ~= "" then
+      counts[state] = (tonumber(counts[state]) or 0) + 1
+      total = total + 1
+    end
+  end
+
+  return counts, total
+end
+
+local function summary_count_parts(counts, preferred_order)
+  local parts = {}
+  local seen = {}
+  local values = type(counts) == "table" and counts or {}
+
+  for _, state in ipairs(type(preferred_order) == "table" and preferred_order or {}) do
+    seen[state] = true
+    local count = tonumber(values[state]) or 0
+    if count > 0 then
+      parts[#parts + 1] = string.format("%d %s", count, state)
+    end
+  end
+
+  local extra_states = {}
+  for state, value in pairs(values) do
+    local count = tonumber(value) or 0
+    if state ~= "" and not seen[state] and count > 0 then
+      extra_states[#extra_states + 1] = state
+    end
+  end
+  table.sort(extra_states)
+
+  for _, state in ipairs(extra_states) do
+    parts[#parts + 1] = string.format("%d %s", tonumber(values[state]) or 0, state)
+  end
+
+  return parts
+end
+
+local function summary_fraction_parts(counts, preferred_order, total)
+  local parts = {}
+  local max = tonumber(total) or 0
+  if max < 1 then
+    return parts
+  end
+
+  local seen = {}
+  local values = type(counts) == "table" and counts or {}
+
+  for _, state in ipairs(type(preferred_order) == "table" and preferred_order or {}) do
+    seen[state] = true
+    local count = tonumber(values[state]) or 0
+    if count > 0 then
+      parts[#parts + 1] = string.format("%d/%d %s", count, max, state)
+    end
+  end
+
+  local extra_states = {}
+  for state, value in pairs(values) do
+    local count = tonumber(value) or 0
+    if state ~= "" and not seen[state] and count > 0 then
+      extra_states[#extra_states + 1] = state
+    end
+  end
+  table.sort(extra_states)
+
+  for _, state in ipairs(extra_states) do
+    parts[#parts + 1] = string.format("%d/%d %s", tonumber(values[state]) or 0, max, state)
+  end
+
+  return parts
+end
+
+local function title_with_summary(base_title, parts)
+  local base = type(base_title) == "string" and base_title or ""
+  local clean_parts = {}
+  for _, part in ipairs(type(parts) == "table" and parts or {}) do
+    if type(part) == "string" and part ~= "" then
+      clean_parts[#clean_parts + 1] = part
+    end
+  end
+
+  if vim.tbl_isempty(clean_parts) then
+    return base
+  end
+
+  return string.format("%s %s", base, table.concat(clean_parts, " "))
+end
+
+local function summary_total_part(count, label)
+  local value = tonumber(count) or 0
+  if value < 1 then
+    return nil
+  end
+
+  local text = type(label) == "string" and label or ""
+  if text == "" then
+    return tostring(value)
+  end
+
+  return string.format("%d %s", value, text)
+end
+
+local function count_reviewer_states(nodes)
+  return count_entries_by_state(nodes, function(node)
+    local extra = type(node) == "table" and type(node.extra) == "table" and node.extra or nil
+    if extra and extra.kind == "reviewer" then
+      return extra.reviewer_state
+    end
+    return nil
+  end)
+end
+
+local function count_check_states(nodes)
+  return count_entries_by_state(nodes, function(node)
+    local extra = type(node) == "table" and type(node.extra) == "table" and node.extra or nil
+    if extra and extra.kind == "check" then
+      return extra.check_state
+    end
+    return nil
+  end)
+end
+
+local function count_commit_entries(nodes)
+  local total = 0
+  for _, node in ipairs(type(nodes) == "table" and nodes or {}) do
+    local extra = type(node) == "table" and type(node.extra) == "table" and node.extra or nil
+    if extra and extra.kind == "commit" then
+      total = total + 1
+    end
+  end
+  return total
+end
+
+local function count_review_event_states(nodes)
+  return count_entries_by_state(nodes, function(node)
+    local extra = type(node) == "table" and type(node.extra) == "table" and node.extra or nil
+    if extra and extra.kind == "comment_event_review" then
+      return extra.review_state
+    end
+    return nil
+  end)
+end
+
+local function count_thread_states(threads)
+  return count_entries_by_state(threads, function(thread)
+    if type(thread) == "table" then
+      return thread.status
+    end
+    return nil
+  end)
+end
+
+local function count_raw_thread_states(raw_threads)
+  return count_entries_by_state(raw_threads, function(raw_thread)
+    if type(raw_thread) ~= "table" then
+      return nil
+    end
+    return (normalize_thread_status(raw_thread))
+  end)
+end
+
+local function count_thread_states_in_file_groups(files)
+  local counts = {}
+  local total = 0
+
+  for _, bucket in pairs(type(files) == "table" and files or {}) do
+    local bucket_counts, bucket_total = count_thread_states(type(bucket) == "table" and bucket.threads or {})
+    for state, value in pairs(bucket_counts) do
+      counts[state] = (tonumber(counts[state]) or 0) + (tonumber(value) or 0)
+    end
+    total = total + (tonumber(bucket_total) or 0)
+  end
+
+  return counts, total
+end
+
 local function timeline_item_for_thread_comment(thread, comment)
   return {
     kind = "thread_comment",
@@ -1748,6 +1947,9 @@ local function build_comment_nodes(pr, details)
   local review_nodes = build_review_event_nodes(pr, details, type(model.reviews) == "table" and model.reviews.items or {})
   local comment_nodes = build_global_comment_event_nodes(pr, details, type(model.comments) == "table" and model.comments.items or {})
   local orphan_nodes = build_thread_nodes(pr, details, orphan_threads)
+  local by_file_thread_states, _ = count_thread_states_in_file_groups(files)
+  local orphan_thread_states, orphan_thread_total = count_thread_states(orphan_threads)
+  local review_event_states, _ = count_review_event_states(review_nodes)
 
   local sections = {}
   if thread_error then
@@ -1786,7 +1988,10 @@ local function build_comment_nodes(pr, details)
 
   sections[#sections + 1] = {
     id = string.format("ghpr-review:%d:comments:by-file", pr.number),
-    name = string.format("By File (%d threads)", by_file_thread_count),
+    name = title_with_summary(
+      "By File",
+      summary_fraction_parts(by_file_thread_states, THREAD_SUMMARY_ORDER, by_file_thread_count)
+    ),
     type = "directory",
     extra = {
       kind = "comments_section",
@@ -1797,9 +2002,13 @@ local function build_comment_nodes(pr, details)
   }
 
   local global_children = {}
+  local review_events_name = title_with_summary(
+    "Reviews",
+    summary_count_parts(review_event_states, REVIEW_EVENT_SUMMARY_ORDER)
+  )
   global_children[#global_children + 1] = {
     id = string.format("ghpr-review:%d:comments:global-reviews", pr.number),
-    name = string.format("Reviews (%d)", #review_nodes),
+    name = review_events_name,
     type = "directory",
     extra = {
       kind = "comments_section",
@@ -1818,7 +2027,9 @@ local function build_comment_nodes(pr, details)
 
   global_children[#global_children + 1] = {
     id = string.format("ghpr-review:%d:comments:global-comments", pr.number),
-    name = string.format("General Comments (%d)", #comment_nodes),
+    name = title_with_summary("General Comments", {
+      summary_total_part(#comment_nodes),
+    }),
     type = "directory",
     extra = {
       kind = "comments_section",
@@ -1838,7 +2049,10 @@ local function build_comment_nodes(pr, details)
   if not vim.tbl_isempty(orphan_nodes) then
     global_children[#global_children + 1] = {
       id = string.format("ghpr-review:%d:comments:global-orphan-threads", pr.number),
-      name = string.format("Threads (No file) (%d)", #orphan_nodes),
+      name = title_with_summary(
+        "Threads (No file)",
+        summary_fraction_parts(orphan_thread_states, THREAD_SUMMARY_ORDER, orphan_thread_total)
+      ),
       type = "directory",
       extra = {
         kind = "comments_section",
@@ -1849,9 +2063,15 @@ local function build_comment_nodes(pr, details)
     }
   end
 
+  local global_summary_parts = {
+    summary_total_part(global_total, "EVENTS"),
+    summary_total_part(#review_nodes, "REVIEWS"),
+    summary_total_part(#comment_nodes, "COMMENTS"),
+    summary_total_part(#orphan_nodes, "THREADS"),
+  }
   sections[#sections + 1] = {
     id = string.format("ghpr-review:%d:comments:global", pr.number),
-    name = string.format("Global (%d events)", global_total),
+    name = title_with_summary("Global", global_summary_parts),
     type = "directory",
     extra = {
       kind = "comments_section",
@@ -1872,6 +2092,20 @@ local function build_root_nodes(pr, details, repo_full_name, session)
   local checks_children = build_check_nodes(pr, details)
   local comments_children = build_comment_nodes(pr, details)
   local files_title = total_files > 0 and string.format("Files %d/%d viewed", viewed_files, total_files) or "Files"
+  local reviewer_states, _ = count_reviewer_states(reviewers_children)
+  local reviewer_title = title_with_summary("Reviewers", summary_count_parts(reviewer_states, REVIEWER_SUMMARY_ORDER))
+  local commits_total = count_commit_entries(commits_children)
+  local commits_title = title_with_summary("Commits", { summary_total_part(commits_total) })
+  local check_states, _ = count_check_states(checks_children)
+  local checks_title = title_with_summary("Checks", summary_count_parts(check_states, CHECK_SUMMARY_ORDER))
+  local comments_title = "Comments"
+  if type(details.review_threads) == "table" then
+    local comment_thread_states, comment_thread_total = count_raw_thread_states(details.review_threads)
+    comments_title = title_with_summary(
+      comments_title,
+      summary_fraction_parts(comment_thread_states, THREAD_SUMMARY_ORDER, comment_thread_total)
+    )
+  end
 
   return {
     {
@@ -1918,7 +2152,7 @@ local function build_root_nodes(pr, details, repo_full_name, session)
         },
         {
           id = string.format("ghpr-review:%d:reviewers", pr.number),
-          name = "Reviewers",
+          name = reviewer_title,
           type = "directory",
           extra = {
             kind = "reviewers",
@@ -1929,7 +2163,7 @@ local function build_root_nodes(pr, details, repo_full_name, session)
         },
         {
           id = string.format("ghpr-review:%d:commits", pr.number),
-          name = "Commits",
+          name = commits_title,
           type = "directory",
           extra = {
             kind = "commits",
@@ -1940,7 +2174,7 @@ local function build_root_nodes(pr, details, repo_full_name, session)
         },
         {
           id = string.format("ghpr-review:%d:checks", pr.number),
-          name = "Checks",
+          name = checks_title,
           type = "directory",
           extra = {
             kind = "checks",
@@ -1951,7 +2185,7 @@ local function build_root_nodes(pr, details, repo_full_name, session)
         },
         {
           id = string.format("ghpr-review:%d:comments", pr.number),
-          name = "Comments",
+          name = comments_title,
           type = "directory",
           extra = {
             kind = "comments",
@@ -2594,22 +2828,25 @@ M.setup = function(source_config, _)
   source_config.window.mappings = source_config.window.mappings or {}
 
   local default_mappings = {
-    ["<space>"] = "toggle_node",
     ["<CR>"] = "gh_pr_review_open",
     ["R"] = "refresh",
     ["o"] = "open_overview",
+    ["b"] = "open_pr_browser",
+    ["T"] = "open_telescope_actions",
     ["d"] = "open_diff",
     ["O"] = "open_original",
     ["M"] = "open_modified",
-    ["p"] = "toggle_viewed",
     ["v"] = "toggle_viewed",
+    ["a"] = "edit_assignees_multi",
     ["l"] = "edit_labels_multi",
-    ["r"] = "edit_reviewers_multi",
+    ["u"] = "edit_reviewers_multi",
     ["g"] = "comment_file_global",
-    ["S"] = "submit_pending_comment_review",
-    ["A"] = "submit_pending_approve_review",
-    ["C"] = "submit_pending_request_changes_review",
-    ["D"] = "discard_pending_review",
+    ["c"] = "comment_pr",
+    ["r"] = "start_review",
+    ["ra"] = "submit_pending_approve_review",
+    ["rc"] = "submit_pending_comment_review",
+    ["rr"] = "submit_pending_request_changes_review",
+    ["rd"] = "discard_pending_review",
     ["zA"] = "expand_all_review_nodes",
     ["za"] = "collapse_all_review_nodes",
     ["zF"] = "expand_files_nodes",
@@ -2620,7 +2857,6 @@ M.setup = function(source_config, _)
     ["zc"] = "collapse_comments_by_file",
     ["zG"] = "expand_comments_global",
     ["zg"] = "collapse_comments_global",
-    ["s"] = "start_review",
     ["x"] = "toggle_review_tree",
     ["e"] = "toggle_auto_expand_width",
     ["q"] = "close_window",

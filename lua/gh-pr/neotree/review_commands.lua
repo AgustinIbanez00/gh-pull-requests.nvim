@@ -19,6 +19,10 @@ local function node_kind(node)
   return node and node.extra and node.extra.kind or nil
 end
 
+local function has_pr_context(node)
+  return node and node.extra and node.extra.pr ~= nil
+end
+
 local function apply_context(node)
   if not node or type(node.extra) ~= "table" then
     return
@@ -386,7 +390,14 @@ end
 M.noop = function() end
 
 M.refresh = function(state)
-  source.request_refresh(state, { force = true })
+  source.request_refresh(state, {
+    force = true,
+    refresh_context = {
+      mode = "ui-refresh",
+      reason = "manual",
+      notify = false,
+    },
+  })
 end
 
 M.gh_pr_review_open = function(state)
@@ -541,12 +552,28 @@ M.comment_file_global = function(state)
   end
 end
 
+M.comment_pr = function(state)
+  local node = current_node(state)
+  if node then
+    apply_context(node)
+  end
+  actions.comment_pr()
+end
+
 M.edit_labels_multi = function(state)
   local node = current_node(state)
   if node then
     apply_context(node)
   end
   actions.overview_edit_stub("edit_labels", {})
+end
+
+M.edit_assignees_multi = function(state)
+  local node = current_node(state)
+  if node then
+    apply_context(node)
+  end
+  actions.overview_edit_stub("edit_assignees", {})
 end
 
 M.edit_reviewers_multi = function(state)
@@ -565,6 +592,33 @@ M.open_overview = function(state)
 
   apply_context(node)
   actions.open_overview()
+end
+
+M.open_pr_browser = function(state)
+  local node = current_node(state)
+  if not node or not has_pr_context(node) then
+    vim.notify("Selected node has no pull request context", vim.log.levels.INFO)
+    return
+  end
+
+  apply_context(node)
+  local pr = node.extra and node.extra.pr or nil
+  actions.open_overview_url(pr and pr.number or nil)
+end
+
+M.open_telescope_actions = function(state)
+  local node = current_node(state)
+  if node then
+    apply_context(node)
+  end
+
+  local ok, telescope = pcall(require, "gh-pr.telescope")
+  if not ok then
+    vim.notify("Unable to load Telescope review actions", vim.log.levels.ERROR)
+    return
+  end
+
+  telescope.open_review_actions()
 end
 
 M.start_review = function(state)

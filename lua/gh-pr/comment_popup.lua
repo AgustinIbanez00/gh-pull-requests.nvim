@@ -19,6 +19,16 @@ local function valid_win(winid)
   return type(winid) == "number" and winid > 0 and vim.api.nvim_win_is_valid(winid)
 end
 
+local function sanitize_modal_window(winid)
+  if not valid_win(winid) then
+    return
+  end
+
+  pcall(vim.api.nvim_set_option_value, "scrollbind", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "cursorbind", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "diff", false, { win = winid })
+end
+
 local function clamp(value, minimum, maximum)
   return math.max(minimum, math.min(maximum, value))
 end
@@ -311,6 +321,7 @@ function M.open(opts)
   })
 
   local wrap = opts.wrap ~= false
+  sanitize_modal_window(popup_win)
   vim.api.nvim_win_set_option(popup_win, "wrap", wrap)
   vim.api.nvim_win_set_option(popup_win, "linebreak", wrap)
   vim.api.nvim_win_set_option(popup_win, "winhl", safe_string(opts.winhl, "NormalFloat:NormalFloat,FloatBorder:FloatBorder"))

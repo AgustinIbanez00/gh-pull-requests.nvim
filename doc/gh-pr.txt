@@ -25,13 +25,29 @@ Commands
 :GhPrList
     Opens Telescope query and pull request picker.
 
+:GhPrTelescope
+    Opens Telescope query and pull request picker (fallback entrypoint).
+
+:GhPrTelescopeActions
+    Opens contextual Telescope actions:
+      - active Review context when available
+      - otherwise active PR context
+      - otherwise falls back to query/PR picker
+
+:GhPrTelescopeReview
+    Opens Telescope actions scoped to active PR Review context.
+
 :GhPrComments [number]
     Opens the PR Review source with comments integrated for the active PR
     or provided PR number.
 
 :GhPrStartReview [number]
-    Starts review flow for active/provided PR. Prompts whether to notify
-    GitHub (creates/ensures pending review) and opens PR Review source.
+    Starts review flow for active/provided PR and opens PR Review source.
+    Notification prompt (`Notify GitHub that review started...`) is shown
+    only when:
+      - PR is not authored by current user
+      - current user is explicitly requested reviewer on that PR
+      - current user has no pending review on GitHub yet
 
 :GhPrReviewTree
     Toggles PR Review source (`gh_pr_review`).
@@ -49,12 +65,16 @@ Commands
     Marking viewed/unviewed from `gh_pr_review` does not force-focus
     the `gh_pr` panel.
     Inside `gh_pr_review`, `R` forces refresh from GitHub for active PR.
+    `r` re-runs start-review flow for selected PR context.
+    `ra` submit pending review as approve.
+    `rc` submit pending review as comment.
+    `rr` submit pending review as request changes.
+    `rd` discard pending review.
+    `a` opens assignees edit dialog.
     `l` opens labels multi-select edit dialog.
-    `r` opens reviewers multi-select edit dialog.
-    `S` submit pending review as comment.
-    `A` submit pending review as approve.
-    `C` submit pending review as request changes.
-    `D` discard pending review.
+    `u` opens reviewers multi-select edit dialog.
+    `c` publish regular PR comment (`gh pr comment`) outside pending review.
+    `x` toggles PR Review source from current context.
     `zA` expand all review nodes.
     `za` collapse all review nodes.
     `zF` expand `Files` subtree.
@@ -65,11 +85,14 @@ Commands
     `zc` collapse `Comments > By File`.
     `zG` expand `Comments > Global` (including subgroups).
     `zg` collapse `Comments > Global` (including subgroups).
-    `s` re-runs start-review flow for selected PR context.
     `:GhPrOpenCommitPatch` opens the full patch for selected commit.
 
 :GhPrRefresh
     Refreshes PR data in active views.
+
+:GhPRReviewRefresh
+    Forces PR Review refresh in background for the active review PR.
+    Alias: `:GhPrReviewRefresh`.
 
 :GhPrOverview
     Opens an interactive tabs overview for the active pull request.
@@ -88,7 +111,7 @@ Overview buffer keymaps:
     `m` merge PR
     `k` checkout PR branch
     `R` refresh overview
-    `o` open PR URL in browser
+    `b` open PR URL in browser
     `C` open Comments PR tree for current PR
     `q` close buffer
     `H`/`L` previous/next tab
@@ -103,6 +126,7 @@ Overview buffer keymaps:
     `ed` toggle draft status (`ready`/`draft`)
     `<CR>` open selected row action
     `<CR>` on `Commits` opens commit diff details in virtual patch buffer
+    `gp` preview markdown link under cursor in PR description
     `gr` load more for current section tab
     `D` open diff for selected row (file/commit)
     `O` open original for selected file row
@@ -113,6 +137,15 @@ Overview buffer keymaps:
     In multi-select edits (`labels`/`reviewers`), deselected current items
     are interpreted as removals.
     PR description is rendered inline as markdown in `Summary`.
+    Markdown links in description render as labels and support preview.
+    Link preview download is only used for GitHub attachments.
+    Non-attachment links prompt `open link`/`cancel` and open in browser
+    only after confirmation.
+    Overview markdown normalizes CRLF/LF line endings to avoid `^M`
+    artifacts on Windows.
+    PR metadata (state/review/merge/branches/stats) is rendered globally
+    in header across tabs.
+    `Summary` no longer renders the old `Actions` block.
 
 :GhPrCheckout [number]
     Runs `gh pr checkout` for the active PR or provided number.
@@ -132,47 +165,54 @@ Overview buffer keymaps:
       - `auto_github` opens GitHub compare URL, then metadata fallback
     If GitHub file content cannot be loaded, command fails with an explicit
     error (no implicit patch fallback buffer).
-    In virtual PR buffers, `K` opens a modal floating window with comments
+    Virtual file content normalizes CRLF/LF/CR endings to avoid `^M` artifacts.
+    Diff actions are namespaced under `<localleader>` to avoid overriding
+    native Neovim default keys.
+    In virtual PR buffers, `<localleader>dk` opens a modal floating window with comments
     for the current line.
-    Press `R` to refresh current diff buffer from GitHub.
-    Press `?` to open a floating shortcuts help dialog for this buffer.
-    Press `q` for quick close:
+    Press `<localleader>dr` to refresh current diff buffer from GitHub.
+    Press `<localleader>d?` to open a floating shortcuts help dialog for this buffer.
+    Press `<localleader>dq` for quick close:
       - in 2-way diff closes head/modified window and keeps base/original
       - in single-buffer views closes current buffer and opens PR Review
-    Press `Q` to close current diff view(s) and open/focus PR Review.
+    Press `<localleader>dQ` to close current diff view(s) and open/focus PR Review.
+    On first open per diff buffer, gh-pr shows a one-time hint with close shortcuts.
     Additional virtual-buffer shortcuts:
-      `R` refresh current diff from GitHub
-      `q` quick close
-      `Q` close diff view(s) and open PR Review
-      `,dw` toggle whitespace diff mode (ignored/strict)
-      `,dt` toggle whitespace/tab symbol rendering
-      `,dm` cycle diff mode
-      `,dv` force vertical split mode
-      `,dh` force horizontal split mode
-      `,du` force unified mode
-      `gc` add inline comment at cursor (`MODIFIED`/head or `unified`)
-      visual `gc` add inline comment for selected range (`v`/`V`, head or `unified`)
-      image files disable `K`, `gc`, `,n`, `,p` and whitespace/layout toggles
-      image files: `<CR>` runs default fallback action, `gf` opens fallback menu
+      `<localleader>dr` refresh current diff from GitHub
+      `<localleader>dq` quick close
+      `<localleader>dQ` close diff view(s) and open PR Review
+      `<localleader>tw` toggle whitespace diff mode (ignored/strict)
+      `<localleader>ts` toggle leading/trailing whitespace/tab symbol rendering
+      `<localleader>te` toggle endline markers (`LF`/`CRLF`/`CR`)
+      `<localleader>mm` cycle diff mode
+      `<localleader>mv` force vertical split mode
+      `<localleader>mh` force horizontal split mode
+      `<localleader>mu` force unified mode
+      `<localleader>ic` add inline comment at cursor (`MODIFIED`/head or `unified`)
+      visual `<localleader>ic` add inline comment for selected range (`v`/`V`, head or `unified`)
+      `<localleader>is` add inline suggestion at cursor (`suggestion` template)
+      visual `<localleader>is` add inline suggestion for selected range (`v`/`V`)
+      image files disable `<localleader>dk`, `<localleader>ic`, `<localleader>is`, `<localleader>dn`, `<localleader>dp` and whitespace/layout toggles
+      image files: `<localleader>io` runs default fallback action, `<localleader>im` opens fallback menu
       for `ADDED` files, opens single MODIFIED buffer (no split/unified layout)
-      in `ADDED` single mode, `gc` is allowed on any line/range
+      in `ADDED` single mode, `<localleader>ic` is allowed on any line/range
       inline comments are validated before opening composer:
       - head: only inside diff hunks
       - unified: only on added (`+`) lines
       composer: `<C-s>` submit draft, `q`/`<Esc>` cancel
-      `,n` next change
-      `,p` previous change
-      `,f` next file
-      `,F` previous file
-      `,v` next reviewed file
-      `,V` previous reviewed file
+      `<localleader>dn` next change
+      `<localleader>dp` previous change
+      `<localleader>df` next file
+      `<localleader>dF` previous file
+      `<localleader>dv` next reviewed file
+      `<localleader>dV` previous reviewed file
       file navigation always reopens full diff view using current render mode
       (`vertical`/`horizontal`/`unified`)
-      `,rs` submit pending review as comment
-      `,ra` submit pending review as approve
-      `,rr` submit pending review as request changes
-      `,rd` discard pending review
-      `,x` toggle PR Review source
+      `<localleader>rc` submit pending review as comment
+      `<localleader>ra` submit pending review as approve
+      `<localleader>rr` submit pending review as request changes
+      `<localleader>rd` discard pending review
+      `<localleader>rx` toggle PR Review source
 
 :GhPrOpenOriginal
     Opens virtual readonly base version for active PR file.
@@ -239,8 +279,25 @@ Keymaps
 <leader>ght       Toggle viewed (:GhPrToggleReviewed)
 <leader>ghn       Next diff hunk (:GhPrNextChange)
 <leader>ghp       Previous diff hunk (:GhPrPrevChange)
-`C` (gh_pr)      Open comments tree (:GhPrComments)
-`S` (gh_pr)      Start review flow for selected PR
+gh_pr PR nodes     Expose only `Overview` child (no `Files` subtree)
+`r` (gh_pr)      Start review flow for selected PR
+`ra` (gh_pr)     Approve review flow for selected PR
+`rc` (gh_pr)     Comment review flow for selected PR
+`rr` (gh_pr)     Request-changes review flow for selected PR
+`rd` (gh_pr)     Discard pending review for selected PR
+`m` (gh_pr)      Merge flow for selected PR
+`k` (gh_pr)      Checkout selected PR branch
+gh_pr PR rows     Show `[DRAFT]` suffix and draft highlight when draft
+`r` prompt rule   Ask `Notify GitHub...` only for eligible reviewer flow
+`b` (gh_pr)      Open selected PR in browser (PR nodes only)
+`b` (gh_pr_review) Open selected PR in browser (PR context nodes only)
+`T` (gh_pr_review) Open Telescope actions scoped to Review context
+`r` (gh_pr_review) Start/re-enter review flow
+`ra`/`rc`/`rr`/`rd` (gh_pr_review) Submit/discard pending review
+`a`/`l`/`u` (gh_pr_review) Edit assignees/labels/reviewers
+`c` (gh_pr_review) Publish regular PR comment (`gh pr comment`)
+`<space>` (gh_pr/gh_pr_review) Not bound by default (keeps `<leader>` free)
+PR sources prioritize PR-specific mappings over generic Neo-tree mappings
 
 Configuration
 =============
@@ -262,7 +319,7 @@ Call `require("gh-pr").setup({ ... })` with:
 - `line_comments.show_outdated` (`true`)
 - `line_comments.max_popup_width` (`90`)
 - `line_comments.max_popup_height` (`18`)
-- `line_comments.popup.enter` (`true`, modal popup on `K`)
+- `line_comments.popup.enter` (`true`, modal popup on the configured keymap)
 - `line_comments.popup.position` (`"cursor"`, or `"editor"` / `"preview_window"`)
 - `line_comments.popup.border` (`"rounded"`)
 - `line_comments.popup.wrap` (`true`)
@@ -297,6 +354,11 @@ Call `require("gh-pr").setup({ ... })` with:
 - `overview.markdown.provider` (`"auto"`)
 - `overview.markdown.max_lines` (`500`)
 - `overview.markdown.code_block_border` (`false`)
+- `overview.markdown.link_preview_keymap` (`"gp"`)
+- `overview.markdown.link_preview_max_bytes` (`10485760`, 10 MiB)
+- `overview.markdown.link_preview_renderable_extensions` (`txt/md/markdown/json/yaml/yml/csv/log`)
+- `overview.markdown.link_preview_disallowed_extensions` (`zip`)
+- `overview.markdown.link_preview_open_local` (`"system"`)
 - `overview.max_items` (checks/commits/timeline)
 - `overview.show` (toggle sections)
 - `cache.gh_pr.enabled` (`true`)
@@ -314,18 +376,48 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.mode` (`"vertical"`, also `"horizontal"` / `"unified"`)
 - `diff_view.ignore_whitespace` (`false`)
 - `diff_view.render_whitespace` (`true`)
-- `diff_view.whitespace.tab` (`">-"`, tab marker in `listchars`)
-- `diff_view.whitespace.space` (`"."`, space marker in `listchars`)
-- `diff_view.whitespace.trail` (`"~"`, trailing space marker)
+- `diff_view.render_endlines` (`false`)
+- `diff_view.whitespace.tab` (`">-"`, marker for leading/trailing tabs)
+- `diff_view.whitespace.space` (`"."`, marker for leading spaces)
+- `diff_view.whitespace.trail` (`"~"`, marker for trailing spaces)
 - `diff_view.whitespace.nbsp` (`"+"`, non-breaking space marker)
 - `diff_view.whitespace.color` (`nil`, optional highlight color e.g. `#7f8ea3`)
 - `diff_view.whitespace.highlight_group` (`"GhPrDiffWhitespace"`)
-- `diff_view.shortcuts.toggle_whitespace` (`",dw"`)
-- `diff_view.shortcuts.toggle_render_whitespace` (`",dt"`)
-- `diff_view.shortcuts.cycle_mode` (`",dm"`)
-- `diff_view.shortcuts.set_vertical` (`",dv"`)
-- `diff_view.shortcuts.set_horizontal` (`",dh"`)
-- `diff_view.shortcuts.set_unified` (`",du"`)
+- `diff_view.endlines.lf` (`"LF"`)
+- `diff_view.endlines.crlf` (`"CRLF"`)
+- `diff_view.endlines.cr` (`"CR"`)
+- `diff_view.endlines.color` (`"#d16969"`)
+- `diff_view.endlines.highlight_group` (`"GhPrDiffEndline"`)
+- `diff_view.shortcuts.inline_comment` (`"<localleader>ic"`)
+- `diff_view.shortcuts.inline_suggestion` (`"<localleader>is"`)
+- `diff_view.shortcuts.line_comments_popup` (`"<localleader>dk"`)
+- `diff_view.shortcuts.refresh` (`"<localleader>dr"`)
+- `diff_view.shortcuts.close_quick` (`"<localleader>dq"`)
+- `diff_view.shortcuts.close_all_open_review` (`"<localleader>dQ"`)
+- `diff_view.shortcuts.help` (`"<localleader>d?"`)
+- `diff_view.shortcuts.next_change` (`"<localleader>dn"`)
+- `diff_view.shortcuts.prev_change` (`"<localleader>dp"`)
+- `diff_view.shortcuts.next_file` (`"<localleader>df"`)
+- `diff_view.shortcuts.prev_file` (`"<localleader>dF"`)
+- `diff_view.shortcuts.next_reviewed_file` (`"<localleader>dv"`)
+- `diff_view.shortcuts.prev_reviewed_file` (`"<localleader>dV"`)
+- `diff_view.shortcuts.toggle_whitespace` (`"<localleader>tw"`)
+- `diff_view.shortcuts.toggle_render_whitespace` (`"<localleader>ts"`)
+- `diff_view.shortcuts.toggle_render_endlines` (`"<localleader>te"`)
+- `diff_view.shortcuts.cycle_mode` (`"<localleader>mm"`)
+- `diff_view.shortcuts.set_vertical` (`"<localleader>mv"`)
+- `diff_view.shortcuts.set_horizontal` (`"<localleader>mh"`)
+- `diff_view.shortcuts.set_unified` (`"<localleader>mu"`)
+- `diff_view.shortcuts.submit_pending_comment` (`"<localleader>rc"`)
+- `diff_view.shortcuts.submit_pending_approve` (`"<localleader>ra"`)
+- `diff_view.shortcuts.submit_pending_request_changes` (`"<localleader>rr"`)
+- `diff_view.shortcuts.discard_pending_review` (`"<localleader>rd"`)
+- `diff_view.shortcuts.toggle_review_tree` (`"<localleader>rx"`)
+- `diff_view.shortcuts.image_default_action` (`"<localleader>io"`)
+- `diff_view.shortcuts.image_fallback_menu` (`"<localleader>im"`)
+- `diff_view.shortcuts.show_open_hint` (`true`)
+- `<localleader>` in diff shortcuts uses `vim.g.maplocalleader`; when unset,
+  gh-pr falls back to `,` for diff-buffer mappings.
 - `diff_view.images.enabled` (`true`)
 - `diff_view.images.backend` (`"snacks"`, only backend currently supported)
 - `diff_view.images.formats` (`png/jpg/jpeg/gif/webp/bmp/svg`)
@@ -333,7 +425,7 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.images.fallback` (`"placeholder"`)
 - `diff_view.images.fallback_mode` (`"menu"`, also `"metadata_only"` / `"auto_local"` / `"auto_github"`)
 - `diff_view.images.fallback_default_action` (`"metadata"`, also `"open_local_current"` / `"open_local_both"` / `"open_github"`)
-- `diff_view.images.fallback_menu_keymap` (`"gf"`)
+- `diff_view.images.fallback_menu_keymap` (`"gf"`, legacy hint in fallback messages)
 - `diff_view.images.fallback_open_local` (`"system"`)
 - `diff_view.images.fallback_github_target` (`"pr_files"`, also `"pr"`)
 - `diff_view.images.show_metadata` (`true`)
@@ -349,7 +441,7 @@ Persistence
 
 - Queries: `stdpath("state")/gh-pr/queries.json`
 - Viewed files: `stdpath("state")/gh-pr/state.json`
-- Diff view prefs (`mode`, `ignore_whitespace`, `render_whitespace`): `stdpath("state")/gh-pr/state.json`
+- Diff view prefs (`mode`, `ignore_whitespace`, `render_whitespace`, `render_endlines`): `stdpath("state")/gh-pr/state.json`
 - Image fallback default action: `stdpath("state")/gh-pr/state.json`
 - PR cache: `stdpath("state")/gh-pr/pr_cache.json`
 - Cache is stored per source/repo key (`gh_pr` and `gh_pr_review`).

@@ -47,12 +47,34 @@ local function save_cursor(view)
   view.cursor_by_tab[view.current_tab] = cursor[1]
 end
 
-local function current_action(view)
+local function current_action(view, opts)
+  opts = type(opts) == "table" and opts or {}
   local winid = utils.current_win_for_buf(view.bufnr)
   if not winid then
     return nil
   end
-  local line = vim.api.nvim_win_get_cursor(winid)[1]
+  local cursor = vim.api.nvim_win_get_cursor(winid)
+  local line = cursor[1]
+  local col = cursor[2]
+
+  if opts.include_inline == true then
+    local inline = type(view.inline_actions) == "table" and view.inline_actions[line] or nil
+    if type(inline) == "table" and not vim.tbl_isempty(inline) then
+      for _, item in ipairs(inline) do
+        local start_col = tonumber(item.start_col) or -1
+        local end_col = tonumber(item.end_col) or -1
+        local includes_col = start_col >= 0 and col >= start_col and (end_col < 0 or col < end_col)
+        if includes_col and type(item.action) == "table" then
+          return item.action
+        end
+      end
+    end
+  end
+
+  if opts.inline_only == true then
+    return nil
+  end
+
   return view.line_actions[line]
 end
 
@@ -72,6 +94,15 @@ local function execute_action(view, action, variant)
       return
     end
     utils.open_url(action.fallback_url)
+    return
+  end
+
+  if action.kind == "markdown_link" then
+    if type(view.callbacks.preview_markdown_link) == "function" then
+      view.callbacks.preview_markdown_link(action)
+      return
+    end
+    utils.open_url(action.url)
     return
   end
 
@@ -219,11 +250,11 @@ local function ensure_keymaps(view)
     end
   end, "GH PR Overview: refresh")
 
-  map(bufnr, "o", function()
+  map(bufnr, "b", function()
     if type(view.callbacks.open_url) == "function" then
       view.callbacks.open_url()
     end
-  end, "GH PR Overview: open PR URL")
+  end, "GH PR Overview: open PR in browser")
 
   map(bufnr, "C", function()
     if type(view.callbacks.open_comments_tree) == "function" then
@@ -273,6 +304,18 @@ local function ensure_keymaps(view)
   map(bufnr, "M", with_view(function(current)
     execute_action(current, current_action(current), "modified")
   end), "GH PR Overview: open modified file")
+
+  local preview_key = type(view.markdown.link_preview_keymap) == "string" and view.markdown.link_preview_keymap or "gp"
+  if preview_key ~= "" then
+    map(bufnr, preview_key, with_view(function(current)
+      local action = current_action(current, { include_inline = true, inline_only = true })
+      if type(action) ~= "table" or action.kind ~= "markdown_link" then
+        vim.notify("No markdown link found under cursor", vim.log.levels.WARN)
+        return
+      end
+      execute_action(current, action, "default")
+    end), "GH PR Overview: preview markdown link")
+  end
 
   map(bufnr, "gr", with_view(function(current)
     run_more_current(current)
@@ -413,6 +456,7 @@ function M.open(model, opts)
     current_tab = tabs[1],
     cursor_by_tab = {},
     line_actions = {},
+    inline_actions = {},
     keymaps_set = false,
     cleanup_registered = false,
   }

@@ -165,123 +165,12 @@ local function build_chip_line(prefix, values, opts)
   return line, spans
 end
 
-local function summary_actions(view)
-  local model = view.model
-  return {
-    { key = "o", label = "Open pull request in browser", action = { kind = "url", url = model.url } },
-    { key = "C", label = "Open Comments PR tree", action = { kind = "open_comments_tree" } },
-    { key = "et", label = "Edit title", action = summary_action("edit_title", { current = model.title }) },
-    { key = "eb", label = "Edit description", action = summary_action("edit_body", { current = model.description }) },
-    {
-      key = "el",
-      label = "Edit labels",
-      action = summary_action("edit_labels", {
-        current = table.concat(vim.tbl_map(function(label)
-          return utils.safe_string(label.name, "")
-        end, model.labels and model.labels.items or {}), ", "),
-      }),
-    },
-    {
-      key = "er",
-      label = "Edit reviewers",
-      action = summary_action("edit_reviewers", {
-        current = table.concat(model.people and model.people.review_requests or {}, ", "),
-      }),
-    },
-    {
-      key = "ea",
-      label = "Edit assignees",
-      action = summary_action("edit_assignees", {
-        current = table.concat(model.people and model.people.assignees or {}, ", "),
-      }),
-    },
-    {
-      key = "em",
-      label = "Edit milestone",
-      action = summary_action("edit_milestone", {
-        current = utils.safe_string(model.summary and model.summary.milestone, ""),
-      }),
-    },
-    {
-      key = "es",
-      label = "Change state",
-      action = summary_action("change_state", {
-        current = utils.safe_string(model.summary and model.summary.state, ""),
-      }),
-    },
-    {
-      key = "ed",
-      label = "Toggle draft/ready",
-      action = summary_action("change_draft", {
-        current = model.summary and model.summary.is_draft and "draft" or "ready",
-      }),
-    },
-  }
-end
-
 local function build_summary_items(view)
   local model = view.model
-  local summary = model.summary or {}
   local people = model.people or {}
   local theme = view.theme
-  local date_format = view.date_format
   local items = {}
-
-  local state_token = styles.state_text(summary)
-  local review_token = utils.safe_string(summary.review_decision, "REVIEW_REQUIRED")
-  local merge_state = utils.safe_string(summary.merge_state, "-")
-  local mergeable = utils.safe_string(summary.mergeable, "-")
-
-  items[#items + 1] = {
-    lines = {
-      string.format(
-        "@%s opened %s into %s",
-        utils.safe_string(summary.author, "unknown"),
-        utils.safe_string(summary.head_ref, "?"),
-        utils.safe_string(summary.base_ref, "?")
-      ),
-    },
-    hl = "GhPrOverviewBranch",
-    trailing_blank = false,
-  }
-
-  local status_line = string.format(
-    "State: %s   Review: %s   Merge: %s (%s)",
-    state_token,
-    review_token,
-    merge_state,
-    mergeable
-  )
-  local status_spans = {}
-  map_token_span(status_spans, status_line, state_token, styles.state_highlight(summary, theme))
-  map_token_span(status_spans, status_line, review_token, styles.review_highlight(review_token, theme))
-  items[#items + 1] = {
-    lines = { status_line },
-    highlights = status_spans,
-    trailing_blank = false,
-  }
-
-  items[#items + 1] = {
-    lines = {
-      string.format(
-        "Changed files: %d   +%d   -%d",
-        tonumber(summary.files_changed) or 0,
-        tonumber(summary.additions) or 0,
-        tonumber(summary.deletions) or 0
-      ),
-      string.format("Created: %s", utils.format_time(summary.created_at, date_format)),
-      string.format("Updated: %s", utils.format_time(summary.updated_at, date_format)),
-    },
-    trailing_blank = false,
-  }
-
-  if utils.safe_string(summary.merged_at, "") ~= "" then
-    items[#items + 1] = {
-      lines = { string.format("Merged: %s", utils.format_time(summary.merged_at, date_format)) },
-      hl = "GhPrOverviewStateMerged",
-      trailing_blank = false,
-    }
-  end
+  local summary = model.summary or {}
 
   if utils.safe_string(summary.milestone, "") ~= "" then
     items[#items + 1] = {
@@ -337,29 +226,6 @@ local function build_summary_items(view)
   }
 
   items[#items + 1] = {
-    lines = { "Actions" },
-    hl = "GhPrOverviewHeading",
-    trailing_blank = false,
-  }
-
-  for _, action in ipairs(summary_actions(view)) do
-    local action_line = string.format("[%s] %s", action.key, action.label)
-    items[#items + 1] = {
-      lines = { action_line },
-      highlights = {
-        {
-          line = 1,
-          start_col = 0,
-          end_col = 2 + #action.key,
-          group = "GhPrOverviewActionKey",
-        },
-      },
-      action = action.action,
-      trailing_blank = false,
-    }
-  end
-
-  items[#items + 1] = {
     lines = { "Description" },
     hl = "GhPrOverviewHeading",
     action = summary_action("edit_body", { current = model.description }),
@@ -370,6 +236,7 @@ local function build_summary_items(view)
   items[#items + 1] = {
     lines = body_payload.lines,
     highlights = body_payload.highlights,
+    inline_links = body_payload.links,
     trailing_blank = false,
   }
 
@@ -595,6 +462,7 @@ local function render_item(render_data, item, tab_name)
   end
 
   local first_action_line
+  local item_inline_links = type(item.inline_links) == "table" and item.inline_links or {}
   for index, text in ipairs(lines) do
     local is_first = index == 1
     local prefix = is_first and "  " or "    "
@@ -612,6 +480,28 @@ local function render_item(render_data, item, tab_name)
           end_col = #prefix + end_col
         end
         add_highlight(render_data, line_number, start_col, end_col, hl.group)
+      end
+    end
+
+    for _, link in ipairs(item_inline_links) do
+      if link.line == index and type(link.url) == "string" and link.url ~= "" then
+        local start_col = #prefix + (tonumber(link.start_col) or 0)
+        local end_col = tonumber(link.end_col) or start_col
+        if end_col >= 0 then
+          end_col = #prefix + end_col
+        end
+        if not render_data.inline_actions[line_number] then
+          render_data.inline_actions[line_number] = {}
+        end
+        render_data.inline_actions[line_number][#render_data.inline_actions[line_number] + 1] = {
+          start_col = start_col,
+          end_col = end_col,
+          action = {
+            kind = "markdown_link",
+            label = type(link.label) == "string" and link.label or "",
+            url = link.url,
+          },
+        }
       end
     end
   end
@@ -635,6 +525,7 @@ function M.render(view, namespace)
     lines = {},
     highlights = {},
     line_actions = {},
+    inline_actions = {},
     first_action_line = nil,
   }
 
@@ -642,26 +533,55 @@ function M.render(view, namespace)
   add_line(render_data, utils.safe_string(model.title, "(no title)"), "Title")
 
   local summary = model.summary or {}
-  local state = styles.state_text(summary)
+  local state_token = styles.state_text(summary)
+  local review_token = utils.safe_string(summary.review_decision, "REVIEW_REQUIRED")
+  local merge_state = utils.safe_string(summary.merge_state, "-")
+  local mergeable = utils.safe_string(summary.mergeable, "-")
+  local date_format = view.date_format
+
   local branch_line = string.format(
-    "%s  @%s  %s -> %s",
-    state,
+    "@%s opened %s into %s",
     utils.safe_string(summary.author, "unknown"),
     utils.safe_string(summary.head_ref, "?"),
     utils.safe_string(summary.base_ref, "?")
   )
-  local branch_line_no = add_line(render_data, branch_line)
-  local state_start = branch_line:find(state, 1, true)
-  if state_start then
-    add_highlight(
-      render_data,
-      branch_line_no,
-      state_start - 1,
-      (state_start - 1) + #state,
-      styles.state_highlight(summary, view.theme)
-    )
+  add_line(render_data, branch_line, "GhPrOverviewBranch")
+
+  local status_line = string.format(
+    "State: %s   Review: %s   Merge: %s (%s)",
+    state_token,
+    review_token,
+    merge_state,
+    mergeable
+  )
+  local status_line_no = add_line(render_data, status_line)
+  local status_spans = {}
+  map_token_span(status_spans, status_line, state_token, styles.state_highlight(summary, view.theme))
+  map_token_span(status_spans, status_line, review_token, styles.review_highlight(review_token, view.theme))
+  for _, span in ipairs(status_spans) do
+    add_highlight(render_data, status_line_no, span.start_col, span.end_col, span.group)
   end
-  add_highlight(render_data, branch_line_no, 0, -1, "GhPrOverviewBranch")
+
+  add_line(
+    render_data,
+    string.format(
+      "Changed files: %d   +%d   -%d",
+      tonumber(summary.files_changed) or 0,
+      tonumber(summary.additions) or 0,
+      tonumber(summary.deletions) or 0
+    )
+  )
+  add_line(
+    render_data,
+    string.format(
+      "Created: %s   Updated: %s",
+      utils.format_time(summary.created_at, date_format),
+      utils.format_time(summary.updated_at, date_format)
+    )
+  )
+  if utils.safe_string(summary.merged_at, "") ~= "" then
+    add_line(render_data, string.format("Merged: %s", utils.format_time(summary.merged_at, date_format)), "GhPrOverviewStateMerged")
+  end
 
   add_line(render_data, string.format("Repository: %s", utils.safe_string(model.repository, "-")), "GhPrOverviewMuted")
   local url_line = string.format("URL: %s", utils.safe_string(model.url, "-"))
@@ -708,7 +628,18 @@ function M.render(view, namespace)
     )
   end
 
-  add_line(render_data, "H/L: tabs   <CR>: open   D/O/M: diff/original/modified   gr: load more", "GhPrOverviewMuted")
+  local hint = "H/L: tabs   <CR>: open   D/O/M: diff/original/modified   b: browser"
+  local link_preview_key = type(view.markdown.link_preview_keymap) == "string" and view.markdown.link_preview_keymap or "gp"
+  if link_preview_key ~= "" then
+    hint = hint .. "   " .. link_preview_key .. ": preview link"
+  end
+  hint = hint .. "   gr: load more"
+  add_line(render_data, hint, "GhPrOverviewMuted")
+  add_line(
+    render_data,
+    "C: comments tree   a/d/c: review   m: merge   k: checkout   et/eb/el/er/ea/em/es/ed: edit",
+    "GhPrOverviewMuted"
+  )
   add_line(render_data, "")
 
   local current_def = M.TAB_DEFS[view.current_tab] or { label = view.current_tab }
@@ -754,6 +685,7 @@ function M.render(view, namespace)
   end
 
   view.line_actions = render_data.line_actions
+  view.inline_actions = render_data.inline_actions
   view.first_action_line = render_data.first_action_line
 
   local target_line = view.cursor_by_tab[view.current_tab] or render_data.first_action_line or 1
