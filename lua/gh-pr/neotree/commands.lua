@@ -1,6 +1,7 @@
 local actions = require("gh-pr.actions")
 local cc = require("neo-tree.sources.common.commands")
 local source = require("gh-pr.neotree.source")
+local telescope = require("gh-pr.integrations.telescope")
 
 local M = {}
 
@@ -134,13 +135,9 @@ M.open_telescope_actions = function(state)
     apply_context(node)
   end
 
-  local ok, telescope = pcall(require, "gh-pr.telescope")
-  if not ok then
-    vim.notify("Unable to load Telescope fallback actions", vim.log.levels.ERROR)
-    return
-  end
-
-  telescope.open_context_actions()
+  telescope.open_context_actions(nil, {
+    load_error = "Unable to load Telescope fallback actions",
+  })
 end
 
 M.checkout_pr = function(state)

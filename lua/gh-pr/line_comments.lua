@@ -2,6 +2,7 @@ local M = {}
 
 local comment_popup = require("gh-pr.comment_popup")
 local config = require("gh-pr.config")
+local highlights = require("gh-pr.highlights")
 
 local namespace = vim.api.nvim_create_namespace("gh-pr-line-comments")
 local sign_group = "gh_pr_line_comments"
@@ -159,12 +160,7 @@ local function line_entry_state(entry)
 end
 
 local function ensure_highlights()
-  vim.api.nvim_set_hl(0, hl_groups.open, { default = true, link = "DiffText" })
-  vim.api.nvim_set_hl(0, hl_groups.resolved, { default = true, link = "DiffAdd" })
-  vim.api.nvim_set_hl(0, hl_groups.outdated, { default = true, link = "DiffChange" })
-  vim.api.nvim_set_hl(0, virt_hl_groups.open, { default = true, link = "DiagnosticHint" })
-  vim.api.nvim_set_hl(0, virt_hl_groups.resolved, { default = true, link = "DiffAdd" })
-  vim.api.nvim_set_hl(0, virt_hl_groups.outdated, { default = true, link = "WarningMsg" })
+  highlights.ensure_baseline_links()
 end
 
 local function ensure_signs(sign_config)

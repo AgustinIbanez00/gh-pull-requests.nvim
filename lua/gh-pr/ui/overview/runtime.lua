@@ -1,13 +1,13 @@
 local utils = require("gh-pr.overview_utils")
 local styles = require("gh-pr.overview_styles")
-local renderer = require("gh-pr.overview_v2_render")
-local layout = require("gh-pr.overview_v2_layout")
-local keymaps = require("gh-pr.overview_v2_keymaps")
+local renderer = require("gh-pr.ui.overview.render")
+local layout = require("gh-pr.ui.overview.layout")
+local keymaps = require("gh-pr.ui.overview.keymaps")
 local comment_popup = require("gh-pr.comment_popup")
 
 local M = {}
 
-local namespace = vim.api.nvim_create_namespace("gh-pr-overview-v2")
+local namespace = vim.api.nvim_create_namespace("gh-pr-overview")
 local pane_roles = { "summary", "activity", "meta" }
 local pane_index = {
   summary = 1,
@@ -27,7 +27,7 @@ local function default_value(value, fallback)
 end
 
 local function buffer_name(pr_number, role)
-  return string.format("ghpr://overview-v2/%d/%s", tonumber(pr_number) or 0, role)
+  return string.format("ghpr://overview/%d/%s", tonumber(pr_number) or 0, role)
 end
 
 local function create_pane_buffer(pr_number, role)
@@ -122,11 +122,11 @@ local function attach_buffer_metadata(session, role)
 
   vim.b[bufnr].gh_pr_number = tonumber(model.number) or 0
   vim.b[bufnr].gh_pr_repo = model.repository
-  vim.b[bufnr].gh_pr_overview_ui = "v2"
+  vim.b[bufnr].gh_pr_overview_ui = "panes"
   vim.b[bufnr].gh_pr_overview_layout = "panes"
-  vim.b[bufnr].gh_pr_overview_v2_session = session.id
-  vim.b[bufnr].gh_pr_overview_v2_role = role
-  vim.b[bufnr].gh_pr_overview_v2_primary = role == "summary"
+  vim.b[bufnr].gh_pr_overview_session = session.id
+  vim.b[bufnr].gh_pr_overview_role = role
+  vim.b[bufnr].gh_pr_overview_primary = role == "summary"
   vim.b[bufnr].gh_pr_overview_limits = vim.deepcopy(model.limits or {})
   vim.b[bufnr].gh_pr_overview_sections = {
     checks = model.checks and model.checks.total or 0,
@@ -361,7 +361,7 @@ local function help_lines(session)
   local focus_meta = key_display(km.focus_meta, "g3")
 
   return {
-    "gh-pr overview v2 shortcuts",
+    "gh-pr overview shortcuts",
     "",
     "Navigation",
     string.format("%-10s Focus summary pane", focus_summary),
@@ -381,7 +381,7 @@ local function help_lines(session)
     "R          Refresh overview",
     "b          Open pull request in browser",
     "C          Open comments tree",
-    "q          Close overview v2",
+    "q          Close overview",
     "",
     "Review",
     "a / d / c  Approve / Request changes / Comment review",
@@ -400,7 +400,7 @@ local function open_help_popup(session, role)
   local ok, popup_err = comment_popup.open({
     origin_bufnr = bufnr,
     tag = "shortcuts",
-    title = string.format("PR #%d overview v2 shortcuts", tonumber(session.pr_number) or 0),
+    title = string.format("PR #%d overview shortcuts", tonumber(session.pr_number) or 0),
     location = role,
     lines = help_lines(session),
     mode = "open",
@@ -417,7 +417,7 @@ local function open_help_popup(session, role)
   })
 
   if not ok and popup_err then
-    vim.notify("Unable to open overview v2 shortcuts: " .. tostring(popup_err), vim.log.levels.WARN)
+    vim.notify("Unable to open overview shortcuts: " .. tostring(popup_err), vim.log.levels.WARN)
   end
 end
 
@@ -506,7 +506,7 @@ local function register_cleanup_autocmds(session)
   for _, role in ipairs(pane_roles) do
     local bufnr = session.buffers[role]
     if utils.valid_buf(bufnr) then
-      vim.api.nvim_create_autocmd({ "BufWipeout", "BufDelete" }, {
+      vim.api.nvim_create_autocmd({ "BufWipeout", "BufUnload", "BufDelete" }, {
         buffer = bufnr,
         once = true,
         callback = function()
@@ -591,7 +591,7 @@ function M.session_id_for_buf(bufnr)
   if not utils.valid_buf(bufnr) then
     return nil
   end
-  local value = vim.b[bufnr].gh_pr_overview_v2_session
+  local value = vim.b[bufnr].gh_pr_overview_session
   local id = tonumber(value)
   if not id then
     return nil

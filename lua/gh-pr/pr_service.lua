@@ -3,6 +3,9 @@ local M = {}
 local config = require("gh-pr.config")
 local gh = require("gh-pr.gh")
 local repo = require("gh-pr.repo")
+local pr_threads = require("gh-pr.core.pr_service.threads")
+local pr_timeline = require("gh-pr.core.pr_service.timeline")
+local pr_overview_model = require("gh-pr.core.pr_service.overview_model")
 
 local user_cache = {
   login = nil,
@@ -817,595 +820,72 @@ function M.fetch_details_async(number, callback)
   end)
 end
 
-local review_threads_query = [[
-query($owner:String!, $name:String!, $number:Int!, $threadsFirst:Int!, $commentsFirst:Int!) {
-  repository(owner:$owner, name:$name) {
-    pullRequest(number:$number) {
-      reviewThreads(first:$threadsFirst) {
-        nodes {
-          id
-          isResolved
-          isOutdated
-          path
-          line
-          originalLine
-          startLine
-          originalStartLine
-          diffSide
-          comments(first:$commentsFirst) {
-            nodes {
-              id
-              path
-              line
-              originalLine
-              diffHunk
-              commit { oid }
-              originalCommit { oid }
-              author { login }
-              body
-              createdAt
-              state
-              outdated
-              url
-            }
-          }
-        }
-      }
-    }
-  }
-}
-]]
-
-local function review_threads_args(repository, number, opts)
-  local threads_first = clamp_positive(opts.threads_first, 50, 100)
-  local comments_first = clamp_positive(opts.comments_first, 50, 100)
-
+local function threads_service_context()
   return {
-    "api",
-    "graphql",
-    "-f",
-    "query=" .. review_threads_query,
-    "-F",
-    "owner=" .. repository.owner,
-    "-F",
-    "name=" .. repository.name,
-    "-F",
-    "number=" .. tostring(number),
-    "-F",
-    "threadsFirst=" .. tostring(threads_first),
-    "-F",
-    "commentsFirst=" .. tostring(comments_first),
+    clamp_positive = clamp_positive,
+    normalize_string = normalize_string,
+    normalize_threads = normalize_threads,
+    resolve_repository = M.resolve_repository,
+    gh = gh,
   }
 end
 
-local function parse_review_threads_response(response)
-  if type(response.errors) == "table" and #response.errors > 0 then
-    local first_error = response.errors[1]
-    if type(first_error) == "table" and type(first_error.message) == "string" and first_error.message ~= "" then
-      return nil, first_error.message
-    end
-    return nil, "GraphQL error while loading review threads"
+local function timeline_model_context()
+  local normalize_diff_side = function(value)
+    return pr_threads.normalize_diff_side(value, {
+      normalize_string = normalize_string,
+    })
   end
 
-  local data = response.data
-  local repo_node = type(data) == "table" and data.repository or nil
-  local pr = type(repo_node) == "table" and repo_node.pullRequest or nil
-  local review_threads = type(pr) == "table" and pr.reviewThreads or nil
-  local nodes = type(review_threads) == "table" and review_threads.nodes or {}
+  return {
+    normalize_string = normalize_string,
+    normalize_login = normalize_login,
+    normalize_diff_side = normalize_diff_side,
+    first_positive_line = pr_threads.first_positive_line,
+  }
+end
 
-  local threads = {}
-  for _, node in ipairs(type(nodes) == "table" and nodes or {}) do
-    local comments = {}
-    local comments_nodes = type(node.comments) == "table" and node.comments.nodes or {}
-    for _, comment in ipairs(type(comments_nodes) == "table" and comments_nodes or {}) do
-      comments[#comments + 1] = comment
-    end
+local function overview_model_context()
+  local timeline_ctx = timeline_model_context()
 
-    threads[#threads + 1] = {
-      id = node.id,
-      isResolved = node.isResolved,
-      isOutdated = node.isOutdated,
-      path = node.path,
-      line = node.line,
-      originalLine = node.originalLine,
-      startLine = node.startLine,
-      originalStartLine = node.originalStartLine,
-      diffSide = node.diffSide,
-      comments = comments,
-    }
-  end
-
-  return threads, nil
+  return {
+    clamp_positive = clamp_positive,
+    normalize_string = normalize_string,
+    normalize_login = normalize_login,
+    normalize_labels = normalize_labels,
+    normalize_assignees = normalize_assignees,
+    normalize_review_requests = normalize_review_requests,
+    normalize_checks = normalize_checks,
+    normalize_commits = normalize_commits,
+    normalize_comments = normalize_comments,
+    normalize_reviews = normalize_reviews,
+    normalize_threads = normalize_threads,
+    normalize_files = normalize_files,
+    take_recent = take_recent,
+    normalize_pr_change_events = function(events)
+      return pr_timeline.normalize_pr_change_events(events, timeline_ctx)
+    end,
+    build_timeline_items = function(comments, reviews, threads, commits, pr_change_events)
+      return pr_timeline.build_timeline_items(comments, reviews, threads, commits, pr_change_events, timeline_ctx)
+    end,
+  }
 end
 
 function M.fetch_review_threads(number, opts)
-  opts = opts or {}
-
-  local repository, repo_err = M.resolve_repository()
-  if not repository then
-    return nil, repo_err
-  end
-
-  local response, err = gh.run_json(review_threads_args(repository, number, opts))
-
-  if not response then
-    return nil, err
-  end
-
-  return parse_review_threads_response(response)
+  return pr_threads.fetch_review_threads(number, opts, threads_service_context())
 end
 
 function M.fetch_review_threads_async(number, opts, callback)
-  opts = type(opts) == "table" and opts or {}
-  callback = callback or function() end
-
-  local repository, repo_err = M.resolve_repository()
-  if not repository then
-    callback(nil, repo_err)
-    return
-  end
-
-  gh.run_json_async(review_threads_args(repository, number, opts), nil, function(response, err)
-    if not response then
-      callback(nil, err)
-      return
-    end
-
-    local threads, parse_err = parse_review_threads_response(response)
-    if not threads then
-      callback(nil, parse_err)
-      return
-    end
-
-    callback(threads, nil)
-  end)
-end
-
-local function normalize_diff_side(value)
-  local side = normalize_string(value, ""):upper()
-  if side == "LEFT" or side == "RIGHT" then
-    return side
-  end
-  return ""
-end
-
-local function first_positive_line(...)
-  for index = 1, select("#", ...) do
-    local value = tonumber((select(index, ...)))
-    if value and value > 0 then
-      return math.floor(value)
-    end
-  end
-  return nil
-end
-
-local function ensure_line_bucket(index, path)
-  if type(path) ~= "string" or path == "" then
-    return nil
-  end
-
-  index[path] = index[path] or {
-    head = {},
-    base = {},
-  }
-
-  return index[path]
-end
-
-local function add_line_item(index, path, side, line, item)
-  if side ~= "head" and side ~= "base" then
-    return
-  end
-
-  if type(line) ~= "number" or line < 1 then
-    return
-  end
-
-  local bucket = ensure_line_bucket(index, path)
-  if not bucket then
-    return
-  end
-
-  bucket[side][line] = bucket[side][line] or {}
-  bucket[side][line][#bucket[side][line] + 1] = item
-end
-
-local function sort_line_index(index)
-  for _, sides in pairs(index) do
-    for _, side in ipairs({ "head", "base" }) do
-      local line_map = sides[side] or {}
-      for _, entries in pairs(line_map) do
-        table.sort(entries, function(left, right)
-          local left_key = normalize_string(left.created_at, "") .. ":" .. normalize_string(left.comment_id, "")
-          local right_key = normalize_string(right.created_at, "") .. ":" .. normalize_string(right.comment_id, "")
-          return left_key < right_key
-        end)
-      end
-    end
-  end
+  return pr_threads.fetch_review_threads_async(number, opts, callback, threads_service_context())
 end
 
 function M.build_line_comment_index(threads, opts)
-  opts = opts or {}
-
-  local show_resolved = opts.show_resolved ~= false
-  local show_outdated = opts.show_outdated ~= false
-  local normalized_threads = normalize_threads(threads)
-  local index = {}
-
-  for _, thread in ipairs(normalized_threads) do
-    if thread.is_resolved and not show_resolved then
-      goto continue
-    end
-
-    if thread.is_outdated and not show_outdated then
-      goto continue
-    end
-
-    local thread_path = normalize_string(thread.path, "")
-    local thread_side = normalize_diff_side(thread.diff_side)
-
-    for _, comment in ipairs(thread.comments or {}) do
-      local path = normalize_string(comment.path, thread_path)
-      local comment_side = normalize_diff_side(comment.diff_side)
-      local side_hint = comment_side ~= "" and comment_side or thread_side
-
-      local head_line = first_positive_line(comment.line, thread.line, thread.start_line)
-      local base_line = first_positive_line(comment.original_line, thread.original_line, thread.original_start_line)
-
-      if side_hint == "RIGHT" and not head_line then
-        head_line = first_positive_line(thread.line, thread.start_line)
-      elseif side_hint == "LEFT" and not base_line then
-        base_line = first_positive_line(thread.original_line, thread.original_start_line)
-      end
-
-      local entry = {
-        thread_id = thread.id,
-        comment_id = comment.id,
-        path = path,
-        author = comment.author,
-        body = comment.body,
-        created_at = comment.created_at,
-        state = comment.state,
-        url = comment.url,
-        is_resolved = thread.is_resolved == true,
-        is_outdated = thread.is_outdated == true,
-        diff_side = side_hint,
-        line = head_line,
-        original_line = base_line,
-      }
-
-      add_line_item(index, path, "head", head_line, entry)
-      add_line_item(index, path, "base", base_line, entry)
-    end
-
-    ::continue::
-  end
-
-  sort_line_index(index)
-  return index
-end
-
-local function timeline_sort_key(item)
-  return normalize_string(item.created_at, "") .. ":" .. normalize_string(item.id, "")
-end
-
-local function timeline_thread_target(thread, comment)
-  local path = normalize_string(comment.path, normalize_string(thread.path, ""))
-  if path == "" then
-    return nil
-  end
-
-  local side_hint = normalize_diff_side(comment.diff_side)
-  if side_hint == "" then
-    side_hint = normalize_diff_side(thread.diff_side)
-  end
-
-  local head_line = first_positive_line(comment.line, thread.line, thread.start_line)
-  local base_line = first_positive_line(comment.original_line, thread.original_line, thread.original_start_line)
-
-  if side_hint == "RIGHT" and not head_line then
-    head_line = first_positive_line(thread.line, thread.start_line)
-  elseif side_hint == "LEFT" and not base_line then
-    base_line = first_positive_line(thread.original_line, thread.original_start_line)
-  end
-
-  if not head_line and not base_line then
-    return nil
-  end
-
-  if not head_line then
-    head_line = base_line
-  end
-  if not base_line then
-    base_line = head_line
-  end
-
-  return {
-    path = path,
-    side = side_hint == "LEFT" and "base" or "head",
-    line = head_line,
-    original_line = base_line,
-  }
-end
-
-local function build_commit_timeline_item(commit)
-  local oid = normalize_string(type(commit) == "table" and commit.oid, "")
-  local oid_short = normalize_string(type(commit) == "table" and commit.oid_short, "")
-  if oid_short == "" and oid ~= "" then
-    oid_short = oid:sub(1, 8)
-  end
-  local headline = normalize_string(type(commit) == "table" and commit.headline, "(no commit headline)")
-  local body = normalize_string(type(commit) == "table" and commit.body, "")
-  local commit_id = oid
-  if commit_id == "" then
-    commit_id = normalize_string(type(commit) == "table" and commit.committed_at, "") .. ":" .. headline
-  end
-  if body == "" then
-    body = headline
-  else
-    body = headline .. "\n" .. body
-  end
-
-  return {
-    id = "commit:" .. commit_id,
-    kind = "commit",
-    author = normalize_string(type(commit) == "table" and commit.author, "unknown"),
-    body = body,
-    headline = headline,
-    created_at = normalize_string(type(commit) == "table" and commit.committed_at, ""),
-    url = normalize_string(type(commit) == "table" and commit.url, ""),
-    oid = oid,
-    oid_short = oid_short,
-    commit = {
-      oid = oid,
-      oid_short = oid_short,
-      headline = headline,
-      body = normalize_string(type(commit) == "table" and commit.body, ""),
-      author = normalize_string(type(commit) == "table" and commit.author, "unknown"),
-      committed_at = normalize_string(type(commit) == "table" and commit.committed_at, ""),
-      url = normalize_string(type(commit) == "table" and commit.url, ""),
-    },
-  }
-end
-
-local function normalize_pr_change_events(events)
-  local normalized = {}
-  for _, event in ipairs(type(events) == "table" and events or {}) do
-    local change_summary = normalize_string(event.change_summary, "")
-    local change_details = normalize_string(event.change_details, "")
-    local body = normalize_string(event.body, "")
-    if body == "" then
-      if change_summary ~= "" and change_details ~= "" then
-        body = change_summary .. "\n" .. change_details
-      elseif change_summary ~= "" then
-        body = change_summary
-      else
-        body = "(pull request updated)"
-      end
-    end
-
-    normalized[#normalized + 1] = {
-      id = normalize_string(event.id, normalize_string(event.created_at, "") .. ":" .. change_summary),
-      kind = "pr_change",
-      change_type = normalize_string(event.change_type, "updated"),
-      change_summary = change_summary ~= "" and change_summary or "(pull request updated)",
-      change_details = change_details,
-      author = normalize_string(event.author, "unknown"),
-      body = body,
-      created_at = normalize_string(event.created_at, ""),
-      url = normalize_string(event.url, ""),
-      source = normalize_string(event.source, "graphql"),
-    }
-  end
-  return normalized
-end
-
-local function build_timeline_items(comments, reviews, threads, commits, pr_change_events)
-  local items = {}
-
-  for _, comment in ipairs(type(comments) == "table" and comments or {}) do
-    items[#items + 1] = {
-      id = "comment:" .. normalize_string(comment.id, ""),
-      kind = "comment",
-      author = normalize_string(comment.author, "unknown"),
-      association = normalize_string(comment.association, ""),
-      body = normalize_string(comment.body, ""),
-      created_at = normalize_string(comment.created_at, ""),
-      url = normalize_string(comment.url, ""),
-    }
-  end
-
-  for _, review in ipairs(type(reviews) == "table" and reviews or {}) do
-    items[#items + 1] = {
-      id = "review:" .. normalize_string(review.id, ""),
-      kind = "review",
-      author = normalize_string(review.author, "unknown"),
-      association = normalize_string(review.association, ""),
-      state = normalize_string(review.state, "COMMENTED"),
-      body = normalize_string(review.body, ""),
-      created_at = normalize_string(review.submitted_at, ""),
-      url = normalize_string(review.url, ""),
-      commit_oid = normalize_string(review.commit_oid, ""),
-    }
-  end
-
-  for _, thread in ipairs(type(threads) == "table" and threads or {}) do
-    for _, comment in ipairs(type(thread.comments) == "table" and thread.comments or {}) do
-      local target = timeline_thread_target(thread, comment)
-      items[#items + 1] = {
-        id = "thread:" .. normalize_string(thread.id, "") .. ":" .. normalize_string(comment.id, ""),
-        kind = "thread_comment",
-        author = normalize_string(comment.author, "unknown"),
-        body = normalize_string(comment.body, ""),
-        diff_hunk = normalize_string(comment.diff_hunk, ""),
-        state = normalize_string(comment.state, ""),
-        created_at = normalize_string(comment.created_at, ""),
-        url = normalize_string(comment.url, ""),
-        path = target and target.path or normalize_string(comment.path, normalize_string(thread.path, "")),
-        line = target and target.line or first_positive_line(comment.line, thread.line, thread.start_line),
-        original_line = target and target.original_line
-          or first_positive_line(comment.original_line, thread.original_line, thread.original_start_line),
-        side = target and target.side or "head",
-        target = target,
-        thread_id = normalize_string(thread.id, ""),
-        commit_oid = normalize_string(comment.commit_oid, ""),
-        original_commit_oid = normalize_string(comment.original_commit_oid, ""),
-        is_resolved = thread.is_resolved == true,
-        is_outdated = thread.is_outdated == true,
-      }
-    end
-  end
-
-  for _, commit in ipairs(type(commits) == "table" and commits or {}) do
-    items[#items + 1] = build_commit_timeline_item(commit)
-  end
-
-  for _, event in ipairs(type(pr_change_events) == "table" and pr_change_events or {}) do
-    items[#items + 1] = {
-      id = "pr_change:" .. normalize_string(event.id, ""),
-      kind = "pr_change",
-      change_type = normalize_string(event.change_type, "updated"),
-      change_summary = normalize_string(event.change_summary, ""),
-      change_details = normalize_string(event.change_details, ""),
-      author = normalize_string(event.author, "unknown"),
-      body = normalize_string(event.body, ""),
-      created_at = normalize_string(event.created_at, ""),
-      url = normalize_string(event.url, ""),
-      source = normalize_string(event.source, "graphql"),
-    }
-  end
-
-  table.sort(items, function(left, right)
-    return timeline_sort_key(left) < timeline_sort_key(right)
-  end)
-  return items
+  return pr_threads.build_line_comment_index(threads, opts, threads_service_context())
 end
 
 function M.build_overview_model(details, threads, limits, opts)
-  opts = opts or {}
-  details = type(details) == "table" and details or {}
-  limits = type(limits) == "table" and limits or {}
-
-  local normalized_labels = normalize_labels(details.labels)
-  local normalized_assignees = normalize_assignees(details.assignees)
-  local normalized_review_requests = normalize_review_requests(details.reviewRequests)
-  local normalized_checks = normalize_checks(details.statusCheckRollup)
-  local normalized_commits = normalize_commits(details.commits)
-  local normalized_comments = normalize_comments(details.comments)
-  local normalized_reviews = normalize_reviews(details.reviews)
-  local normalized_threads = normalize_threads(threads)
-  local normalized_pr_changes = normalize_pr_change_events(opts.pr_change_events)
-  local normalized_files = normalize_files(details.files)
-
-  local checks_limit = clamp_positive(limits.checks, 10)
-  local commits_limit = clamp_positive(limits.commits, 10)
-  local timeline_limit = clamp_positive(
-    limits.timeline,
-    math.max(clamp_positive(limits.comments, 20), clamp_positive(limits.reviews, 20), clamp_positive(limits.threads, 20))
-  )
-  local comments_limit = clamp_positive(limits.comments, timeline_limit)
-  local reviews_limit = clamp_positive(limits.reviews, timeline_limit)
-  local threads_limit = clamp_positive(limits.threads, timeline_limit)
-  local normalized_limits = vim.deepcopy(limits)
-  normalized_limits.checks = checks_limit
-  normalized_limits.commits = commits_limit
-  normalized_limits.timeline = math.max(timeline_limit, comments_limit, reviews_limit, threads_limit)
-  normalized_limits.comments = comments_limit
-  normalized_limits.reviews = reviews_limit
-  normalized_limits.threads = threads_limit
-
-  local checks_limited, checks_total = take_recent(normalized_checks, checks_limit)
-  local commits_limited, commits_total = take_recent(normalized_commits, commits_limit)
-  local comments_limited, comments_total = take_recent(normalized_comments, comments_limit)
-  local reviews_limited, reviews_total = take_recent(normalized_reviews, reviews_limit)
-  local threads_limited, threads_total = take_recent(normalized_threads, threads_limit)
-  local pr_changes_limited, pr_changes_total = take_recent(normalized_pr_changes, normalized_limits.timeline)
-  local timeline_all = build_timeline_items(
-    normalized_comments,
-    normalized_reviews,
-    normalized_threads,
-    normalized_commits,
-    normalized_pr_changes
-  )
-  local timeline_limited, timeline_total = take_recent(timeline_all, normalized_limits.timeline)
-
-  local author = normalize_login(details.author, "unknown")
-  local milestone_title = ""
-  if type(details.milestone) == "table" then
-    milestone_title = normalize_string(details.milestone.title, "")
-  end
-
-  return {
-    number = tonumber(details.number) or 0,
-    title = normalize_string(details.title, ""),
-    url = normalize_string(details.url, ""),
-    repository = normalize_string(opts.repository, ""),
-    description = normalize_string(details.body, ""),
-    thread_error = normalize_string(opts.thread_error, ""),
-    pr_change_error = normalize_string(opts.pr_change_error, ""),
-    limits = normalized_limits,
-    summary = {
-      state = normalize_string(details.state, "UNKNOWN"),
-      is_draft = details.isDraft == true,
-      author = author,
-      review_decision = normalize_string(details.reviewDecision, "REVIEW_REQUIRED"),
-      merge_state = normalize_string(details.mergeStateStatus, ""),
-      mergeable = normalize_string(details.mergeable, ""),
-      maintainer_can_modify = details.maintainerCanModify == true,
-      head_ref = normalize_string(details.headRefName, "?"),
-      base_ref = normalize_string(details.baseRefName, "?"),
-      created_at = normalize_string(details.createdAt, ""),
-      updated_at = normalize_string(details.updatedAt, ""),
-      merged_at = normalize_string(details.mergedAt, ""),
-      milestone = milestone_title,
-      files_changed = tonumber(details.changedFiles) or (type(details.files) == "table" and #details.files or 0),
-      additions = tonumber(details.additions) or 0,
-      deletions = tonumber(details.deletions) or 0,
-    },
-    people = {
-      assignees = normalized_assignees,
-      review_requests = normalized_review_requests,
-    },
-    labels = {
-      items = normalized_labels,
-      total = #normalized_labels,
-    },
-    checks = {
-      items = checks_limited,
-      total = checks_total,
-    },
-    commits = {
-      items = commits_limited,
-      total = commits_total,
-    },
-    timeline = {
-      items = timeline_limited,
-      total = timeline_total,
-    },
-    comments = {
-      items = comments_limited,
-      total = comments_total,
-    },
-    reviews = {
-      items = reviews_limited,
-      total = reviews_total,
-    },
-    threads = {
-      items = threads_limited,
-      total = threads_total,
-    },
-    pr_changes = {
-      items = pr_changes_limited,
-      total = pr_changes_total,
-    },
-    files = {
-      items = normalized_files,
-      total = #normalized_files,
-    },
-  }
+  return pr_overview_model.build(details, threads, limits, opts, overview_model_context())
 end
-
 local function normalize_repository_from_input(input)
   if type(input) == "string" and input ~= "" then
     local owner, name = input:match("^([^/]+)/(.+)$")
@@ -1754,420 +1234,28 @@ local function run_graphql(query, variables)
   return response, nil
 end
 
-local pr_change_events_query = [[
-query($owner:String!, $name:String!, $number:Int!, $first:Int!, $after:String) {
-  repository(owner:$owner, name:$name) {
-    pullRequest(number:$number) {
-      url
-      timelineItems(
-        first:$first
-        after:$after
-        itemTypes:[
-          BASE_REF_CHANGED_EVENT
-          HEAD_REF_FORCE_PUSHED_EVENT
-          MERGED_EVENT
-          READY_FOR_REVIEW_EVENT
-          CONVERT_TO_DRAFT_EVENT
-          REVIEW_REQUESTED_EVENT
-          REVIEW_REQUEST_REMOVED_EVENT
-          ASSIGNED_EVENT
-          UNASSIGNED_EVENT
-          LABELED_EVENT
-          UNLABELED_EVENT
-          MILESTONED_EVENT
-          DEMILESTONED_EVENT
-          CLOSED_EVENT
-          REOPENED_EVENT
-          RENAMED_TITLE_EVENT
-        ]
-      ) {
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-        nodes {
-          __typename
-          ... on Node {
-            id
-          }
-          ... on ClosedEvent {
-            createdAt
-            stateReason
-            actor { login }
-          }
-          ... on ReopenedEvent {
-            createdAt
-            actor { login }
-          }
-          ... on MergedEvent {
-            createdAt
-            mergeRefName
-            actor { login }
-            commit { oid }
-          }
-          ... on ReadyForReviewEvent {
-            createdAt
-            actor { login }
-          }
-          ... on ConvertToDraftEvent {
-            createdAt
-            actor { login }
-          }
-          ... on RenamedTitleEvent {
-            createdAt
-            actor { login }
-            previousTitle
-            currentTitle
-          }
-          ... on BaseRefChangedEvent {
-            createdAt
-            actor { login }
-            previousRefName
-            currentRefName
-          }
-          ... on HeadRefForcePushedEvent {
-            createdAt
-            actor { login }
-            beforeCommit { oid }
-            afterCommit { oid }
-            ref { name }
-          }
-          ... on ReviewRequestedEvent {
-            createdAt
-            actor { login }
-            requestedReviewer {
-              __typename
-              ... on User {
-                login
-              }
-              ... on Team {
-                slug
-                name
-              }
-            }
-          }
-          ... on ReviewRequestRemovedEvent {
-            createdAt
-            actor { login }
-            requestedReviewer {
-              __typename
-              ... on User {
-                login
-              }
-              ... on Team {
-                slug
-                name
-              }
-            }
-          }
-          ... on AssignedEvent {
-            createdAt
-            actor { login }
-            assignee {
-              __typename
-              ... on User { login }
-              ... on Mannequin { login }
-            }
-          }
-          ... on UnassignedEvent {
-            createdAt
-            actor { login }
-            assignee {
-              __typename
-              ... on User { login }
-              ... on Mannequin { login }
-            }
-          }
-          ... on LabeledEvent {
-            createdAt
-            actor { login }
-            label { name }
-          }
-          ... on UnlabeledEvent {
-            createdAt
-            actor { login }
-            label { name }
-          }
-          ... on MilestonedEvent {
-            createdAt
-            actor { login }
-            milestoneTitle
-          }
-          ... on DemilestonedEvent {
-            createdAt
-            actor { login }
-            milestoneTitle
-          }
-        }
-      }
-    }
-  }
-}
-]]
-
-local function short_oid(value)
-  local oid = normalize_string(value, "")
-  if oid == "" then
-    return ""
-  end
-  return oid:sub(1, 8)
-end
-
-local function requested_reviewer_name(node)
-  local reviewer = type(node) == "table" and type(node.requestedReviewer) == "table" and node.requestedReviewer or {}
-  local reviewer_type = normalize_string(reviewer.__typename, "")
-  if reviewer_type == "Team" then
-    local slug = normalize_string(reviewer.slug, "")
-    if slug ~= "" then
-      return "@" .. slug
-    end
-    local name = normalize_string(reviewer.name, "")
-    if name ~= "" then
-      return name
-    end
-  end
-
-  local login = normalize_login(reviewer, "")
-  if login ~= "" and login ~= "unknown" then
-    return "@" .. login
-  end
-
-  return "(unknown reviewer)"
-end
-
-local function assignee_name(node)
-  local assignee = type(node) == "table" and type(node.assignee) == "table" and node.assignee or {}
-  local login = normalize_login(assignee, "")
-  if login ~= "" and login ~= "unknown" then
-    return "@" .. login
-  end
-  return "(unknown assignee)"
-end
-
-local function normalize_pr_change_node(node, fallback_url)
-  if type(node) ~= "table" then
-    return nil
-  end
-
-  local typename = normalize_string(node.__typename, "")
-  if typename == "" then
-    return nil
-  end
-
-  local created_at = normalize_string(node.createdAt, "")
-  local id = normalize_string(node.id, typename .. ":" .. created_at)
-  local author = normalize_login(node.actor, "unknown")
-  local change_type = ""
-  local change_summary = ""
-  local change_details = ""
-
-  if typename == "ClosedEvent" then
-    change_type = "closed"
-    change_summary = "Closed pull request"
-    local reason = normalize_string(node.stateReason, "")
-    if reason ~= "" then
-      change_details = "Reason: " .. reason
-    end
-  elseif typename == "ReopenedEvent" then
-    change_type = "reopened"
-    change_summary = "Reopened pull request"
-  elseif typename == "MergedEvent" then
-    change_type = "merged"
-    local merge_ref = normalize_string(node.mergeRefName, "")
-    change_summary = merge_ref ~= "" and ("Merged into `" .. merge_ref .. "`") or "Merged pull request"
-    local merged_commit = type(node.commit) == "table" and short_oid(node.commit.oid) or ""
-    if merged_commit ~= "" then
-      change_details = "Merge commit: `" .. merged_commit .. "`"
-    end
-  elseif typename == "ReadyForReviewEvent" then
-    change_type = "ready_for_review"
-    change_summary = "Marked ready for review"
-  elseif typename == "ConvertToDraftEvent" then
-    change_type = "converted_to_draft"
-    change_summary = "Converted to draft"
-  elseif typename == "RenamedTitleEvent" then
-    change_type = "renamed_title"
-    change_summary = "Renamed pull request title"
-    local previous_title = normalize_string(node.previousTitle, "")
-    local current_title = normalize_string(node.currentTitle, "")
-    if previous_title ~= "" or current_title ~= "" then
-      change_details = string.format("`%s` -> `%s`", previous_title ~= "" and previous_title or "(empty)", current_title ~= "" and current_title or "(empty)")
-    end
-  elseif typename == "BaseRefChangedEvent" then
-    change_type = "base_ref_changed"
-    change_summary = "Changed base branch"
-    local previous_ref = normalize_string(node.previousRefName, "")
-    local current_ref = normalize_string(node.currentRefName, "")
-    if previous_ref ~= "" or current_ref ~= "" then
-      change_details = string.format("`%s` -> `%s`", previous_ref ~= "" and previous_ref or "(unknown)", current_ref ~= "" and current_ref or "(unknown)")
-    end
-  elseif typename == "HeadRefForcePushedEvent" then
-    change_type = "head_ref_force_pushed"
-    change_summary = "Force-pushed branch"
-    local ref_name = type(node.ref) == "table" and normalize_string(node.ref.name, "") or ""
-    local before_oid = type(node.beforeCommit) == "table" and short_oid(node.beforeCommit.oid) or ""
-    local after_oid = type(node.afterCommit) == "table" and short_oid(node.afterCommit.oid) or ""
-    local base = ""
-    if before_oid ~= "" or after_oid ~= "" then
-      base = string.format("`%s` -> `%s`", before_oid ~= "" and before_oid or "(unknown)", after_oid ~= "" and after_oid or "(unknown)")
-    end
-    if ref_name ~= "" and base ~= "" then
-      change_details = string.format("`%s`: %s", ref_name, base)
-    elseif ref_name ~= "" then
-      change_details = string.format("`%s`", ref_name)
-    else
-      change_details = base
-    end
-  elseif typename == "ReviewRequestedEvent" then
-    change_type = "review_requested"
-    change_summary = "Requested review"
-    change_details = requested_reviewer_name(node)
-  elseif typename == "ReviewRequestRemovedEvent" then
-    change_type = "review_request_removed"
-    change_summary = "Removed review request"
-    change_details = requested_reviewer_name(node)
-  elseif typename == "AssignedEvent" then
-    change_type = "assigned"
-    change_summary = "Assigned"
-    change_details = assignee_name(node)
-  elseif typename == "UnassignedEvent" then
-    change_type = "unassigned"
-    change_summary = "Unassigned"
-    change_details = assignee_name(node)
-  elseif typename == "LabeledEvent" then
-    change_type = "labeled"
-    change_summary = "Added label"
-    change_details = normalize_string(type(node.label) == "table" and node.label.name, "(unknown label)")
-  elseif typename == "UnlabeledEvent" then
-    change_type = "unlabeled"
-    change_summary = "Removed label"
-    change_details = normalize_string(type(node.label) == "table" and node.label.name, "(unknown label)")
-  elseif typename == "MilestonedEvent" then
-    change_type = "milestoned"
-    change_summary = "Added milestone"
-    change_details = normalize_string(node.milestoneTitle, "(unknown milestone)")
-  elseif typename == "DemilestonedEvent" then
-    change_type = "demilestoned"
-    change_summary = "Removed milestone"
-    change_details = normalize_string(node.milestoneTitle, "(unknown milestone)")
-  else
-    return nil
-  end
-
-  local body = change_summary
-  if change_details ~= "" then
-    body = body .. "\n" .. change_details
+local function timeline_service_context()
+  local normalize_diff_side = function(value)
+    return pr_threads.normalize_diff_side(value, {
+      normalize_string = normalize_string,
+    })
   end
 
   return {
-    id = id,
-    change_type = change_type,
-    change_summary = change_summary,
-    change_details = change_details,
-    author = author,
-    body = body,
-    created_at = created_at,
-    url = normalize_string(fallback_url, ""),
-    source = "graphql",
+    normalize_string = normalize_string,
+    normalize_login = normalize_login,
+    clamp_positive = clamp_positive,
+    resolve_repository = M.resolve_repository,
+    normalize_repository_from_input = normalize_repository_from_input,
+    run_graphql = run_graphql,
+    normalize_diff_side = normalize_diff_side,
+    first_positive_line = pr_threads.first_positive_line,
   }
 end
 
-local function parse_pr_change_events_response(response, fallback_url)
-  local data = type(response) == "table" and response.data or nil
-  local repo_node = type(data) == "table" and data.repository or nil
-  local pr_node = type(repo_node) == "table" and repo_node.pullRequest or nil
-  if type(pr_node) ~= "table" then
-    return nil, nil, nil, "Unable to resolve pull request timeline for PR changes"
-  end
-
-  local pull_request_url = normalize_string(pr_node.url, normalize_string(fallback_url, ""))
-  local timeline_items = type(pr_node.timelineItems) == "table" and pr_node.timelineItems or {}
-  local nodes = type(timeline_items.nodes) == "table" and timeline_items.nodes or {}
-  local page_info = type(timeline_items.pageInfo) == "table" and timeline_items.pageInfo or {}
-  local has_next_page = page_info.hasNextPage == true
-  local end_cursor = normalize_string(page_info.endCursor, "")
-  local events = {}
-
-  for _, node in ipairs(nodes) do
-    local event = normalize_pr_change_node(node, pull_request_url)
-    if type(event) == "table" then
-      events[#events + 1] = event
-    end
-  end
-
-  return events, has_next_page, end_cursor, nil
-end
-
 function M.fetch_pr_change_events(number, opts)
-  opts = type(opts) == "table" and opts or {}
-
-  local repository = normalize_repository_from_input(opts.repository)
-  if not repository then
-    local resolved, repo_err = M.resolve_repository()
-    if not resolved then
-      return nil, repo_err
-    end
-    repository = resolved
-  end
-
-  local first = clamp_positive(opts.first or opts.limit, 100, 100)
-  local max_items = clamp_positive(opts.max_items, first)
-  local max_pages = clamp_positive(opts.max_pages, 3, 10)
-  local fallback_url = normalize_string(opts.pr_url, "")
-  local after = nil
-  local collected = {}
-
-  for _ = 1, max_pages do
-    local variables = {
-      { flag = "-f", key = "owner", value = repository.owner },
-      { flag = "-f", key = "name", value = repository.name },
-      { flag = "-F", key = "number", value = tonumber(number) or number },
-      { flag = "-F", key = "first", value = first },
-    }
-    if after ~= "" then
-      variables[#variables + 1] = { flag = "-f", key = "after", value = after }
-    end
-
-    local response, err = run_graphql(pr_change_events_query, variables)
-    if not response then
-      return nil, err
-    end
-
-    local page_items, has_next_page, end_cursor, parse_err = parse_pr_change_events_response(response, fallback_url)
-    if not page_items then
-      return nil, parse_err
-    end
-
-    for _, item in ipairs(page_items) do
-      collected[#collected + 1] = item
-    end
-
-    if #collected >= max_items then
-      break
-    end
-    if not has_next_page or end_cursor == "" then
-      break
-    end
-
-    after = end_cursor
-  end
-
-  table.sort(collected, function(left, right)
-    return timeline_sort_key(left) < timeline_sort_key(right)
-  end)
-
-  if #collected > max_items then
-    local trimmed = {}
-    local start_index = #collected - max_items + 1
-    for index = start_index, #collected do
-      trimmed[#trimmed + 1] = collected[index]
-    end
-    collected = trimmed
-  end
-
-  return collected, nil
+  return pr_timeline.fetch_pr_change_events(number, opts, timeline_service_context())
 end
-
 local function fetch_review_context(number)
   local repository, repo_err = M.resolve_repository()
   if not repository then
@@ -2358,11 +1446,15 @@ function M.add_pending_inline_comment(number, opts)
     start_line = nil
   end
 
-  local side = normalize_diff_side(opts.side)
+  local side = pr_threads.normalize_diff_side(opts.side, {
+    normalize_string = normalize_string,
+  })
   if side == "" then
     side = "RIGHT"
   end
-  local start_side = normalize_diff_side(opts.start_side)
+  local start_side = pr_threads.normalize_diff_side(opts.start_side, {
+    normalize_string = normalize_string,
+  })
   if start_side == "" then
     start_side = side
   end

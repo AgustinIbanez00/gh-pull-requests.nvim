@@ -1,4 +1,5 @@
 local utils = require("gh-pr.overview_utils")
+local highlights = require("gh-pr.highlights")
 
 local M = {}
 
@@ -74,42 +75,7 @@ function M.ensure_base_highlights()
     return
   end
   base_highlights_ready = true
-
-  vim.api.nvim_set_hl(0, "GhPrOverviewTitle", { default = true, link = "Title" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewHeading", { default = true, link = "Special" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewMuted", { default = true, link = "Comment" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewTab", { default = true, link = "Comment" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewTabActive", { default = true, link = "TabLineSel" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewBranch", { default = true, link = "Special" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewBadge", { default = true, link = "PmenuSel" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewReviewer", { default = true, link = "Directory" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewAssignee", { default = true, link = "Function" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewActionKey", { default = true, link = "Keyword" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewActionText", { default = true, link = "Normal" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewStateOpen", { default = true, link = "DiagnosticOk" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewStateClosed", { default = true, link = "DiagnosticError" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewStateMerged", { default = true, link = "DiagnosticInfo" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewReviewApproved", { default = true, link = "DiagnosticOk" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewReviewChanges", { default = true, link = "DiagnosticError" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewReviewPending", { default = true, link = "DiagnosticWarn" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewCheckPass", { default = true, link = "DiagnosticOk" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewCheckFail", { default = true, link = "DiagnosticError" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewCheckPending", { default = true, link = "DiagnosticWarn" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewCheckNeutral", { default = true, link = "DiagnosticInfo" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewTimelineComment", { default = true, link = "DiagnosticInfo" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewTimelineReview", { default = true, link = "DiagnosticWarn" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewTimelineThread", { default = true, link = "Identifier" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewTimelineCommit", { default = true, link = "Special" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewTimelinePrChange", { default = true, link = "Type" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownHeading", { default = true, link = "Title" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownCode", { default = true, link = "String" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownCodeFence", { default = true, link = "SpecialComment" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownInlineCode", { default = true, link = "String" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownQuote", { default = true, link = "Comment" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownQuoteMarker", { default = true, link = "SpecialChar" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownListMarker", { default = true, link = "SpecialChar" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownLink", { default = true, link = "Underlined" })
-  vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownRule", { default = true, link = "Comment" })
+  highlights.ensure_baseline_links()
 end
 
 function M.ensure_label_highlight(color)

@@ -2,6 +2,7 @@ local actions = require("gh-pr.actions")
 local cc = require("neo-tree.sources.common.commands")
 local source = require("gh-pr.neotree.review_source")
 local runtime_state = require("gh-pr.state")
+local telescope = require("gh-pr.integrations.telescope")
 
 local renderer = require("neo-tree.ui.renderer")
 
@@ -324,7 +325,19 @@ local function resolve_folder_toggle_target_viewed(entries, repo_name, pr_number
   return false
 end
 
-local function confirm_directory_toggle(node, file_count, mark_viewed)
+local function on_main_loop(callback, value)
+  if vim.in_fast_event() then
+    vim.schedule(function()
+      callback(value)
+    end)
+    return
+  end
+  callback(value)
+end
+
+local function confirm_directory_toggle(node, file_count, mark_viewed, callback)
+  callback = type(callback) == "function" and callback or function() end
+
   local folder_name = type(node) == "table" and type(node.name) == "string" and node.name or ""
   if folder_name == "" then
     folder_name = directory_path_from_node(node)
@@ -346,8 +359,21 @@ local function confirm_directory_toggle(node, file_count, mark_viewed)
     action_line,
     tonumber(file_count) or 0
   )
+
+  if vim.ui and type(vim.ui.select) == "function" then
+    vim.ui.select({ "yes", "no" }, {
+      prompt = prompt,
+      format_item = function(item)
+        return item
+      end,
+    }, function(choice)
+      on_main_loop(callback, choice == "yes")
+    end)
+    return
+  end
+
   local choice = vim.fn.confirm(prompt, "&Yes\n&No", 2)
-  return choice == 1
+  callback(choice == 1)
 end
 
 local function collapse_ancestors_for_nodes(state, nodes, stop_id)
@@ -530,11 +556,15 @@ M.toggle_viewed = function(state)
 
   local mark_viewed = resolve_folder_toggle_target_viewed(descendants, metadata.repo, metadata.pr_number)
   if metadata.has_nested_directories then
-    local confirmed = confirm_directory_toggle(node, #descendants, mark_viewed)
-    if not confirmed then
-      vim.notify("Folder viewed update cancelled", vim.log.levels.INFO)
-      return
-    end
+    confirm_directory_toggle(node, #descendants, mark_viewed, function(confirmed)
+      if not confirmed then
+        vim.notify("Folder viewed update cancelled", vim.log.levels.INFO)
+        return
+      end
+
+      actions.mark_files_viewed(descendants, mark_viewed)
+    end)
+    return
   end
 
   actions.mark_files_viewed(descendants, mark_viewed)
@@ -612,13 +642,9 @@ M.open_telescope_actions = function(state)
     apply_context(node)
   end
 
-  local ok, telescope = pcall(require, "gh-pr.telescope")
-  if not ok then
-    vim.notify("Unable to load Telescope review actions", vim.log.levels.ERROR)
-    return
-  end
-
-  telescope.open_review_actions()
+  telescope.open_review_actions(nil, {
+    load_error = "Unable to load Telescope review actions",
+  })
 end
 
 M.start_review = function(state)

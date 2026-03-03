@@ -70,12 +70,12 @@ local defaults = {
     window = {
       enabled = true,
       border = "rounded",
-      width_ratio = 0.88,
-      height_ratio = 0.88,
-      min_width = 100,
-      min_height = 28,
-      max_width = 180,
-      max_height = 60,
+      width_ratio = 0.9,
+      height_ratio = 0.9,
+      min_width = 110,
+      min_height = 30,
+      max_width = 220,
+      max_height = 80,
       backdrop = 0,
       enter = true,
     },
@@ -125,6 +125,34 @@ local defaults = {
       context_after = 5,
       fallback_to_buffer = true,
     },
+    panes = {
+      layout = {
+        sidebar_width_ratio = 0.34,
+        summary_height_ratio = 0.38,
+        gap = 1,
+        min_left_width = 58,
+        min_sidebar_width = 30,
+        min_summary_height = 10,
+        min_activity_height = 12,
+      },
+      activity = {
+        max_body_lines = 8,
+        max_events = 120,
+        show_code_context = true,
+      },
+      keymaps = {
+        cycle_next = "<Tab>",
+        cycle_prev = "<S-Tab>",
+        focus_summary = "g1",
+        focus_activity = "g2",
+        focus_meta = "g3",
+        help = "?",
+        focus_left = "<C-h>",
+        focus_down = "<C-j>",
+        focus_up = "<C-k>",
+        focus_right = "<C-l>",
+      },
+    },
     tabs = {
       "summary",
       "checks",
@@ -152,55 +180,6 @@ local defaults = {
   },
   overview_v2 = {
     enabled = false,
-    date_format = "%Y-%m-%d %H:%M",
-    window = {
-      enabled = true,
-      border = "rounded",
-      width_ratio = 0.9,
-      height_ratio = 0.9,
-      min_width = 110,
-      min_height = 30,
-      max_width = 220,
-      max_height = 80,
-      backdrop = 0,
-      enter = true,
-    },
-    layout = {
-      sidebar_width_ratio = 0.34,
-      summary_height_ratio = 0.38,
-      gap = 1,
-      min_left_width = 58,
-      min_sidebar_width = 30,
-      min_summary_height = 10,
-      min_activity_height = 12,
-    },
-    activity = {
-      max_body_lines = 8,
-      max_events = 120,
-      show_code_context = true,
-    },
-    show = {
-      checks = true,
-      commits = true,
-      timeline = true,
-      comments = true,
-      reviews = true,
-      threads = true,
-      pr_changes = true,
-      labels = true,
-    },
-    keymaps = {
-      cycle_next = "<Tab>",
-      cycle_prev = "<S-Tab>",
-      focus_summary = "g1",
-      focus_activity = "g2",
-      focus_meta = "g3",
-      help = "?",
-      focus_left = "<C-h>",
-      focus_down = "<C-j>",
-      focus_up = "<C-k>",
-      focus_right = "<C-l>",
-    },
   },
   cache = {
     gh_pr = {
@@ -281,6 +260,24 @@ local defaults = {
     use_neotree = true,
     telescope_fallback = true,
   },
+  mappings = {
+    global = {
+      enabled = false,
+      keys = {
+        open = "<leader>gho",
+        list = "<leader>ghl",
+        comments = "<leader>ghm",
+        refresh = "<leader>ghr",
+        overview = "<leader>ghv",
+        checkout = "<leader>ghc",
+        open_diff = "<leader>ghd",
+        review_tree = "<leader>ghx",
+        toggle_reviewed = "<leader>ght",
+        next_change = "<leader>ghn",
+        prev_change = "<leader>ghp",
+      },
+    },
+  },
   queries = {
     {
       folder = "Inbox",
@@ -306,6 +303,21 @@ local defaults = {
 }
 
 local state = vim.deepcopy(defaults)
+local deprecation_warnings = {}
+
+local function notify_deprecation_once(key, message)
+  if deprecation_warnings[key] then
+    return
+  end
+  deprecation_warnings[key] = true
+  if type(vim.notify_once) == "function" then
+    vim.notify_once(message, vim.log.levels.WARN, { title = "gh-pr" })
+    return
+  end
+  if type(vim.notify) == "function" then
+    vim.notify(message, vim.log.levels.WARN)
+  end
+end
 
 local function sanitize_query(item, index)
   if type(item) ~= "table" then
@@ -652,6 +664,84 @@ local function sanitize_overview(overview)
     result.thread_fix_diff.fallback_to_buffer = defaults.overview.thread_fix_diff.fallback_to_buffer
   end
 
+  result.panes = type(result.panes) == "table" and result.panes or {}
+  result.panes.layout = type(result.panes.layout) == "table" and result.panes.layout or {}
+  local sidebar_ratio = tonumber(result.panes.layout.sidebar_width_ratio)
+  if type(sidebar_ratio) ~= "number" or sidebar_ratio < 0.2 or sidebar_ratio > 0.6 then
+    sidebar_ratio = defaults.overview.panes.layout.sidebar_width_ratio
+  end
+  result.panes.layout.sidebar_width_ratio = sidebar_ratio
+  local summary_ratio = tonumber(result.panes.layout.summary_height_ratio)
+  if type(summary_ratio) ~= "number" or summary_ratio < 0.2 or summary_ratio > 0.8 then
+    summary_ratio = defaults.overview.panes.layout.summary_height_ratio
+  end
+  result.panes.layout.summary_height_ratio = summary_ratio
+  result.panes.layout.gap = sanitize_non_negative_integer(result.panes.layout.gap, defaults.overview.panes.layout.gap)
+  if result.panes.layout.gap > 3 then
+    result.panes.layout.gap = defaults.overview.panes.layout.gap
+  end
+  result.panes.layout.min_left_width = sanitize_positive_integer(
+    result.panes.layout.min_left_width,
+    defaults.overview.panes.layout.min_left_width
+  )
+  result.panes.layout.min_sidebar_width = sanitize_positive_integer(
+    result.panes.layout.min_sidebar_width,
+    defaults.overview.panes.layout.min_sidebar_width
+  )
+  result.panes.layout.min_summary_height = sanitize_positive_integer(
+    result.panes.layout.min_summary_height,
+    defaults.overview.panes.layout.min_summary_height
+  )
+  result.panes.layout.min_activity_height = sanitize_positive_integer(
+    result.panes.layout.min_activity_height,
+    defaults.overview.panes.layout.min_activity_height
+  )
+
+  result.panes.activity = type(result.panes.activity) == "table" and result.panes.activity or {}
+  result.panes.activity.max_body_lines = sanitize_positive_integer(
+    result.panes.activity.max_body_lines,
+    defaults.overview.panes.activity.max_body_lines
+  )
+  result.panes.activity.max_events = sanitize_positive_integer(
+    result.panes.activity.max_events,
+    defaults.overview.panes.activity.max_events
+  )
+  if type(result.panes.activity.show_code_context) ~= "boolean" then
+    result.panes.activity.show_code_context = defaults.overview.panes.activity.show_code_context
+  end
+
+  result.panes.keymaps = type(result.panes.keymaps) == "table" and result.panes.keymaps or {}
+  if type(result.panes.keymaps.cycle_next) ~= "string" then
+    result.panes.keymaps.cycle_next = defaults.overview.panes.keymaps.cycle_next
+  end
+  if type(result.panes.keymaps.cycle_prev) ~= "string" then
+    result.panes.keymaps.cycle_prev = defaults.overview.panes.keymaps.cycle_prev
+  end
+  if type(result.panes.keymaps.focus_summary) ~= "string" then
+    result.panes.keymaps.focus_summary = defaults.overview.panes.keymaps.focus_summary
+  end
+  if type(result.panes.keymaps.focus_activity) ~= "string" then
+    result.panes.keymaps.focus_activity = defaults.overview.panes.keymaps.focus_activity
+  end
+  if type(result.panes.keymaps.focus_meta) ~= "string" then
+    result.panes.keymaps.focus_meta = defaults.overview.panes.keymaps.focus_meta
+  end
+  if type(result.panes.keymaps.help) ~= "string" then
+    result.panes.keymaps.help = defaults.overview.panes.keymaps.help
+  end
+  if type(result.panes.keymaps.focus_left) ~= "string" then
+    result.panes.keymaps.focus_left = defaults.overview.panes.keymaps.focus_left
+  end
+  if type(result.panes.keymaps.focus_down) ~= "string" then
+    result.panes.keymaps.focus_down = defaults.overview.panes.keymaps.focus_down
+  end
+  if type(result.panes.keymaps.focus_up) ~= "string" then
+    result.panes.keymaps.focus_up = defaults.overview.panes.keymaps.focus_up
+  end
+  if type(result.panes.keymaps.focus_right) ~= "string" then
+    result.panes.keymaps.focus_right = defaults.overview.panes.keymaps.focus_right
+  end
+
   result.tabs = sanitize_overview_tabs(result.tabs)
   result.expand_step = sanitize_positive_integer(result.expand_step, defaults.overview.expand_step)
 
@@ -692,149 +782,55 @@ local function sanitize_overview(overview)
   return result
 end
 
-local function sanitize_overview_v2(overview_v2)
+local function merge_legacy_overview_v2_alias(overview, overview_v2)
   if type(overview_v2) ~= "table" then
-    return vim.deepcopy(defaults.overview_v2)
+    return overview
   end
 
-  local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.overview_v2), overview_v2)
+  local legacy_overview = {
+    date_format = overview_v2.date_format,
+    window = overview_v2.window,
+    show = overview_v2.show,
+    panes = {
+      layout = overview_v2.layout,
+      activity = overview_v2.activity,
+      keymaps = overview_v2.keymaps,
+    },
+  }
 
-  if type(result.enabled) ~= "boolean" then
+  if type(overview_v2.enabled) == "boolean" then
+    legacy_overview.window = type(legacy_overview.window) == "table" and legacy_overview.window or {}
+    legacy_overview.window.enabled = overview_v2.enabled
+  end
+
+  return vim.tbl_deep_extend("force", legacy_overview, type(overview) == "table" and overview or {})
+end
+
+local function build_overview_v2_alias(overview)
+  local source = type(overview) == "table" and overview or {}
+  local panes = type(source.panes) == "table" and source.panes or {}
+  local window = type(source.window) == "table" and source.window or {}
+
+  return {
+    enabled = window.enabled ~= false,
+    date_format = source.date_format,
+    window = window,
+    layout = panes.layout,
+    activity = panes.activity,
+    show = source.show,
+    keymaps = panes.keymaps,
+  }
+end
+
+local function sanitize_overview_v2(overview_v2)
+  local canonical = sanitize_overview(merge_legacy_overview_v2_alias(nil, overview_v2))
+  local result = build_overview_v2_alias(canonical)
+  local source = type(overview_v2) == "table" and overview_v2 or nil
+
+  if source and type(source.enabled) == "boolean" then
+    result.enabled = source.enabled
+  else
     result.enabled = defaults.overview_v2.enabled
-  end
-
-  if type(result.date_format) ~= "string" or result.date_format == "" then
-    result.date_format = defaults.overview_v2.date_format
-  end
-
-  result.window = type(result.window) == "table" and result.window or {}
-  if type(result.window.enabled) ~= "boolean" then
-    result.window.enabled = defaults.overview_v2.window.enabled
-  end
-  if result.window.border ~= "rounded"
-    and result.window.border ~= "single"
-    and result.window.border ~= "double"
-    and result.window.border ~= "solid"
-    and result.window.border ~= "shadow"
-    and result.window.border ~= "none" then
-    result.window.border = defaults.overview_v2.window.border
-  end
-  result.window.width_ratio = sanitize_ratio(result.window.width_ratio, defaults.overview_v2.window.width_ratio)
-  result.window.height_ratio = sanitize_ratio(result.window.height_ratio, defaults.overview_v2.window.height_ratio)
-  result.window.min_width = sanitize_positive_integer(result.window.min_width, defaults.overview_v2.window.min_width)
-  result.window.min_height = sanitize_positive_integer(result.window.min_height, defaults.overview_v2.window.min_height)
-  result.window.max_width = sanitize_positive_integer(result.window.max_width, defaults.overview_v2.window.max_width)
-  result.window.max_height = sanitize_positive_integer(result.window.max_height, defaults.overview_v2.window.max_height)
-  if result.window.max_width < result.window.min_width then
-    result.window.max_width = result.window.min_width
-  end
-  if result.window.max_height < result.window.min_height then
-    result.window.max_height = result.window.min_height
-  end
-  if type(result.window.backdrop) == "number" then
-    result.window.backdrop = math.max(0, math.min(100, math.floor(result.window.backdrop)))
-  elseif result.window.backdrop ~= false then
-    result.window.backdrop = defaults.overview_v2.window.backdrop
-  end
-  if type(result.window.enter) ~= "boolean" then
-    result.window.enter = defaults.overview_v2.window.enter
-  end
-
-  result.layout = type(result.layout) == "table" and result.layout or {}
-  local sidebar_ratio = tonumber(result.layout.sidebar_width_ratio)
-  if type(sidebar_ratio) ~= "number" or sidebar_ratio < 0.2 or sidebar_ratio > 0.6 then
-    sidebar_ratio = defaults.overview_v2.layout.sidebar_width_ratio
-  end
-  result.layout.sidebar_width_ratio = sidebar_ratio
-  local summary_ratio = tonumber(result.layout.summary_height_ratio)
-  if type(summary_ratio) ~= "number" or summary_ratio < 0.2 or summary_ratio > 0.8 then
-    summary_ratio = defaults.overview_v2.layout.summary_height_ratio
-  end
-  result.layout.summary_height_ratio = summary_ratio
-  result.layout.gap = sanitize_non_negative_integer(result.layout.gap, defaults.overview_v2.layout.gap)
-  if result.layout.gap > 3 then
-    result.layout.gap = defaults.overview_v2.layout.gap
-  end
-  result.layout.min_left_width = sanitize_positive_integer(result.layout.min_left_width, defaults.overview_v2.layout.min_left_width)
-  result.layout.min_sidebar_width = sanitize_positive_integer(
-    result.layout.min_sidebar_width,
-    defaults.overview_v2.layout.min_sidebar_width
-  )
-  result.layout.min_summary_height = sanitize_positive_integer(
-    result.layout.min_summary_height,
-    defaults.overview_v2.layout.min_summary_height
-  )
-  result.layout.min_activity_height = sanitize_positive_integer(
-    result.layout.min_activity_height,
-    defaults.overview_v2.layout.min_activity_height
-  )
-
-  result.activity = type(result.activity) == "table" and result.activity or {}
-  result.activity.max_body_lines = sanitize_positive_integer(
-    result.activity.max_body_lines,
-    defaults.overview_v2.activity.max_body_lines
-  )
-  result.activity.max_events = sanitize_positive_integer(result.activity.max_events, defaults.overview_v2.activity.max_events)
-  if type(result.activity.show_code_context) ~= "boolean" then
-    result.activity.show_code_context = defaults.overview_v2.activity.show_code_context
-  end
-
-  result.show = type(result.show) == "table" and result.show or {}
-  if type(result.show.checks) ~= "boolean" then
-    result.show.checks = defaults.overview_v2.show.checks
-  end
-  if type(result.show.commits) ~= "boolean" then
-    result.show.commits = defaults.overview_v2.show.commits
-  end
-  if type(result.show.timeline) ~= "boolean" then
-    result.show.timeline = defaults.overview_v2.show.timeline
-  end
-  if type(result.show.comments) ~= "boolean" then
-    result.show.comments = defaults.overview_v2.show.comments
-  end
-  if type(result.show.reviews) ~= "boolean" then
-    result.show.reviews = defaults.overview_v2.show.reviews
-  end
-  if type(result.show.threads) ~= "boolean" then
-    result.show.threads = defaults.overview_v2.show.threads
-  end
-  if type(result.show.pr_changes) ~= "boolean" then
-    result.show.pr_changes = defaults.overview_v2.show.pr_changes
-  end
-  if type(result.show.labels) ~= "boolean" then
-    result.show.labels = defaults.overview_v2.show.labels
-  end
-
-  result.keymaps = type(result.keymaps) == "table" and result.keymaps or {}
-  if type(result.keymaps.cycle_next) ~= "string" then
-    result.keymaps.cycle_next = defaults.overview_v2.keymaps.cycle_next
-  end
-  if type(result.keymaps.cycle_prev) ~= "string" then
-    result.keymaps.cycle_prev = defaults.overview_v2.keymaps.cycle_prev
-  end
-  if type(result.keymaps.focus_summary) ~= "string" then
-    result.keymaps.focus_summary = defaults.overview_v2.keymaps.focus_summary
-  end
-  if type(result.keymaps.focus_activity) ~= "string" then
-    result.keymaps.focus_activity = defaults.overview_v2.keymaps.focus_activity
-  end
-  if type(result.keymaps.focus_meta) ~= "string" then
-    result.keymaps.focus_meta = defaults.overview_v2.keymaps.focus_meta
-  end
-  if type(result.keymaps.help) ~= "string" then
-    result.keymaps.help = defaults.overview_v2.keymaps.help
-  end
-  if type(result.keymaps.focus_left) ~= "string" then
-    result.keymaps.focus_left = defaults.overview_v2.keymaps.focus_left
-  end
-  if type(result.keymaps.focus_down) ~= "string" then
-    result.keymaps.focus_down = defaults.overview_v2.keymaps.focus_down
-  end
-  if type(result.keymaps.focus_up) ~= "string" then
-    result.keymaps.focus_up = defaults.overview_v2.keymaps.focus_up
-  end
-  if type(result.keymaps.focus_right) ~= "string" then
-    result.keymaps.focus_right = defaults.overview_v2.keymaps.focus_right
   end
 
   return result
@@ -951,6 +947,28 @@ local function sanitize_follow_current_file(follow_current_file)
   end
   if type(result.sources.pr_review) ~= "boolean" then
     result.sources.pr_review = defaults.follow_current_file.sources.pr_review
+  end
+
+  return result
+end
+
+local function sanitize_mappings(mappings)
+  if type(mappings) ~= "table" then
+    return vim.deepcopy(defaults.mappings)
+  end
+
+  local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.mappings), mappings)
+  result.global = type(result.global) == "table" and result.global or {}
+
+  if type(result.global.enabled) ~= "boolean" then
+    result.global.enabled = defaults.mappings.global.enabled
+  end
+
+  result.global.keys = type(result.global.keys) == "table" and result.global.keys or {}
+  for key, lhs in pairs(defaults.mappings.global.keys) do
+    if type(result.global.keys[key]) ~= "string" or result.global.keys[key] == "" then
+      result.global.keys[key] = lhs
+    end
   end
 
   return result
@@ -1346,7 +1364,21 @@ local function sanitize_diff_view(diff_view)
 end
 
 function M.setup(opts)
-  opts = opts or {}
+  opts = type(opts) == "table" and opts or {}
+  local legacy_overview_v2_input = type(opts.overview_v2) == "table" and opts.overview_v2 or nil
+  local merged_overview_input = merge_legacy_overview_v2_alias(
+    type(opts.overview) == "table" and opts.overview or nil,
+    legacy_overview_v2_input
+  )
+
+  if legacy_overview_v2_input and not vim.tbl_isempty(legacy_overview_v2_input) then
+    notify_deprecation_once(
+      "overview_v2",
+      "gh-pr: `overview_v2` is deprecated; migrate to `overview` "
+        .. "(date_format/window/show) and `overview.panes` (layout/activity/keymaps)."
+    )
+  end
+
   state = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts)
   state.remotes = sanitize_remotes(state.remotes)
   state.queries = sanitize_queries(state.queries)
@@ -1362,12 +1394,18 @@ function M.setup(opts)
   end
 
   state.line_comments = sanitize_line_comments(state.line_comments)
-  state.overview = sanitize_overview(state.overview)
-  state.overview_v2 = sanitize_overview_v2(state.overview_v2)
+  state.overview = sanitize_overview(merged_overview_input)
+  state.overview_v2 = sanitize_overview_v2(build_overview_v2_alias(state.overview))
+  if legacy_overview_v2_input and type(legacy_overview_v2_input.enabled) == "boolean" then
+    state.overview_v2.enabled = legacy_overview_v2_input.enabled
+  else
+    state.overview_v2.enabled = defaults.overview_v2.enabled
+  end
   state.cache = sanitize_cache(state.cache)
   state.follow_current_file = sanitize_follow_current_file(state.follow_current_file)
   state.diff_view = sanitize_diff_view(state.diff_view)
   state.path_render = sanitize_path_render(state.path_render, opts)
+  state.mappings = sanitize_mappings(state.mappings)
 
   if type(state.ui) ~= "table" then
     state.ui = vim.deepcopy(defaults.ui)

@@ -344,7 +344,7 @@ function M.open(opts)
   })
 
   if valid_buf(origin_bufnr) then
-    vim.api.nvim_create_autocmd({ "BufWipeout", "BufDelete" }, {
+    vim.api.nvim_create_autocmd({ "BufWipeout", "BufUnload", "BufDelete" }, {
       buffer = origin_bufnr,
       once = true,
       callback = function()

@@ -8,10 +8,52 @@ local line_comments = require("gh-pr.line_comments")
 local state = require("gh-pr.state")
 
 local base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-local unified_highlight_ns = vim.api.nvim_create_namespace("gh-pr-unified-diff")
-local unified_syntax_ns = vim.api.nvim_create_namespace("gh-pr-unified-syntax")
-local endline_render_ns = vim.api.nvim_create_namespace("gh-pr-endline-render")
-local whitespace_render_ns = vim.api.nvim_create_namespace("gh-pr-whitespace-render")
+local extmark_namespaces = {
+  unified_highlight = vim.api.nvim_create_namespace("gh-pr-unified-diff"),
+  unified_syntax = vim.api.nvim_create_namespace("gh-pr-unified-syntax"),
+  endline = vim.api.nvim_create_namespace("gh-pr-endline-render"),
+  whitespace = vim.api.nvim_create_namespace("gh-pr-whitespace-render"),
+}
+local unified_highlight_ns = extmark_namespaces.unified_highlight
+local unified_syntax_ns = extmark_namespaces.unified_syntax
+local endline_render_ns = extmark_namespaces.endline
+local whitespace_render_ns = extmark_namespaces.whitespace
+
+local function clear_extmark_namespaces(bufnr, namespace_keys)
+  if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local keys = type(namespace_keys) == "table"
+      and namespace_keys
+    or { "unified_highlight", "unified_syntax", "endline", "whitespace" }
+
+  for _, key in ipairs(keys) do
+    local namespace = extmark_namespaces[key]
+    if type(namespace) == "number" then
+      pcall(vim.api.nvim_buf_clear_namespace, bufnr, namespace, 0, -1)
+    end
+  end
+end
+
+local function ensure_virtual_buffer_cleanup(bufnr)
+  if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  if vim.b[bufnr].gh_pr_virtual_cleanup_attached == true then
+    return
+  end
+  vim.b[bufnr].gh_pr_virtual_cleanup_attached = true
+
+  vim.api.nvim_create_autocmd({ "BufWipeout", "BufUnload" }, {
+    buffer = bufnr,
+    callback = function()
+      image_renderer.clear(bufnr)
+      clear_extmark_namespaces(bufnr)
+    end,
+  })
+end
 
 local function decode_base64_fallback(data)
   data = data:gsub("[^" .. base64_chars .. "=]", "")
@@ -793,8 +835,27 @@ local function set_pr_buffer_keymaps(bufnr, keymap_opts)
   maybe_notify_diff_open_hint(bufnr, file_kind, diff_shortcuts)
 end
 
+local function apply_buffer_mode_cleanup(bufnr, opts)
+  opts = type(opts) == "table" and opts or {}
+  local is_image = opts.is_image == true
+  local images = type(opts.images) == "table" and opts.images or resolve_image_options()
+
+  set_pr_buffer_keymaps(bufnr, {
+    is_image = is_image,
+    images = images,
+  })
+  ensure_virtual_buffer_cleanup(bufnr)
+
+  if is_image then
+    clear_extmark_namespaces(bufnr, { "whitespace", "endline" })
+    return
+  end
+
+  image_renderer.clear(bufnr)
+end
+
 local function apply_line_highlights(bufnr, highlights)
-  vim.api.nvim_buf_clear_namespace(bufnr, unified_highlight_ns, 0, -1)
+  clear_extmark_namespaces(bufnr, { "unified_highlight" })
   if type(highlights) ~= "table" then
     return
   end
@@ -854,7 +915,7 @@ local function resolve_capture_group(capture_name, lang)
 end
 
 local function apply_unified_syntax_highlights(bufnr, path, line_map)
-  vim.api.nvim_buf_clear_namespace(bufnr, unified_syntax_ns, 0, -1)
+  clear_extmark_namespaces(bufnr, { "unified_syntax" })
 
   if type(line_map) ~= "table" then
     return
@@ -1081,27 +1142,13 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
   if kind == "unified" then
     apply_unified_syntax_highlights(bufnr, canonical ~= "" and canonical or path, vim.b[bufnr].gh_pr_unified_line_map)
   else
-    vim.api.nvim_buf_clear_namespace(bufnr, unified_syntax_ns, 0, -1)
+    clear_extmark_namespaces(bufnr, { "unified_syntax" })
   end
 
-  set_pr_buffer_keymaps(bufnr, {
+  apply_buffer_mode_cleanup(bufnr, {
     is_image = is_image,
     images = images_cfg,
   })
-
-  if is_image then
-    vim.api.nvim_buf_clear_namespace(bufnr, endline_render_ns, 0, -1)
-  end
-
-  if is_image and not vim.b[bufnr].gh_pr_image_cleanup_attached then
-    vim.b[bufnr].gh_pr_image_cleanup_attached = true
-    vim.api.nvim_create_autocmd("BufWipeout", {
-      buffer = bufnr,
-      callback = function()
-        image_renderer.clear(bufnr)
-      end,
-    })
-  end
 
   return bufnr
 end
@@ -1493,7 +1540,7 @@ local function apply_window_whitespace_render(winid, enabled)
     return
   end
 
-  vim.api.nvim_buf_clear_namespace(bufnr, whitespace_render_ns, 0, -1)
+  clear_extmark_namespaces(bufnr, { "whitespace" })
 
   -- Keep diff buffers independent from global `list` rendering.
   pcall(vim.api.nvim_set_option_value, "list", false, { win = winid })
@@ -1574,7 +1621,7 @@ local function apply_window_endline_render(winid, enabled)
     return
   end
 
-  vim.api.nvim_buf_clear_namespace(bufnr, endline_render_ns, 0, -1)
+  clear_extmark_namespaces(bufnr, { "endline" })
   if enabled ~= true or vim.b[bufnr].gh_pr_is_image == true then
     return
   end
@@ -2284,19 +2331,19 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
     vim.b[bufnr].gh_pr_unified_line_map = unified_line_map
     apply_unified_syntax_highlights(bufnr, canonical_path ~= "" and canonical_path or next_path, unified_line_map)
   else
-    vim.api.nvim_buf_clear_namespace(bufnr, unified_syntax_ns, 0, -1)
+    clear_extmark_namespaces(bufnr, { "unified_syntax" })
   end
 
+  apply_buffer_mode_cleanup(bufnr, {
+    is_image = is_image_buffer,
+    images = data.image_options,
+  })
+
   if is_image_buffer then
-    set_pr_buffer_keymaps(bufnr, { is_image = true, images = data.image_options })
-    vim.api.nvim_buf_clear_namespace(bufnr, whitespace_render_ns, 0, -1)
-    vim.api.nvim_buf_clear_namespace(bufnr, endline_render_ns, 0, -1)
     for _, win in ipairs(windows_showing_buffer(bufnr)) do
       render_image_in_window(bufnr, win.winid, details, pr, image_side, data.status, image_asset, data.image_options)
     end
   else
-    image_renderer.clear(bufnr)
-    set_pr_buffer_keymaps(bufnr, { is_image = false, images = data.image_options })
     local diff_view = M.resolve_diff_view_options()
     for _, win in ipairs(windows_showing_buffer(bufnr)) do
       apply_window_whitespace_render(win.winid, diff_view.render_whitespace)

@@ -6,14 +6,52 @@ GitHub CLI as backend.
 Requirements
 ============
 
+- Neovim >= 0.9 (0.10+ recommended for `vim.system` / `vim.ui.open` support)
 - `gh` installed and authenticated
 - inside a git repository
+- `render-markdown.nvim` installed (required dependency)
 
 Optional UI backends:
 
 - `neo-tree.nvim` (primary)
 - `telescope.nvim` (fallback)
 - `snacks.nvim` (required for interactive overview)
+
+Architecture
+============
+
+Canonical module layout after consolidation:
+
+- Entrypoint: `plugin/gh-pr.lua` (commands + `<Plug>` wiring only)
+- Public facade: `lua/gh-pr/init.lua`
+- Config/state normalization: `lua/gh-pr/config.lua`
+- Command specs: `lua/gh-pr/commands.lua`
+- Mapping specs: `lua/gh-pr/mappings.lua`
+- Core domains: `lua/gh-pr/core/*` (overview/diff/review action modules)
+- UI domains: `lua/gh-pr/ui/*` (overview panes in `ui/overview/*`)
+- Optional adapters: `lua/gh-pr/integrations/*`
+- Health checks: `lua/gh-pr/health.lua`
+
+Migration (legacy overview path removal)
+========================================
+
+Legacy internal `overview_v2*` module paths were removed. Update custom
+`require()` calls:
+
+- `gh-pr.overview_v2_runtime` -> `gh-pr.ui.overview.runtime`
+- `gh-pr.overview_v2_layout` -> `gh-pr.ui.overview.layout`
+- `gh-pr.overview_v2_render` -> `gh-pr.ui.overview.render`
+- `gh-pr.overview_v2_keymaps` -> `gh-pr.ui.overview.keymaps`
+
+User-facing compatibility aliases remain available:
+
+- `:GhPrOverviewV2` maps to `:GhPrOverview`
+- `:GhPrOverviewV2Refresh` maps to `:GhPrOverviewRefresh`
+- `setup({ overview_v2 = ... })` is still accepted and mapped to `overview`
+  / `overview.panes` with a deprecation warning
+- `require("gh-pr").open_overview_v2()` and
+  `require("gh-pr").refresh_overview_v2()` still dispatch to canonical
+  overview actions
 
 Commands
 ========
@@ -95,14 +133,21 @@ Commands
     Alias: `:GhPrReviewRefresh`.
 
 :GhPrOverview
-    Opens an interactive tabs overview for the active pull request.
-    Requires `snacks.nvim`; if missing, an explicit error is shown.
+    Opens overview panes (Summary, Activity, Collaboration) for the
+    active pull request.
+
+:GhPrOverviewV2
+    Compatibility alias of `:GhPrOverview`.
 
 :GhPrOverviewRefresh
-    Refreshes the current overview buffer in place.
+    Refreshes the active overview panes.
+
+:GhPrOverviewV2Refresh
+    Compatibility alias of `:GhPrOverviewRefresh`.
 
 :GhPrOverviewMore {section} [count]
-    Loads more items in a section (`checks`, `commits`, `timeline`).
+    Loads more items in a section (`checks`, `commits`, `comments`,
+    `reviews`, `threads`).
 
 Overview buffer keymaps:
     `a` approve review
@@ -126,8 +171,11 @@ Overview buffer keymaps:
     `ed` toggle draft status (`ready`/`draft`)
     `<CR>` open selected row action
     `<CR>` on `Commits` opens commit diff details in virtual patch buffer
+    `<CR>` on `Summary > Activity` thread headers toggles expand/collapse
     `gp` preview markdown link under cursor in PR description
-    `gr` load more for current section tab
+    `gf` toggle fix diff for thread comment (latest commit patch in PR
+    touching the file)
+    `gr` load more for current section tab (`Summary` loads more Activity)
     `D` open diff for selected row (file/commit)
     `O` open original for selected file row
     `M` open modified for selected file row
@@ -136,8 +184,16 @@ Overview buffer keymaps:
     the overview on success.
     In multi-select edits (`labels`/`reviewers`), deselected current items
     are interpreted as removals.
-    PR description is rendered inline as markdown in `Summary`.
-    Markdown links in description render as labels and support preview.
+    PR description is rendered as markdown in `Summary`.
+    In `overview.markdown.mode = "full"`, raw markdown and fenced code
+    blocks are preserved (including `diff` snippets with syntax highlight).
+    In `overview.markdown.mode = "legacy"`, renderer is selected by
+    `overview.markdown.provider` (`render-markdown` or `builtin`).
+    With `overview.markdown.github_style = true`, Summary uses
+    GitHub-like markdown structure (headings + separators).
+    `overview.markdown.diff_gutter = "none"` keeps thread and fix
+    diff blocks clean (no per-line numbering).
+    Markdown links in description support preview.
     Link preview download is only used for GitHub attachments.
     Non-attachment links prompt `open link`/`cancel` and open in browser
     only after confirmation.
@@ -146,6 +202,44 @@ Overview buffer keymaps:
     PR metadata (state/review/merge/branches/stats) is rendered globally
     in header across tabs.
     `Summary` no longer renders the old `Actions` block.
+    `Summary` embeds `Activity` below PR description.
+    Embedded Activity includes commit uploads and PR change events
+    (labels/review requests/assignees/milestones/title/base-ref/ready-
+    draft/close/reopen/merge/force-push).
+    Commit events in embedded Activity can be opened with `<CR>` to view
+    commit diffs.
+    Threads in embedded activity open by default; resolved/outdated
+    threads start collapsed.
+    Thread comments in embedded activity include foldable markdown code
+    blocks (`diffHunk`, fenced as `diff`) with syntax-aware rendering
+    and two-level indentation (thread + replies).
+    Thread code snippets are trimmed around the commented line and can be
+    configured with `overview.thread_snippet.context_before/context_after`
+    (default `5/5`).
+    Thread comments can render `↪ View fix diff` and toggle an inline
+    markdown `diff` block from the latest commit patch touching that
+    file (`overview.thread_fix_diff`).
+    Thread comments also render `↪ View evolution diff` to open virtual
+    diff buffer from comment commit to latest commit touching that file
+    (no patch buffers).
+    If inline patch resolution fails and
+    `overview.thread_fix_diff.fallback_to_buffer = true`, gh-pr opens
+    legacy diff buffers as fallback.
+
+Overview panes keymaps:
+    `a`/`d`/`c`/`m`/`k`/`b` same review/browser actions as Overview.
+    `<CR>` executes the action under cursor in focused pane.
+    Thread comments show `↪ View evolution diff` (comment commit ->
+    latest commit touching file) using virtual diff buffer.
+    `gr` loads more activity events.
+    `et`/`eb`/`el`/`er`/`ea`/`em`/`es`/`ed` trigger metadata edits.
+    `?` opens floating shortcuts help.
+    `<Tab>`/`<S-Tab>` cycle panes.
+    `g1`/`g2`/`g3` focus Summary/Activity/Collaboration panes.
+    `<C-h>`/`<C-j>`/`<C-k>`/`<C-l>` switch focus between
+    Summary/Activity/Collaboration panes.
+    `<C-w>w`/`<C-w>W` cycle panes; `<C-w>h/j/k/l` focuses
+    Summary/Activity/Summary/Collaboration.
 
 :GhPrCheckout [number]
     Runs `gh pr checkout` for the active PR or provided number.
@@ -176,11 +270,14 @@ Overview buffer keymaps:
       - in 2-way diff closes head/modified window and keeps base/original
       - in single-buffer views closes current buffer and opens PR Review
     Press `<localleader>dQ` to close current diff view(s) and open/focus PR Review.
+    Press `<localleader>dc` to toggle bottom comments panel in diff view.
+    When enabled, the comments panel auto-opens for PRs with file comments.
     On first open per diff buffer, gh-pr shows a one-time hint with close shortcuts.
     Additional virtual-buffer shortcuts:
       `<localleader>dr` refresh current diff from GitHub
       `<localleader>dq` quick close
       `<localleader>dQ` close diff view(s) and open PR Review
+      `<localleader>dc` toggle diff comments panel
       `<localleader>tw` toggle whitespace diff mode (ignored/strict)
       `<localleader>ts` toggle leading/trailing whitespace/tab symbol rendering
       `<localleader>te` toggle endline markers (`LF`/`CRLF`/`CR`)
@@ -268,17 +365,42 @@ Overview buffer keymaps:
 Keymaps
 =======
 
-<leader>gho       Open PR UI (:GhPrOpen)
-<leader>ghl       Open Telescope list (:GhPrList)
-<leader>ghm       Open comments tree (:GhPrComments)
-<leader>ghx       Toggle PR Review source (:GhPrReviewTree)
-<leader>ghr       Refresh (:GhPrRefresh)
-<leader>ghv       Open PR overview (:GhPrOverview)
-<leader>ghc       Checkout PR (:GhPrCheckout)
-<leader>ghd       Open diff (:GhPrOpenDiff)
-<leader>ght       Toggle viewed (:GhPrToggleReviewed)
-<leader>ghn       Next diff hunk (:GhPrNextChange)
-<leader>ghp       Previous diff hunk (:GhPrPrevChange)
+Top-level mappings are exposed as <Plug> targets. Global <leader> mappings are
+disabled by default.
+
+<Plug>(gh-pr-open)            Open PR UI (:GhPrOpen)
+<Plug>(gh-pr-list)            Open Telescope list (:GhPrList)
+<Plug>(gh-pr-comments)        Open comments tree (:GhPrComments)
+<Plug>(gh-pr-start-review)    Start PR review flow (:GhPrStartReview)
+<Plug>(gh-pr-review-tree)     Toggle PR Review source (:GhPrReviewTree)
+<Plug>(gh-pr-refresh)         Refresh (:GhPrRefresh)
+<Plug>(gh-pr-review-refresh)  Force refresh PR Review data (:GhPrReviewRefresh)
+<Plug>(gh-pr-overview)        Open PR overview (:GhPrOverview)
+<Plug>(gh-pr-overview-refresh) Refresh PR overview (:GhPrOverviewRefresh)
+<Plug>(gh-pr-checkout)        Checkout PR (:GhPrCheckout)
+<Plug>(gh-pr-open-diff)       Open diff (:GhPrOpenDiff)
+<Plug>(gh-pr-open-original)   Open base version (:GhPrOpenOriginal)
+<Plug>(gh-pr-open-modified)   Open head version (:GhPrOpenModified)
+<Plug>(gh-pr-open-commit-patch) Open selected commit patch (:GhPrOpenCommitPatch)
+<Plug>(gh-pr-toggle-reviewed) Toggle viewed (:GhPrToggleReviewed)
+<Plug>(gh-pr-next-change)     Next diff hunk (:GhPrNextChange)
+<Plug>(gh-pr-prev-change)     Previous diff hunk (:GhPrPrevChange)
+<Plug>(gh-pr-approve)         Approve active PR (:GhPrApprove)
+<Plug>(gh-pr-request-changes) Request changes on active PR (:GhPrRequestChanges)
+<Plug>(gh-pr-comment)         Submit PR comment review (:GhPrComment)
+<Plug>(gh-pr-review-submit)   Submit pending review as comment (:GhPrReviewSubmit)
+<Plug>(gh-pr-review-approve)  Submit pending review as approve (:GhPrReviewApprove)
+<Plug>(gh-pr-review-request-changes) Submit pending review as request changes (:GhPrReviewRequestChanges)
+<Plug>(gh-pr-review-discard)  Discard pending review (:GhPrReviewDiscard)
+<Plug>(gh-pr-merge)           Merge active PR (:GhPrMerge)
+
+Example user map:
+  vim.keymap.set("n", "<leader>gho", "<Plug>(gh-pr-open)",
+    { remap = true, silent = true, desc = "Open PR UI" })
+
+Enable default global mappings:
+  require("gh-pr").setup({ mappings = { global = { enabled = true } } })
+
 gh_pr PR nodes     Expose only `Overview` child (no `Files` subtree)
 `r` (gh_pr)      Start review flow for selected PR
 `ra` (gh_pr)     Approve review flow for selected PR
@@ -333,34 +455,72 @@ Call `require("gh-pr").setup({ ... })` with:
 - `line_comments.comments_tree.preview.keymap` (`"p"`)
 - `line_comments.comments_tree.preview.position` (`"right"`)
 - `line_comments.comments_tree.preview.keep_focus` (`true`)
+- `line_comments.comments_tree.auto_open_thread_popup` (`true`)
+- `line_comments.comments_tree.thread_popup.enabled` (`true`)
+- `line_comments.comments_tree.thread_popup.width_ratio|height_ratio` (`0.62|0.55`)
+- `line_comments.comments_tree.thread_popup.min_width|min_height` (`80|12`)
+- `line_comments.comments_tree.thread_popup.max_width|max_height` (`140|40`)
+- `line_comments.comments_tree.thread_popup.border` (`"rounded"`)
+- `line_comments.comments_tree.thread_popup.wrap` (`true`)
+- `line_comments.comments_tree.thread_popup.enter` (`true`)
+- `line_comments.comments_tree.thread_popup.position` (`"cursor"`, or `"editor"`)
 - `overview.ui` (`"snacks"`)
 - `overview.layout` (`"tabs"`)
-- `overview.tabs` (`summary/checks/commits/timeline/files`)
+- `overview.tabs` (`summary/checks/commits/files`; legacy `timeline/comments/reviews/threads` map to `summary`)
 - `overview.expand_step` (`20`)
 - `overview.date_format` (`"%Y-%m-%d %H:%M"`)
 - `overview.window.enabled` (`true`)
 - `overview.window.border` (`"rounded"`)
-- `overview.window.width_ratio|height_ratio` (`0.88`)
-- `overview.window.min_width|min_height` (`100|28`)
-- `overview.window.max_width|max_height` (`180|60`)
+- `overview.window.width_ratio|height_ratio` (`0.9`)
+- `overview.window.min_width|min_height` (`110|30`)
+- `overview.window.max_width|max_height` (`220|80`)
 - `overview.window.backdrop` (`0`)
 - `overview.window.enter` (`true`)
+- `overview.panes.layout.sidebar_width_ratio` (`0.34`)
+- `overview.panes.layout.summary_height_ratio` (`0.38`)
+- `overview.panes.layout.gap` (`1`)
+- `overview.panes.layout.min_left_width|min_sidebar_width` (`58|30`)
+- `overview.panes.layout.min_summary_height|min_activity_height` (`10|12`)
+- `overview.panes.activity.max_body_lines` (`8`)
+- `overview.panes.activity.max_events` (`120`)
+- `overview.panes.activity.show_code_context` (`true`)
+- `overview.panes.keymaps.cycle_next|cycle_prev` (`<Tab>/<S-Tab>`)
+- `overview.panes.keymaps.focus_summary|focus_activity|focus_meta` (`g1/g2/g3`)
+- `overview.panes.keymaps.help` (`?`)
+- `overview.panes.keymaps.focus_left|focus_down|focus_up|focus_right` (`<C-h>/<C-j>/<C-k>/<C-l>`)
 - `overview.theme.state_colors` (`true`)
 - `overview.theme.checks_colors` (`true`)
 - `overview.theme.labels` (`true`)
 - `overview.theme.reviewers` (`true`)
 - `overview.theme.timeline_kinds` (`true`)
 - `overview.markdown.enabled` (`true`)
-- `overview.markdown.provider` (`"auto"`)
+- `overview.markdown.mode` (`"full"`; also `"legacy"`)
+- `overview.markdown.provider` (`"render-markdown"` default, or `"builtin"`)
 - `overview.markdown.max_lines` (`500`)
 - `overview.markdown.code_block_border` (`false`)
+- `overview.markdown.github_style` (`true`)
+- `overview.markdown.github_style_separators` (`"rules"`)
+- `overview.markdown.diff_gutter` (`"none"` default; `"old_new_code"` deprecated and mapped to `"none"`)
 - `overview.markdown.link_preview_keymap` (`"gp"`)
 - `overview.markdown.link_preview_max_bytes` (`10485760`, 10 MiB)
 - `overview.markdown.link_preview_renderable_extensions` (`txt/md/markdown/json/yaml/yml/csv/log`)
 - `overview.markdown.link_preview_disallowed_extensions` (`zip`)
 - `overview.markdown.link_preview_open_local` (`"system"`)
-- `overview.max_items` (checks/commits/timeline)
+- `overview.thread_snippet.context_before` (`5`)
+- `overview.thread_snippet.context_after` (`5`)
+- `overview.thread_fix_diff.enabled` (`true`)
+- `overview.thread_fix_diff.show_action_line` (`true`)
+- `overview.thread_fix_diff.keymap` (`"gf"`)
+- `overview.thread_fix_diff.inline` (`true`)
+- `overview.thread_fix_diff.context_before` (`5`)
+- `overview.thread_fix_diff.context_after` (`5`)
+- `overview.thread_fix_diff.fallback_to_buffer` (`true`)
+- `overview.max_items` (checks/commits/timeline/comments/reviews/threads)
 - `overview.show` (toggle sections)
+- `overview.show.comments|reviews|threads` (`true`)
+- `overview.show.pr_changes` (`true`, show PR change events in `Summary > Activity`)
+- `overview_v2.enabled` (`false`; deprecated compatibility flag)
+- Legacy `overview_v2.date_format|window|layout|activity|show|keymaps` are still accepted and mapped to `overview` / `overview.panes` with deprecation warning.
 - `cache.gh_pr.enabled` (`true`)
 - `cache.gh_pr.ttl_seconds` (`60`)
 - `cache.gh_pr.auto_refresh_when_focused` (`true`)
@@ -373,6 +533,9 @@ Call `require("gh-pr").setup({ ... })` with:
 - `cache.gh_pr_review.max_cache_age_seconds` (`900`)
 - `cache.gh_pr_review.show_stale_badge` (`true`)
 - `cache.gh_pr_review.sync_visible_buffers` (`true`)
+- `follow_current_file.enabled` (`true`)
+- `follow_current_file.debounce_ms` (`60`)
+- `follow_current_file.sources.pr|pr_review` (`true|true`)
 - `diff_view.mode` (`"vertical"`, also `"horizontal"` / `"unified"`)
 - `diff_view.ignore_whitespace` (`false`)
 - `diff_view.render_whitespace` (`true`)
@@ -413,9 +576,19 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.shortcuts.submit_pending_request_changes` (`"<localleader>rr"`)
 - `diff_view.shortcuts.discard_pending_review` (`"<localleader>rd"`)
 - `diff_view.shortcuts.toggle_review_tree` (`"<localleader>rx"`)
+- `diff_view.shortcuts.toggle_comments_panel` (`"<localleader>dc"`)
 - `diff_view.shortcuts.image_default_action` (`"<localleader>io"`)
 - `diff_view.shortcuts.image_fallback_menu` (`"<localleader>im"`)
 - `diff_view.shortcuts.show_open_hint` (`true`)
+- `diff_view.comments_panel.enabled` (`true`)
+- `diff_view.comments_panel.auto_open` (`"if_comments"`, also `"never"` / `"always"`)
+- `diff_view.comments_panel.height_ratio` (`0.28`)
+- `diff_view.comments_panel.min_height` (`8`)
+- `diff_view.comments_panel.max_height` (`18`)
+- `diff_view.comments_panel.follow_cursor` (`true`)
+- `diff_view.comments_panel.show_resolved` (`true`)
+- `diff_view.comments_panel.show_outdated` (`true`)
+- `diff_view.comments_panel.close_with_dq` (`true`)
 - `<localleader>` in diff shortcuts uses `vim.g.maplocalleader`; when unset,
   gh-pr falls back to `,` for diff-buffer mappings.
 - `diff_view.images.enabled` (`true`)
@@ -435,6 +608,25 @@ Call `require("gh-pr").setup({ ... })` with:
 - `queries` list: `{ folder, label, query }`
 - `ui.use_neotree` (`true`)
 - `ui.telescope_fallback` (`true`)
+- `mappings.global.enabled` (`false`; set `true` to enable default `<leader>gh*` maps)
+- `mappings.global.keys.open|list|comments|refresh|overview|checkout|open_diff|review_tree|toggle_reviewed|next_change|prev_change`
+  (defaults to `<leader>gho|ghl|ghm|ghr|ghv|ghc|ghd|ghx|ght|ghn|ghp`)
+
+Highlights
+==========
+
+- Baseline `GhPr*` highlight groups are defined as links to standard Neovim
+  highlight groups.
+- gh-pr re-applies these baseline links on `ColorScheme`.
+- To override plugin groups, define your own `ColorScheme` autocmd:
+>
+  vim.api.nvim_create_autocmd("ColorScheme", {
+    callback = function()
+      vim.api.nvim_set_hl(0, "GhPrPrDraft", { link = "WarningMsg" })
+      vim.api.nvim_set_hl(0, "GhPrOverviewBadge", { link = "StatusLine" })
+    end,
+  })
+<
 
 Persistence
 ===========

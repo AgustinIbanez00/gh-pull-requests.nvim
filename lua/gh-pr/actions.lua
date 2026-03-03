@@ -3,15 +3,18 @@ local M = {}
 local comment_composer = require("gh-pr.comment_composer")
 local comment_popup = require("gh-pr.comment_popup")
 local config = require("gh-pr.config")
+local diff_actions = require("gh-pr.core.diff_actions")
+local overview_actions = require("gh-pr.core.overview_actions")
+local overview_edit_actions = require("gh-pr.core.overview_edit_actions")
+local review_actions = require("gh-pr.core.review_actions")
 local diff_shortcuts_config = require("gh-pr.diff_shortcuts")
 local gh = require("gh-pr.gh")
 local image_metadata = require("gh-pr.image_metadata")
 local line_comments = require("gh-pr.line_comments")
-local multi_select = require("gh-pr.multi_select")
-local overview = require("gh-pr.overview")
 local pr_service = require("gh-pr.pr_service")
 local state = require("gh-pr.state")
 local thread_popup = require("gh-pr.thread_popup")
+local overview_edit_picker = require("gh-pr.ui.overview.edit_picker")
 local virtual_files = require("gh-pr.virtual_files")
 local uv = vim.uv or vim.loop
 
@@ -118,39 +121,6 @@ local function positive_integer(value, fallback)
   end
 
   return number
-end
-
-local function valid_overview_sections()
-  return {
-    checks = true,
-    commits = true,
-    timeline = true,
-  }
-end
-
-local function normalize_overview_limits(input)
-  local overview_config = (config.get() or {}).overview or {}
-  local defaults = overview_config.max_items or {}
-  local limits = type(input) == "table" and vim.deepcopy(input) or {}
-
-  limits.checks = positive_integer(limits.checks, positive_integer(defaults.checks, 10))
-  limits.commits = positive_integer(limits.commits, positive_integer(defaults.commits, 10))
-  limits.timeline = positive_integer(
-    limits.timeline,
-    positive_integer(defaults.timeline, math.max(positive_integer(defaults.comments, 30), positive_integer(defaults.reviews, 30)))
-  )
-  limits.comments = positive_integer(limits.comments, limits.timeline)
-  limits.reviews = positive_integer(limits.reviews, limits.timeline)
-  limits.threads = positive_integer(limits.threads, limits.timeline)
-  limits.timeline = math.max(limits.timeline, limits.comments, limits.reviews, limits.threads)
-
-  return limits
-end
-
-local function current_overview_limits()
-  local bufnr = vim.api.nvim_get_current_buf()
-  local stored = vim.b[bufnr].gh_pr_overview_limits
-  return normalize_overview_limits(type(stored) == "table" and stored or nil)
 end
 
 local function line_comment_options()
@@ -2566,339 +2536,64 @@ function M.open_timeline_item(item, opts)
   end
 end
 
-local function build_overview_callbacks(pr_number, mode)
-  mode = mode == "v2" and "v2" or "v1"
+local function overview_actions_context()
   return {
-    approve = function()
-      M.review("approve")
-    end,
-    request_changes = function()
-      M.review("request_changes")
-    end,
-    comment = function()
-      M.review("comment")
-    end,
-    merge = function()
-      M.merge()
-    end,
-    checkout = function()
-      M.checkout(pr_number)
-    end,
-    refresh = function()
-      if mode == "v2" then
-        M.refresh_overview_v2()
-      else
-        M.refresh_overview()
-      end
-    end,
-    open_url = function()
-      M.open_overview_url(pr_number)
-    end,
-    open_comments_tree = function()
-      M.open_comments(pr_number)
-    end,
-    edit_stub = function(kind, payload)
-      M.overview_edit_stub(kind, payload)
-    end,
-    more_section = function(section)
-      M.overview_more(section)
-    end,
-    open_location = function(target)
-      M.open_comment_location(target)
-    end,
-    open_commit_diff = function(commit)
-      M.open_commit_diff(commit)
-    end,
-    open_file_diff = function(file)
-      M.open_diff(file)
-    end,
-    open_file_original = function(file)
-      M.open_original(file)
-    end,
-    open_file_modified = function(file)
-      M.open_modified(file)
-    end,
-    open_thread_fix_diff = function(payload)
-      M.open_thread_fix_diff(payload)
-    end,
-    open_thread_comment_evolution_diff = function(payload)
-      M.open_thread_comment_evolution_diff(payload)
-    end,
-    open_thread_comment_commit_diff = function(payload)
-      M.open_thread_comment_commit_diff(payload)
-    end,
-    resolve_thread_fix_diff = function(payload, options)
-      return M.resolve_thread_fix_diff(payload, options)
-    end,
-    preview_markdown_link = function(action)
-      M.overview_preview_markdown_link(action)
-    end,
-    toggle_review_tree = function()
-      M.toggle_review_tree()
-    end,
+    actions = {
+      checkout = M.checkout,
+      merge = M.merge,
+      open_comment_location = M.open_comment_location,
+      open_comments = M.open_comments,
+      open_commit_diff = M.open_commit_diff,
+      open_diff = M.open_diff,
+      open_modified = M.open_modified,
+      open_original = M.open_original,
+      open_overview = M.open_overview,
+      open_overview_url = M.open_overview_url,
+      open_thread_comment_commit_diff = M.open_thread_comment_commit_diff,
+      open_thread_comment_evolution_diff = M.open_thread_comment_evolution_diff,
+      open_thread_fix_diff = M.open_thread_fix_diff,
+      overview_edit_stub = M.overview_edit_stub,
+      overview_more = M.overview_more,
+      overview_preview_markdown_link = M.overview_preview_markdown_link,
+      refresh_overview = M.refresh_overview,
+      resolve_thread_fix_diff = M.resolve_thread_fix_diff,
+      review = M.review,
+      toggle_review_tree = M.toggle_review_tree,
+    },
+    buffer_filetype = buffer_filetype,
+    config = config,
+    is_valid_buf = is_valid_buf,
+    is_valid_win = is_valid_win,
+    normalize_repository = normalize_repository,
+    notify_error = notify_error,
+    positive_integer = positive_integer,
+    pr_service = pr_service,
+    resolve_active_pr = resolve_active_pr,
   }
 end
 
 function M.build_overview_model_for_overview(number, opts)
-  opts = opts or {}
-  local pr, details, err = resolve_active_pr(number, { refresh = opts.refresh == true })
-  if not pr then
-    return nil, nil, err
-  end
-
-  local limits = normalize_overview_limits(opts.overview_limits)
-  local threads, thread_err = pr_service.fetch_review_threads(pr.number, {
-    threads_first = limits.threads,
-    comments_first = math.min(100, limits.threads * 4),
-  })
-
-  if not threads then
-    threads = {}
-  end
-
-  local repository = normalize_repository(details) or ""
-  local pr_change_events, pr_change_err = pr_service.fetch_pr_change_events(pr.number, {
-    repository = repository,
-    pr_url = type(details.url) == "string" and details.url or "",
-    max_items = math.min(500, math.max(100, limits.timeline * 4)),
-    max_pages = 5,
-  })
-  if not pr_change_events then
-    pr_change_events = {}
-  end
-
-  local model = pr_service.build_overview_model(details, threads, limits, {
-    repository = repository,
-    thread_error = thread_err,
-    pr_change_events = pr_change_events,
-    pr_change_error = pr_change_err,
-  })
-
-  return pr, model, nil
+  return overview_actions.build_overview_model(number, opts, overview_actions_context())
 end
 
 function M.open_overview(number, opts)
-  opts = opts or {}
-
-  local plugin_config = config.get() or {}
-  local overview_v2_config = plugin_config.overview_v2 or {}
-  if overview_v2_config.enabled == true and opts.force_v1 ~= true then
-    return M.open_overview_v2(number, opts)
-  end
-
-  local pr, model, err = M.build_overview_model_for_overview(number, opts)
-  if not pr then
-    return notify_error(err)
-  end
-
-  local overview_config = plugin_config.overview or {}
-
-  local target_bufnr = nil
-  if is_valid_buf(opts.bufnr) then
-    target_bufnr = opts.bufnr
-  elseif opts.reuse_buffer then
-    local current = vim.api.nvim_get_current_buf()
-    if is_valid_buf(current) then
-      target_bufnr = current
-    end
-  end
-
-  overview.open(model, {
-    bufnr = target_bufnr,
-    cursor_line = opts.cursor_line,
-    ui = overview_config.ui or "snacks",
-    layout = overview_config.layout or "tabs",
-    window = overview_config.window or {},
-    theme = overview_config.theme or {},
-    markdown = overview_config.markdown or {},
-    thread_snippet = overview_config.thread_snippet or {},
-    thread_fix_diff = overview_config.thread_fix_diff or {},
-    tabs = overview_config.tabs,
-    show = overview_config.show or {},
-    date_format = overview_config.date_format or "%Y-%m-%d %H:%M",
-    actions = build_overview_callbacks(pr.number, "v1"),
-  })
-end
-
-function M.open_overview_v2(number, opts)
-  opts = opts or {}
-
-  local pr, model, err = M.build_overview_model_for_overview(number, opts)
-  if not pr then
-    return notify_error(err)
-  end
-
-  local plugin_config = config.get() or {}
-  local overview_config = plugin_config.overview or {}
-  local overview_v2_config = plugin_config.overview_v2 or {}
-  local session_id = tonumber(opts.session_id) or nil
-
-  require("gh-pr.overview_v2").open(model, {
-    session_id = session_id,
-    window = overview_v2_config.window or overview_config.window or {},
-    layout = overview_v2_config.layout or {},
-    keymaps = overview_v2_config.keymaps or {},
-    activity = overview_v2_config.activity or {},
-    show = overview_v2_config.show or overview_config.show or {},
-    date_format = overview_v2_config.date_format or overview_config.date_format or "%Y-%m-%d %H:%M",
-    theme = overview_config.theme or {},
-    markdown = overview_config.markdown or {},
-    thread_snippet = overview_config.thread_snippet or {},
-    actions = build_overview_callbacks(pr.number, "v2"),
-  })
+  return overview_actions.open_overview(number, opts, overview_actions_context())
 end
 
 function M.refresh_overview()
-  local bufnr = vim.api.nvim_get_current_buf()
-  local number = vim.b[bufnr].gh_pr_number
-  if type(number) ~= "number" then
-    return notify_error("Current buffer is not a gh-pr overview")
-  end
-
-  if vim.b[bufnr].gh_pr_overview_ui == "v2" then
-    return M.refresh_overview_v2()
-  end
-
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  M.open_overview(number, {
-    refresh = true,
-    reuse_buffer = true,
-    cursor_line = cursor[1],
-    overview_limits = current_overview_limits(),
-    force_v1 = true,
-  })
-end
-
-function M.refresh_overview_v2()
-  local bufnr = vim.api.nvim_get_current_buf()
-  local number = vim.b[bufnr].gh_pr_number
-  if type(number) ~= "number" then
-    return notify_error("Current buffer is not a gh-pr overview")
-  end
-
-  M.open_overview_v2(number, {
-    refresh = true,
-    session_id = vim.b[bufnr].gh_pr_overview_v2_session,
-    overview_limits = current_overview_limits(),
-  })
+  return overview_actions.refresh_overview(overview_actions_context())
 end
 
 function M.refresh_visible_overview_for_pr(number)
-  local pr_number = tonumber(number)
-  if not pr_number then
-    return 0
-  end
-
-  local current_tab = vim.api.nvim_get_current_tabpage()
-  local refreshed = 0
-  local refreshed_buffers = {}
-
-  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(current_tab)) do
-    if is_valid_win(winid) then
-      local bufnr = vim.api.nvim_win_get_buf(winid)
-      local overview_ui = vim.b[bufnr].gh_pr_overview_ui
-      local is_v1 = overview_ui == "snacks" or buffer_filetype(bufnr) == "ghpr_overview"
-      local is_v2 = overview_ui == "v2" and vim.b[bufnr].gh_pr_overview_v2_primary == true
-      if is_valid_buf(bufnr)
-        and not refreshed_buffers[bufnr]
-        and (is_v1 or is_v2)
-        and tonumber(vim.b[bufnr].gh_pr_number) == pr_number then
-        local cursor = vim.api.nvim_win_get_cursor(winid)
-        local cursor_line = type(cursor) == "table" and tonumber(cursor[1]) or nil
-        local limits = type(vim.b[bufnr].gh_pr_overview_limits) == "table" and vim.deepcopy(vim.b[bufnr].gh_pr_overview_limits)
-          or nil
-
-        local ok = pcall(vim.api.nvim_win_call, winid, function()
-          if is_v2 then
-            M.open_overview_v2(pr_number, {
-              refresh = true,
-              session_id = vim.b[bufnr].gh_pr_overview_v2_session,
-              overview_limits = limits,
-            })
-          else
-            M.open_overview(pr_number, {
-              refresh = true,
-            reuse_buffer = true,
-            bufnr = bufnr,
-            cursor_line = cursor_line,
-            overview_limits = limits,
-            force_v1 = true,
-          })
-          end
-        end)
-
-        if ok then
-          refreshed = refreshed + 1
-          refreshed_buffers[bufnr] = true
-        end
-      end
-    end
-  end
-
-  return refreshed
+  return overview_actions.refresh_visible_overview_for_pr(number, overview_actions_context())
 end
 
 function M.overview_more(section, count)
-  section = type(section) == "string" and section:lower() or ""
-  if section == "comments" or section == "reviews" or section == "threads" then
-    section = "timeline"
-  end
-  if not valid_overview_sections()[section] then
-    return notify_error("Section must be one of: checks, commits, timeline")
-  end
-
-  local bufnr = vim.api.nvim_get_current_buf()
-  local number = vim.b[bufnr].gh_pr_number
-  if type(number) ~= "number" then
-    return notify_error("Current buffer is not a gh-pr overview")
-  end
-  local overview_ui = vim.b[bufnr].gh_pr_overview_ui
-
-  local overview_config = (config.get() or {}).overview or {}
-  local step = positive_integer(count, positive_integer(overview_config.expand_step, 20))
-  local limits = current_overview_limits()
-  if section == "timeline" then
-    limits.timeline = positive_integer(limits.timeline, step) + step
-    limits.comments = limits.timeline
-    limits.reviews = limits.timeline
-    limits.threads = limits.timeline
-  else
-    limits[section] = positive_integer(limits[section], step) + step
-  end
-
-  if overview_ui == "v2" then
-    M.open_overview_v2(number, {
-      refresh = true,
-      session_id = vim.b[bufnr].gh_pr_overview_v2_session,
-      overview_limits = limits,
-    })
-    return
-  end
-
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  M.open_overview(number, {
-    refresh = true,
-    reuse_buffer = true,
-    cursor_line = cursor[1],
-    overview_limits = limits,
-    force_v1 = true,
-  })
+  return overview_actions.overview_more(section, count, overview_actions_context())
 end
 
 function M.open_overview_url(number)
-  local pr, _, err = resolve_active_pr(number)
-  if not pr then
-    return notify_error(err)
-  end
-
-  local ok, open_err = pr_service.open_in_browser(pr.number)
-  if not ok then
-    if vim.ui and type(vim.ui.open) == "function" and type(pr.url) == "string" and pr.url ~= "" then
-      vim.ui.open(pr.url)
-      return
-    end
-    return notify_error(open_err)
-  end
+  return overview_actions.open_overview_url(number, overview_actions_context())
 end
 
 function M.open_comments(number)
@@ -2914,823 +2609,38 @@ function M.open_comments(number)
   end
 end
 
-local overview_edit_labels = {
-  edit_title = "Edit title",
-  edit_body = "Edit description",
-  edit_labels = "Edit labels",
-  edit_reviewers = "Edit reviewers",
-  edit_assignees = "Edit assignees",
-  edit_milestone = "Edit milestone",
-  change_state = "Change state",
-  change_draft = "Change draft status",
-}
-
-local function normalize_string(value)
-  if type(value) ~= "string" then
-    return ""
-  end
-  return vim.trim(value)
-end
-
-local function normalize_key(value)
-  return normalize_string(value):lower()
-end
-
-local function parse_csv_items(value)
-  if type(value) ~= "string" then
-    return {}
-  end
-
-  local items = {}
-  local seen = {}
-  for _, raw in ipairs(vim.split(value, ",", { plain = true })) do
-    local item = normalize_string(raw)
-    if item ~= "" then
-      local key = normalize_key(item)
-      if key ~= "" and not seen[key] then
-        seen[key] = true
-        items[#items + 1] = item
-      end
-    end
-  end
-
-  return items
-end
-
-local function summarize_list(items, empty_label)
-  items = type(items) == "table" and items or {}
-  if vim.tbl_isempty(items) then
-    return empty_label or "(none)"
-  end
-
-  if #items <= 5 then
-    return table.concat(items, ", ")
-  end
-
-  local preview = {}
-  for index = 1, 4 do
-    preview[#preview + 1] = items[index]
-  end
-  preview[#preview + 1] = string.format("+%d more", #items - 4)
-  return table.concat(preview, ", ")
-end
-
-local function summarize_text(value, max_length)
-  local text = normalize_string(value)
-  if text == "" then
-    return "(empty)"
-  end
-
-  text = text:gsub("\n", " ")
-  local limit = positive_integer(max_length, 80)
-  if #text > limit then
-    return text:sub(1, limit - 3) .. "..."
-  end
-  return text
-end
-
-local function extract_name(item)
-  if type(item) == "string" then
-    return normalize_string(item)
-  end
-
-  if type(item) ~= "table" then
-    return ""
-  end
-
-  if type(item.login) == "string" and item.login ~= "" then
-    return normalize_string(item.login)
-  end
-
-  if type(item.slug) == "string" and item.slug ~= "" then
-    if type(item.organization) == "table" and type(item.organization.login) == "string" and item.organization.login ~= "" then
-      return normalize_string(item.organization.login .. "/" .. item.slug)
-    end
-    return normalize_string(item.slug)
-  end
-
-  if type(item.name) == "string" and item.name ~= "" then
-    return normalize_string(item.name)
-  end
-
-  if type(item.requestedReviewer) == "table" then
-    return extract_name(item.requestedReviewer)
-  end
-
-  if type(item.user) == "table" then
-    return extract_name(item.user)
-  end
-
-  if type(item.team) == "table" then
-    return extract_name(item.team)
-  end
-
-  return ""
-end
-
-local function normalize_items(items)
-  local result = {}
-  local seen = {}
-
-  for _, item in ipairs(type(items) == "table" and items or {}) do
-    local name = extract_name(item)
-    if name ~= "" then
-      local key = normalize_key(name)
-      if key ~= "" and not seen[key] then
-        seen[key] = true
-        result[#result + 1] = name
-      end
-    end
-  end
-
-  return result
-end
-
-local function compute_replacement_diff(current_items, desired_items)
-  local current = {}
-  local desired = {}
-  local add = {}
-  local remove = {}
-
-  for _, item in ipairs(current_items) do
-    local key = normalize_key(item)
-    if key ~= "" then
-      current[key] = item
-    end
-  end
-
-  for _, item in ipairs(desired_items) do
-    local key = normalize_key(item)
-    if key ~= "" and not desired[key] then
-      desired[key] = item
-      if not current[key] then
-        add[#add + 1] = item
-      end
-    end
-  end
-
-  for _, item in ipairs(current_items) do
-    local key = normalize_key(item)
-    if key ~= "" and not desired[key] then
-      remove[#remove + 1] = item
-    end
-  end
-
-  return add, remove
-end
-
-local function current_milestone(details)
-  if type(details.milestone) == "table" and type(details.milestone.title) == "string" then
-    return normalize_string(details.milestone.title)
-  end
-  return ""
-end
-
-local function current_labels(details)
-  return normalize_items(details.labels)
-end
-
-local function current_reviewers(details)
-  return normalize_items(details.reviewRequests)
-end
-
-local function current_assignees(details)
-  return normalize_items(details.assignees)
-end
-
-local function normalize_values_list(values)
-  local result = {}
-  local seen = {}
-  for _, value in ipairs(type(values) == "table" and values or {}) do
-    local text = normalize_string(value)
-    local key = normalize_key(text)
-    if text ~= "" and key ~= "" and not seen[key] then
-      seen[key] = true
-      result[#result + 1] = text
-    end
-  end
-  return result
-end
-
-local function normalize_reviewer_identity(value)
-  local text = normalize_string(value)
-  if text == "" then
-    return ""
-  end
-
-  text = text:gsub("^%s+", ""):gsub("%s+$", "")
-  text = text:gsub("^@", "")
-  text = text:gsub("%s+%([Tt][Ee][Aa][Mm]%)$", "")
-  text = text:gsub("^%s+", ""):gsub("%s+$", "")
-  return text
-end
-
-local function normalize_reviewer_values(values)
-  local result = {}
-  local seen = {}
-  for _, value in ipairs(type(values) == "table" and values or {}) do
-    local normalized = normalize_reviewer_identity(value)
-    local key = normalize_key(normalized)
-    if normalized ~= "" and key ~= "" and not seen[key] then
-      seen[key] = true
-      result[#result + 1] = normalized
-    end
-  end
-  return result
-end
-
-local function confirm_overview_edit(pr_number, action_label, summary, callback)
-  local prompt = string.format(
-    "Apply %s on PR #%d? %s",
-    action_label,
-    pr_number,
-    summary
-  )
-
-  vim.ui.select({ "confirm", "cancel" }, {
-    prompt = prompt,
-  }, function(choice)
-    callback(choice == "confirm")
-  end)
-end
-
-local function build_title_edit(choice, details)
-  local next_title = normalize_string(choice)
-  local current_title = normalize_string(details.title)
-  if next_title == "" then
-    return nil, "Title cannot be empty", false
-  end
-  if next_title == current_title then
-    return nil, "No changes detected for title", true
-  end
-
+local function overview_edit_picker_context()
   return {
-    summary = string.format("title: %s", summarize_text(next_title, 80)),
-    success = "Title updated",
-    run = function(pr_number)
-      return pr_service.edit(pr_number, { title = next_title })
-    end,
-  }, nil, false
+    normalize_repository = normalize_repository,
+    notify_error = notify_error,
+    notify_warn = notify_warn,
+    pr_service = pr_service,
+  }
 end
 
-local function build_body_edit(choice, details)
-  local next_body = type(choice) == "string" and choice or ""
-  local current_body = type(details.body) == "string" and details.body or ""
-  if next_body == current_body then
-    return nil, "No changes detected for description", true
-  end
-
-  local summary
-  if normalize_string(next_body) == "" then
-    summary = "description: clear"
-  else
-    summary = string.format("description: %s", summarize_text(next_body, 80))
-  end
-
+local function overview_edit_actions_context()
+  local picker_ctx = overview_edit_picker_context()
   return {
-    summary = summary,
-    success = "Description updated",
-    run = function(pr_number)
-      return pr_service.edit(pr_number, { body = next_body })
-    end,
-  }, nil, false
-end
-
-local function build_milestone_edit(choice, details)
-  local next_milestone = normalize_string(choice)
-  local current_value = current_milestone(details)
-  if next_milestone == current_value then
-    return nil, "No changes detected for milestone", true
-  end
-
-  if next_milestone == "" then
-    if current_value == "" then
-      return nil, "No changes detected for milestone", true
-    end
-
-    return {
-      summary = "milestone: remove",
-      success = "Milestone removed",
-      run = function(pr_number)
-        return pr_service.edit(pr_number, { remove_milestone = true })
+    is_valid_buf = is_valid_buf,
+    is_valid_win = is_valid_win,
+    notify_error = notify_error,
+    notify_info = notify_info,
+    notify_warn = notify_warn,
+    open_overview = M.open_overview,
+    pr_service = pr_service,
+    refresh_pr_sources_after_state_change = refresh_pr_sources_after_state_change,
+    resolve_active_pr = resolve_active_pr,
+    ui = {
+      confirm = overview_edit_picker.confirm,
+      pick = function(kind, payload, pr, details, label, callback)
+        overview_edit_picker.pick(kind, payload, pr, details, label, picker_ctx, callback)
       end,
-    }, nil, false
-  end
-
-  return {
-    summary = string.format("milestone: %s", summarize_text(next_milestone, 60)),
-    success = "Milestone updated",
-    run = function(pr_number)
-      return pr_service.edit(pr_number, { milestone = next_milestone })
-    end,
-  }, nil, false
-end
-
-local function build_list_edit_from_values(kind, desired_values, current_values)
-  local desired = normalize_values_list(desired_values)
-  local current = normalize_values_list(current_values)
-  if kind == "edit_reviewers" then
-    desired = normalize_reviewer_values(desired)
-    current = normalize_reviewer_values(current)
-  end
-
-  local add, remove = compute_replacement_diff(current, desired)
-
-  if vim.tbl_isempty(add) and vim.tbl_isempty(remove) then
-    return nil, "No changes detected", true
-  end
-
-  local summary = string.format(
-    "final: [%s] | add: [%s] | remove: [%s]",
-    summarize_list(desired),
-    summarize_list(add),
-    summarize_list(remove)
-  )
-
-  local operations = {}
-  local success
-
-  if kind == "edit_labels" then
-    operations.add_labels = add
-    operations.remove_labels = remove
-    success = "Labels updated"
-  elseif kind == "edit_reviewers" then
-    operations.add_reviewers = add
-    operations.remove_reviewers = remove
-    success = "Reviewers updated"
-  elseif kind == "edit_assignees" then
-    operations.add_assignees = add
-    operations.remove_assignees = remove
-    success = "Assignees updated"
-  else
-    return nil, "Unsupported list edit action", false
-  end
-
-  return {
-    summary = summary,
-    success = success,
-    run = function(pr_number)
-      return pr_service.edit(pr_number, operations)
-    end,
-  }, nil, false
-end
-
-local function build_list_edit(kind, choice, current_values)
-  local desired = parse_csv_items(type(choice) == "string" and choice or "")
-  return build_list_edit_from_values(kind, desired, current_values)
-end
-
-local selector_cache = {
-  labels = {},
-  reviewers = {},
-}
-
-local function cache_now()
-  return os.time()
-end
-
-local function cache_key_for_repo(details)
-  local repository = normalize_repository(details)
-  return type(repository) == "string" and repository ~= "" and repository or "__unknown__"
-end
-
-local function cache_get(bucket, key, ttl_seconds)
-  local entry = selector_cache[bucket] and selector_cache[bucket][key] or nil
-  if type(entry) ~= "table" then
-    return nil
-  end
-  local age = cache_now() - (tonumber(entry.timestamp) or 0)
-  if age > ttl_seconds then
-    selector_cache[bucket][key] = nil
-    return nil
-  end
-  return vim.deepcopy(entry.value)
-end
-
-local function cache_put(bucket, key, value)
-  selector_cache[bucket] = selector_cache[bucket] or {}
-  selector_cache[bucket][key] = {
-    timestamp = cache_now(),
-    value = vim.deepcopy(value),
+    },
   }
-end
-
-local function load_label_candidates(details)
-  local key = cache_key_for_repo(details)
-  local cached = cache_get("labels", key, 120)
-  if cached then
-    return cached, nil
-  end
-
-  local labels, labels_err = pr_service.fetch_repo_labels({
-    repository = key ~= "__unknown__" and key or nil,
-    per_page = 100,
-    max_pages = 20,
-  })
-  if not labels then
-    return nil, labels_err
-  end
-
-  cache_put("labels", key, labels)
-  return labels, nil
-end
-
-local function load_reviewer_candidates(details)
-  local key = cache_key_for_repo(details)
-  local cached = cache_get("reviewers", key, 120)
-  if cached then
-    return cached, nil
-  end
-
-  local candidates, candidates_err = pr_service.fetch_reviewer_candidates({
-    repository = key ~= "__unknown__" and key or nil,
-    per_page = 100,
-    max_pages = 20,
-  })
-  if not candidates then
-    return nil, candidates_err
-  end
-
-  cache_put("reviewers", key, candidates)
-  return candidates, nil
-end
-
-local function open_label_multi_select(pr, details, callback)
-  local labels, labels_err = load_label_candidates(details)
-  if not labels then
-    notify_error("Unable to load repository labels: " .. tostring(labels_err))
-    callback(false)
-    return
-  end
-
-  local current = current_labels(details)
-  local selected = {}
-  for _, value in ipairs(current) do
-    selected[normalize_key(value)] = true
-  end
-
-  local items = {}
-  local seen = {}
-  for _, label in ipairs(labels) do
-    local name = normalize_string(label.name)
-    local key = normalize_key(name)
-    if name ~= "" and key ~= "" and not seen[key] then
-      seen[key] = true
-      items[#items + 1] = {
-        id = name,
-        value = name,
-        label = name,
-        description = normalize_string(label.description),
-        color = normalize_string(label.color),
-        kind = "label",
-        selected = selected[key] == true,
-      }
-    end
-  end
-
-  for _, current_name in ipairs(current) do
-    local key = normalize_key(current_name)
-    if key ~= "" and not seen[key] then
-      seen[key] = true
-      items[#items + 1] = {
-        id = current_name,
-        value = current_name,
-        label = current_name,
-        description = "",
-        color = "",
-        kind = "label",
-        selected = true,
-      }
-    end
-  end
-
-  table.sort(items, function(left, right)
-    return normalize_key(left.label) < normalize_key(right.label)
-  end)
-
-  multi_select.open({
-    title = string.format("PR #%d - Edit labels", pr.number),
-    items = items,
-    on_confirm = function(values)
-      callback(values)
-    end,
-    on_cancel = function()
-      callback(nil)
-    end,
-  })
-end
-
-local function open_reviewer_multi_select(pr, details, callback)
-  local candidates, candidates_err = load_reviewer_candidates(details)
-  if not candidates then
-    notify_error("Unable to load reviewer candidates: " .. tostring(candidates_err))
-    callback(false)
-    return
-  end
-
-  for _, warning in ipairs(type(candidates.warnings) == "table" and candidates.warnings or {}) do
-    notify_warn(warning)
-  end
-
-  local current = current_reviewers(details)
-  local selected = {}
-  for _, value in ipairs(current) do
-    selected[normalize_key(value)] = true
-  end
-
-  local items = {}
-  local seen = {}
-  for _, candidate in ipairs(type(candidates.merged) == "table" and candidates.merged or {}) do
-    local value = normalize_string(candidate.value)
-    local key = normalize_key(value)
-    if value ~= "" and key ~= "" and not seen[key] then
-      seen[key] = true
-      items[#items + 1] = {
-        id = value,
-        value = value,
-        label = normalize_string(candidate.display) ~= "" and normalize_string(candidate.display) or value,
-        description = "",
-        kind = normalize_string(candidate.kind) == "team" and "team" or "user",
-        selected = selected[key] == true,
-      }
-    end
-  end
-
-  for _, current_value in ipairs(current) do
-    local key = normalize_key(current_value)
-    if key ~= "" and not seen[key] then
-      seen[key] = true
-      local is_team = current_value:find("/", 1, true) ~= nil
-      items[#items + 1] = {
-        id = current_value,
-        value = current_value,
-        label = "@" .. current_value,
-        description = "",
-        kind = is_team and "team" or "user",
-        selected = true,
-      }
-    end
-  end
-
-  table.sort(items, function(left, right)
-    if left.kind ~= right.kind then
-      local left_order = left.kind == "user" and 1 or 2
-      local right_order = right.kind == "user" and 1 or 2
-      return left_order < right_order
-    end
-    return normalize_key(left.value) < normalize_key(right.value)
-  end)
-
-  multi_select.open({
-    title = string.format("PR #%d - Edit reviewers", pr.number),
-    items = items,
-    on_confirm = function(values)
-      callback(values)
-    end,
-    on_cancel = function()
-      callback(nil)
-    end,
-  })
-end
-
-local function build_state_change(choice, details)
-  local target = normalize_key(choice)
-  if target ~= "open" and target ~= "closed" then
-    return nil, "Invalid state selection", false
-  end
-
-  local current = normalize_key(details.state)
-  if current == target then
-    return nil, "No changes detected for PR state", true
-  end
-
-  local before_state = (current ~= "" and current or "unknown"):upper()
-  local after_state = target:upper()
-  return {
-    summary = string.format("state: %s -> %s", before_state, after_state),
-    success = string.format("PR state changed to %s", after_state),
-    run = function(pr_number)
-      return pr_service.change_state(pr_number, target)
-    end,
-  }, nil, false
-end
-
-local function build_draft_change(choice, details)
-  local target = normalize_key(choice)
-  if target ~= "ready" and target ~= "draft" then
-    return nil, "Invalid draft status selection", false
-  end
-
-  local current = details.isDraft == true and "draft" or "ready"
-  if current == target then
-    return nil, "No changes detected for draft status", true
-  end
-
-  return {
-    summary = string.format("draft status: %s -> %s", current:upper(), target:upper()),
-    success = string.format("Draft status changed to %s", target:upper()),
-    run = function(pr_number)
-      return pr_service.change_draft(pr_number, target)
-    end,
-  }, nil, false
-end
-
-local function build_overview_edit_operation(kind, choice, details)
-  if kind == "edit_title" then
-    return build_title_edit(choice, details)
-  end
-  if kind == "edit_body" then
-    return build_body_edit(choice, details)
-  end
-  if kind == "edit_milestone" then
-    return build_milestone_edit(choice, details)
-  end
-  if kind == "edit_labels" then
-    if type(choice) == "table" then
-      return build_list_edit_from_values(kind, choice, current_labels(details))
-    end
-    return build_list_edit(kind, choice, current_labels(details))
-  end
-  if kind == "edit_reviewers" then
-    if type(choice) == "table" then
-      return build_list_edit_from_values(kind, choice, current_reviewers(details))
-    end
-    return build_list_edit(kind, choice, current_reviewers(details))
-  end
-  if kind == "edit_assignees" then
-    return build_list_edit(kind, choice, current_assignees(details))
-  end
-  if kind == "change_state" then
-    return build_state_change(choice, details)
-  end
-  if kind == "change_draft" then
-    return build_draft_change(choice, details)
-  end
-
-  return nil, "Unsupported overview edit action", false
-end
-
-local function capture_overview_context()
-  local bufnr = vim.api.nvim_get_current_buf()
-  if not is_valid_buf(bufnr) then
-    return nil
-  end
-
-  local number = vim.b[bufnr].gh_pr_number
-  if type(number) ~= "number" then
-    return nil
-  end
-
-  local context = {
-    bufnr = bufnr,
-    pr_number = number,
-    overview_ui = vim.b[bufnr].gh_pr_overview_ui,
-    overview_v2_session = tonumber(vim.b[bufnr].gh_pr_overview_v2_session),
-  }
-
-  local winid = vim.fn.bufwinid(bufnr)
-  if is_valid_win(winid) then
-    context.winid = winid
-    local ok, cursor = pcall(vim.api.nvim_win_get_cursor, winid)
-    if ok and type(cursor) == "table" and type(cursor[1]) == "number" then
-      context.cursor_line = math.max(1, math.floor(cursor[1]))
-    end
-  end
-
-  local limits = vim.b[bufnr].gh_pr_overview_limits
-  if type(limits) == "table" then
-    context.overview_limits = vim.deepcopy(limits)
-  end
-
-  return context
-end
-
-local function refresh_overview_after_edit(pr_number, context)
-  local options = {
-    refresh = true,
-  }
-  local opener = M.open_overview
-
-  if type(pr_number) ~= "number" then
-    return
-  end
-
-  local is_v2 = type(context) == "table" and context.overview_ui == "v2"
-  if is_v2 then
-    opener = M.open_overview_v2
-    options.session_id = type(context) == "table" and context.overview_v2_session or nil
-  elseif type(context) == "table" and is_valid_buf(context.bufnr) then
-    options.reuse_buffer = true
-    options.bufnr = context.bufnr
-    if type(context.cursor_line) == "number" then
-      options.cursor_line = context.cursor_line
-    end
-    options.force_v1 = true
-  end
-
-  if type(context) == "table" and type(context.overview_limits) == "table" then
-    options.overview_limits = context.overview_limits
-  end
-
-  local ok, err = pcall(opener, pr_number, options)
-  if not ok then
-    notify_warn("Overview updated remotely, but local refresh failed: " .. tostring(err))
-  end
-end
-
-local function overview_edit_picker(kind, payload, pr, details, callback)
-  payload = type(payload) == "table" and payload or {}
-
-  if kind == "edit_labels" then
-    return open_label_multi_select(pr, details, callback)
-  end
-
-  if kind == "edit_reviewers" then
-    return open_reviewer_multi_select(pr, details, callback)
-  end
-
-  if kind == "change_state" then
-    vim.ui.select({ "open", "closed" }, {
-      prompt = "Target state:",
-    }, function(choice)
-      callback(choice)
-    end)
-    return
-  end
-
-  if kind == "change_draft" then
-    vim.ui.select({ "ready", "draft" }, {
-      prompt = "Target draft status:",
-    }, function(choice)
-      callback(choice)
-    end)
-    return
-  end
-
-  local default_value = payload.current
-  if type(default_value) ~= "string" then
-    default_value = ""
-  end
-
-  local prompt = string.format("%s: ", overview_edit_labels[kind] or "Edit")
-  vim.ui.input({
-    prompt = prompt,
-    default = default_value,
-  }, function(input)
-    callback(input)
-  end)
 end
 
 function M.overview_edit_stub(kind, payload)
-  local label = overview_edit_labels[kind]
-  if not label then
-    return notify_warn("Unsupported overview edit action")
-  end
-
-  local overview_context = capture_overview_context()
-  local target_number = overview_context and overview_context.pr_number or nil
-  local pr, details, err = resolve_active_pr(target_number)
-  if not pr then
-    return notify_error(err)
-  end
-
-  overview_edit_picker(kind, payload, pr, details, function(choice)
-    if choice == false then
-      return
-    end
-
-    if choice == nil then
-      notify_info(label .. " cancelled")
-      return
-    end
-
-    local operation, build_err, noop = build_overview_edit_operation(kind, choice, details)
-    if noop then
-      notify_info(build_err or "No changes detected")
-      return
-    end
-    if not operation then
-      notify_error(build_err)
-      return
-    end
-
-    confirm_overview_edit(pr.number, label, operation.summary or "", function(confirmed)
-      if not confirmed then
-        notify_info(label .. " cancelled")
-        return
-      end
-
-      local ok, op_err = operation.run(pr.number)
-      if not ok then
-        notify_error(op_err)
-        return
-      end
-
-      notify_info(operation.success or (label .. " completed"))
-      refresh_overview_after_edit(pr.number, overview_context)
-      refresh_pr_sources_after_state_change({ force = true })
-    end)
-  end)
+  return overview_edit_actions.run(kind, payload, overview_edit_actions_context())
 end
 
 local function resolve_commit(commit)
@@ -5099,41 +4009,6 @@ function M.close_all_and_open_review()
   open_review_tree_after_close()
 end
 
-local function file_path(file)
-  if type(file) ~= "table" then
-    return nil
-  end
-
-  local path = file.path or file.filename
-  if type(path) ~= "string" or path == "" then
-    return nil
-  end
-
-  return path
-end
-
-local function current_file_path()
-  if type(vim.b.gh_pr_path) == "string" and vim.b.gh_pr_path ~= "" then
-    return vim.b.gh_pr_path
-  end
-
-  return file_path(state.get_active_file())
-end
-
-local function ordered_pr_files(details)
-  local entries = {}
-  for _, file in ipairs(type(details.files) == "table" and details.files or {}) do
-    local path = file_path(file)
-    if path then
-      entries[#entries + 1] = {
-        file = file,
-        path = path,
-      }
-    end
-  end
-  return entries
-end
-
 find_diff_pair_windows_for_current_file = function()
   local tab = vim.api.nvim_get_current_tabpage()
   local base_win, head_win
@@ -5202,99 +4077,31 @@ open_review_tree_after_close = function()
   end
 end
 
-local function file_matches_filter(entry, repository, pr_number, reviewed_only)
-  if not reviewed_only then
-    return true
-  end
-
-  if type(repository) ~= "string" or repository == "" then
-    return false
-  end
-
-  return state.is_viewed(repository, pr_number, entry.path)
-end
-
-local function pick_next_file(details, pr, step, reviewed_only)
-  local entries = ordered_pr_files(details)
-  if #entries == 0 then
-    return nil, "Current PR has no files"
-  end
-
-  local repository = reviewed_only and normalize_repository(details) or nil
-  if reviewed_only and not repository then
-    return nil, "Unable to resolve repository for reviewed files"
-  end
-
-  local current_path = current_file_path()
-  local current_index = nil
-  if current_path then
-    for index, entry in ipairs(entries) do
-      if entry.path == current_path then
-        current_index = index
-        break
-      end
-    end
-  end
-
-  if current_index == nil then
-    current_index = step > 0 and 0 or 1
-  end
-
-  local total = #entries
-  for offset = 1, total do
-    local index = ((current_index - 1) + (offset * step)) % total + 1
-    local entry = entries[index]
-    if file_matches_filter(entry, repository, pr.number, reviewed_only) then
-      return entry.file, nil
-    end
-  end
-
-  if reviewed_only then
-    return nil, "No reviewed files found in this PR"
-  end
-
-  return nil, "Unable to resolve next file in PR"
-end
-
-local function open_file_for_navigation(file)
-  local diff_view = current_diff_view_preferences()
-  M.open_diff(file, {
-    new_tab = false,
-    view_mode = diff_view.mode,
-    ignore_whitespace = diff_view.ignore_whitespace,
-    render_whitespace = diff_view.render_whitespace,
-    render_endlines = diff_view.render_endlines,
-  })
-end
-
-local function navigate_files(step, reviewed_only)
-  local pr, details, err = resolve_active_pr()
-  if not pr then
-    return notify_error(err)
-  end
-
-  local target, target_err = pick_next_file(details, pr, step, reviewed_only)
-  if not target then
-    return notify_error(target_err)
-  end
-
-  open_file_for_navigation(target)
+local function diff_actions_context()
+  return {
+    current_diff_view_preferences = current_diff_view_preferences,
+    normalize_repository = normalize_repository,
+    notify_error = notify_error,
+    open_diff = M.open_diff,
+    resolve_active_pr = resolve_active_pr,
+    state = state,
+  }
 end
 
 function M.next_file()
-  navigate_files(1, false)
+  diff_actions.next_file(diff_actions_context())
 end
 
 function M.prev_file()
-  navigate_files(-1, false)
+  diff_actions.prev_file(diff_actions_context())
 end
 
 function M.next_reviewed_file()
-  navigate_files(1, true)
+  diff_actions.next_reviewed_file(diff_actions_context())
 end
 
 function M.prev_reviewed_file()
-  navigate_files(-1, true)
+  diff_actions.prev_reviewed_file(diff_actions_context())
 end
 
 function M.checkout(number)
@@ -6508,81 +5315,37 @@ function M.comment_pr()
   })
 end
 
-function M.submit_pending_review(event)
-  local pr, details, err = resolve_active_pr()
-  if not pr then
-    return notify_error(err)
-  end
-
-  local label = review_event_label(event)
-  if not label then
-    return notify_error("Unsupported review event")
-  end
-
-  local defaults = {
-    approve = "",
-    request_changes = "Requested changes from Neovim",
-    comment = "",
+local function review_actions_context()
+  return {
+    confirm_review_submission = confirm_review_submission,
+    notify_error = notify_error,
+    notify_info = notify_info,
+    pr_service = pr_service,
+    prompt_review_body = prompt_review_body,
+    refresh_line_comments_for_pr = refresh_line_comments_for_pr,
+    resolve_active_pr = resolve_active_pr,
+    review_event_label = review_event_label,
   }
+end
 
-  prompt_review_body(defaults[event] or "", function(body, input_cancelled)
-    if input_cancelled then
-      notify_info("Pending review submission cancelled")
-      return
-    end
-
-    confirm_review_submission(event, pr.number, body, function(confirmed)
-      if not confirmed then
-        notify_info("Pending review submission cancelled")
-        return
-      end
-
-      local ok, review_err = pr_service.submit_pending_review(pr.number, event, body)
-      if not ok then
-        notify_error(review_err)
-        return
-      end
-
-      notify_info(string.format("Pending %s review submitted for PR #%d", label, pr.number))
-      refresh_line_comments_for_pr(pr.number, details)
-    end)
-  end)
+function M.submit_pending_review(event)
+  review_actions.submit_pending_review(event, review_actions_context())
 end
 
 function M.submit_pending_comment_review()
-  M.submit_pending_review("comment")
+  review_actions.submit_pending_comment_review(review_actions_context())
 end
 
 function M.submit_pending_approve_review()
-  M.submit_pending_review("approve")
+  review_actions.submit_pending_approve_review(review_actions_context())
 end
 
 function M.submit_pending_request_changes_review()
-  M.submit_pending_review("request_changes")
+  review_actions.submit_pending_request_changes_review(review_actions_context())
 end
 
 function M.discard_pending_review()
-  local pr, _, err = resolve_active_pr()
-  if not pr then
-    return notify_error(err)
-  end
-
-  vim.ui.select({ "confirm", "cancel" }, {
-    prompt = string.format("Discard pending review for PR #%d?", pr.number),
-  }, function(choice)
-    if choice ~= "confirm" then
-      notify_info("Discard pending review cancelled")
-      return
-    end
-
-    local ok, discard_err = pr_service.discard_pending_review(pr.number)
-    if not ok then
-      notify_error(discard_err)
-      return
-    end
-
-    notify_info(string.format("Pending review discarded for PR #%d", pr.number))
-  end)
+  review_actions.discard_pending_review(review_actions_context())
 end
 
 function M.merge(method)
@@ -6611,46 +5374,11 @@ function M.merge(method)
 end
 
 function M.next_change()
-  if vim.wo.diff then
-    vim.cmd("normal! ]c")
-    return
-  end
-
-  if vim.b.gh_pr_file_kind ~= "unified" then
-    return
-  end
-
-  local bufnr = vim.api.nvim_get_current_buf()
-  local line_count = vim.api.nvim_buf_line_count(bufnr)
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  for line = cursor[1] + 1, line_count do
-    local text = (vim.api.nvim_buf_get_lines(bufnr, line - 1, line, false)[1] or "")
-    if vim.startswith(text, "+ ") or vim.startswith(text, "- ") then
-      vim.api.nvim_win_set_cursor(0, { line, 0 })
-      return
-    end
-  end
+  diff_actions.next_change()
 end
 
 function M.prev_change()
-  if vim.wo.diff then
-    vim.cmd("normal! [c")
-    return
-  end
-
-  if vim.b.gh_pr_file_kind ~= "unified" then
-    return
-  end
-
-  local bufnr = vim.api.nvim_get_current_buf()
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  for line = cursor[1] - 1, 1, -1 do
-    local text = (vim.api.nvim_buf_get_lines(bufnr, line - 1, line, false)[1] or "")
-    if vim.startswith(text, "+ ") or vim.startswith(text, "- ") then
-      vim.api.nvim_win_set_cursor(0, { line, 0 })
-      return
-    end
-  end
+  diff_actions.prev_change()
 end
 
 function M.toggle_diff_whitespace()

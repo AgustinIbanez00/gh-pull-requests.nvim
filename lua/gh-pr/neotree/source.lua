@@ -6,6 +6,7 @@ local M = {
 local cache_store = require("gh-pr.cache_store")
 local config = require("gh-pr.config")
 local follow = require("gh-pr.neotree.follow")
+local highlights = require("gh-pr.highlights")
 local path_tree = require("gh-pr.path_tree")
 local pr_service = require("gh-pr.pr_service")
 local repo = require("gh-pr.repo")
@@ -1080,11 +1081,7 @@ function M.follow_current_file_if_visible(opts)
 end
 
 M.setup = function(source_config, _)
-  vim.api.nvim_set_hl(0, "GhPrPrDraft", { default = true, link = "DiagnosticWarn" })
-  vim.api.nvim_set_hl(0, "GhPrPrAuthor", { default = true, link = "Comment" })
-  vim.api.nvim_set_hl(0, "GhPrCheckRunning", { default = true, link = "DiagnosticWarn" })
-  vim.api.nvim_set_hl(0, "GhPrCheckSuccess", { default = true, link = "DiagnosticOk" })
-  vim.api.nvim_set_hl(0, "GhPrCheckFailed", { default = true, link = "DiagnosticError" })
+  highlights.ensure_baseline_links()
 
   local commands = require("gh-pr.neotree.commands")
   local components = require("gh-pr.neotree.components")

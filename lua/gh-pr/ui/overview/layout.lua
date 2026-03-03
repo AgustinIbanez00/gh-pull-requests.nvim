@@ -135,7 +135,7 @@ local function open_float(bufnr, geometry, title, window_opts, enter)
     config.title_pos = nil
     local fallback_ok, fallback_winid = pcall(vim.api.nvim_open_win, bufnr, enter, config)
     if not fallback_ok then
-      error("Unable to open overview v2 float window: " .. tostring(fallback_winid))
+      error("Unable to open overview float window: " .. tostring(fallback_winid))
     end
     winid = fallback_winid
   end
