@@ -53,9 +53,17 @@ vim.api.nvim_create_user_command("GhPrOverview", function()
   require("gh-pr").open_overview()
 end, { desc = "Open active pull request overview" })
 
+vim.api.nvim_create_user_command("GhPrOverviewV2", function()
+  require("gh-pr").open_overview_v2()
+end, { desc = "Open active pull request overview (V2 panes POC)" })
+
 vim.api.nvim_create_user_command("GhPrOverviewRefresh", function()
   require("gh-pr").refresh_overview()
 end, { desc = "Refresh active pull request overview buffer" })
+
+vim.api.nvim_create_user_command("GhPrOverviewV2Refresh", function()
+  require("gh-pr").refresh_overview_v2()
+end, { desc = "Refresh active pull request overview V2 panes" })
 
 vim.api.nvim_create_user_command("GhPrOverviewMore", function(command)
   local section = command.fargs[1]

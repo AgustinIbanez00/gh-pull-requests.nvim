@@ -26,6 +26,7 @@ M.defaults = {
   submit_pending_request_changes = "<localleader>rr",
   discard_pending_review = "<localleader>rd",
   toggle_review_tree = "<localleader>rx",
+  toggle_comments_panel = "<localleader>dc",
   image_default_action = "<localleader>io",
   image_fallback_menu = "<localleader>im",
   show_open_hint = true,

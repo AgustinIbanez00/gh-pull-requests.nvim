@@ -395,6 +395,12 @@ local function timeline_kind_label(item)
     return "COMMENT"
   end
 
+  if item.kind == "commit" then
+    return "COMMIT"
+  end
+  if item.kind == "pr_change" then
+    return "PR CHANGE"
+  end
   if item.kind == "thread_comment" then
     return "THREAD"
   end
@@ -421,6 +427,19 @@ end
 
 local function timeline_body_preview(item)
   local body = type(item) == "table" and type(item.body) == "string" and item.body or ""
+  if type(item) == "table" and type(item.kind) == "string" and item.kind == "commit" and body == "" then
+    body = type(item.headline) == "string" and item.headline or ""
+  end
+  if type(item) == "table" and type(item.kind) == "string" and item.kind == "pr_change" and body == "" then
+    local summary = type(item.change_summary) == "string" and item.change_summary or ""
+    local details = type(item.change_details) == "string" and item.change_details or ""
+    body = summary
+    if body ~= "" and details ~= "" then
+      body = body .. " - " .. details
+    elseif body == "" then
+      body = details
+    end
+  end
   local first = vim.split(body, "\n", { plain = true })[1] or ""
   first = vim.trim(first)
   if first == "" then
@@ -441,6 +460,16 @@ local function timeline_items_for_details(details)
     threads = {}
   end
 
+  local pr_change_events, pr_change_err = pr_service.fetch_pr_change_events(tonumber(details.number), {
+    repository = repository_full_name(details),
+    pr_url = type(details.url) == "string" and details.url or "",
+    max_items = 400,
+    max_pages = 5,
+  })
+  if not pr_change_events then
+    pr_change_events = {}
+  end
+
   local model = pr_service.build_overview_model(details, threads, {
     checks = 20,
     commits = 50,
@@ -451,9 +480,19 @@ local function timeline_items_for_details(details)
   }, {
     repository = repository_full_name(details),
     thread_error = thread_err,
+    pr_change_events = pr_change_events,
+    pr_change_error = pr_change_err,
   })
 
-  return type(model.timeline) == "table" and model.timeline.items or {}, thread_err
+  local warnings = {}
+  if type(thread_err) == "string" and thread_err ~= "" then
+    warnings[#warnings + 1] = "thread fetch error: " .. thread_err
+  end
+  if type(pr_change_err) == "string" and pr_change_err ~= "" then
+    warnings[#warnings + 1] = "pr-change fetch error: " .. pr_change_err
+  end
+
+  return type(model.timeline) == "table" and model.timeline.items or {}, table.concat(warnings, "; ")
 end
 
 local function open_timeline_item(details, item)

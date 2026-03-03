@@ -223,16 +223,18 @@ function M.ensure_overview_buffer(pr_number, bufnr)
   return created
 end
 
-function M.ensure_buffer_options(bufnr)
+function M.ensure_buffer_options(bufnr, opts)
   if not M.valid_buf(bufnr) then
     return
   end
+  opts = type(opts) == "table" and opts or {}
+  local filetype = M.safe_string(opts.filetype, "markdown")
 
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = bufnr })
   vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = bufnr })
   vim.api.nvim_set_option_value("swapfile", false, { buf = bufnr })
   vim.api.nvim_set_option_value("modifiable", false, { buf = bufnr })
-  vim.api.nvim_set_option_value("filetype", "ghpr_overview", { buf = bufnr })
+  vim.api.nvim_set_option_value("filetype", filetype, { buf = bufnr })
 end
 
 function M.ensure_window_options(winid)
@@ -307,12 +309,17 @@ end
 
 function M.sanitize_markdown_opts(input)
   local source = type(input) == "table" and input or {}
-  local provider = M.safe_string(source.provider, "auto"):lower()
-  if provider ~= "auto"
-    and provider ~= "builtin"
-    and provider ~= "render-markdown"
-    and provider ~= "markview" then
-    provider = "auto"
+  local mode = M.safe_string(source.mode, "full"):lower()
+  if mode ~= "full" and mode ~= "legacy" then
+    mode = "full"
+  end
+
+  local provider = M.safe_string(source.provider, "render-markdown"):lower()
+  if provider == "auto" or provider == "markview" then
+    provider = "render-markdown"
+  end
+  if provider ~= "builtin" and provider ~= "render-markdown" then
+    provider = "render-markdown"
   end
 
   local max_lines = math.floor(tonumber(source.max_lines) or 500)
@@ -356,8 +363,22 @@ function M.sanitize_markdown_opts(input)
     { "zip" }
   )
 
+  local github_style_separators = M.safe_string(source.github_style_separators, "rules"):lower()
+  if github_style_separators ~= "rules" then
+    github_style_separators = "rules"
+  end
+
+  local diff_gutter = M.safe_string(source.diff_gutter, "none"):lower()
+  if diff_gutter ~= "old_new_code" and diff_gutter ~= "none" then
+    diff_gutter = "none"
+  end
+  if diff_gutter == "old_new_code" then
+    diff_gutter = "none"
+  end
+
   return {
     enabled = M.bool_or_default(source.enabled, true),
+    mode = mode,
     provider = provider,
     max_lines = max_lines,
     code_block_border = M.bool_or_default(source.code_block_border, false),
@@ -366,7 +387,107 @@ function M.sanitize_markdown_opts(input)
     link_preview_renderable_extensions = link_preview_renderable_extensions,
     link_preview_disallowed_extensions = link_preview_disallowed_extensions,
     link_preview_open_local = source.link_preview_open_local == "system" and "system" or "system",
+    github_style = M.bool_or_default(source.github_style, true),
+    github_style_separators = github_style_separators,
+    diff_gutter = diff_gutter,
   }
+end
+
+function M.sanitize_thread_snippet_opts(input)
+  local source = type(input) == "table" and input or {}
+  local before = tonumber(source.context_before)
+  if type(before) ~= "number" then
+    before = tonumber(source.before)
+  end
+  local after = tonumber(source.context_after)
+  if type(after) ~= "number" then
+    after = tonumber(source.after)
+  end
+
+  before = math.floor(type(before) == "number" and before or 5)
+  after = math.floor(type(after) == "number" and after or 5)
+
+  if before < 0 then
+    before = 0
+  end
+  if after < 0 then
+    after = 0
+  end
+  if before > 200 then
+    before = 200
+  end
+  if after > 200 then
+    after = 200
+  end
+
+  return {
+    context_before = before,
+    context_after = after,
+  }
+end
+
+function M.sanitize_thread_fix_diff_opts(input)
+  local source = type(input) == "table" and input or {}
+  local before = math.floor(tonumber(source.context_before) or 5)
+  local after = math.floor(tonumber(source.context_after) or 5)
+  if before < 0 then
+    before = 0
+  end
+  if after < 0 then
+    after = 0
+  end
+  if before > 200 then
+    before = 200
+  end
+  if after > 200 then
+    after = 200
+  end
+
+  return {
+    enabled = M.bool_or_default(source.enabled, true),
+    show_action_line = M.bool_or_default(source.show_action_line, true),
+    keymap = type(source.keymap) == "string" and source.keymap or "gf",
+    inline = M.bool_or_default(source.inline, true),
+    context_before = before,
+    context_after = after,
+    fallback_to_buffer = M.bool_or_default(source.fallback_to_buffer, true),
+  }
+end
+
+function M.thread_fix_action_key(action)
+  if type(action) ~= "table" then
+    return nil
+  end
+
+  local thread_id = M.safe_string(action.thread_id, "")
+  local comment_id = M.safe_string(action.comment_id, "")
+  local scope = M.safe_string(action.target_scope, "")
+  if thread_id ~= "" then
+    if scope == "thread" then
+      return thread_id .. "|thread"
+    end
+    if comment_id ~= "" then
+      return thread_id .. "|" .. comment_id
+    end
+    return thread_id .. "|thread"
+  end
+
+  local path = M.safe_string(action.path, "")
+  if path == "" then
+    return nil
+  end
+
+  local line = tonumber(action.line) or tonumber(action.original_line) or 0
+  if line < 1 then
+    line = 0
+  else
+    line = math.floor(line)
+  end
+
+  if comment_id ~= "" then
+    return string.format("%s|%d|%s", path, line, comment_id)
+  end
+  return string.format("%s|%d|thread", path, line)
 end
 
 function M.resolve_float_size(window_opts)

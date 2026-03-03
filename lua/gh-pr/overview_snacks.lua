@@ -1,5 +1,6 @@
 local M = {}
 
+local overview_markdown = require("gh-pr.overview_markdown")
 local utils = require("gh-pr.overview_utils")
 local styles = require("gh-pr.overview_styles")
 local renderer = require("gh-pr.overview_render")
@@ -16,11 +17,26 @@ local function tab_exists(tabs, name)
   return false
 end
 
+local function overview_buffer_filetype(view)
+  local markdown = type(view) == "table" and type(view.markdown) == "table" and view.markdown or {}
+  if markdown.mode == "full" then
+    return "markdown"
+  end
+
+  local provider = overview_markdown.resolve_provider(markdown)
+  if provider == "render-markdown" then
+    return "markdown"
+  end
+
+  return "ghpr_overview"
+end
+
 local function attach_buffer_metadata(bufnr, model, view)
   vim.b[bufnr].gh_pr_number = model.number
   vim.b[bufnr].gh_pr_repo = model.repository
   vim.b[bufnr].gh_pr_overview_ui = "snacks"
   vim.b[bufnr].gh_pr_overview_layout = "tabs"
+  vim.b[bufnr].gh_pr_overview_buffer_ft = overview_buffer_filetype(view)
   vim.b[bufnr].gh_pr_overview_tab = view.current_tab
   vim.b[bufnr].gh_pr_overview_limits = vim.deepcopy(model.limits or {})
   vim.b[bufnr].gh_pr_overview_sections = {
@@ -30,6 +46,7 @@ local function attach_buffer_metadata(bufnr, model, view)
     comments = model.comments and model.comments.total or 0,
     reviews = model.reviews and model.reviews.total or 0,
     threads = model.threads and model.threads.total or 0,
+    pr_changes = model.pr_changes and model.pr_changes.total or 0,
   }
 end
 
@@ -78,8 +95,160 @@ local function current_action(view, opts)
   return view.line_actions[line]
 end
 
+local function thread_fix_diff_inline_enabled(view)
+  if type(view.thread_fix_diff) ~= "table" then
+    return false
+  end
+  if view.thread_fix_diff.enabled == false then
+    return false
+  end
+  return view.thread_fix_diff.inline ~= false
+end
+
+local function ensure_thread_fix_inline_store(view)
+  view.thread_fix_inline = type(view.thread_fix_inline) == "table" and view.thread_fix_inline or {}
+  return view.thread_fix_inline
+end
+
+local function thread_fix_diff_inline_request_opts(view)
+  local fix_opts = type(view.thread_fix_diff) == "table" and view.thread_fix_diff or {}
+  return {
+    inline = true,
+    context_before = tonumber(fix_opts.context_before) or 5,
+    context_after = tonumber(fix_opts.context_after) or 5,
+    fallback_to_buffer = fix_opts.fallback_to_buffer ~= false,
+    silent = true,
+  }
+end
+
+local function toggle_thread_fix_diff_inline(view, action)
+  local key = utils.thread_fix_action_key(action)
+  if type(key) ~= "string" or key == "" then
+    if type(view.callbacks.open_thread_fix_diff) == "function" then
+      view.callbacks.open_thread_fix_diff(action)
+    end
+    return
+  end
+
+  local store = ensure_thread_fix_inline_store(view)
+  local state = store[key]
+  if type(state) ~= "table" then
+    state = {}
+    store[key] = state
+  end
+
+  if state.expanded == true then
+    state.expanded = false
+    refresh_view(view)
+    return
+  end
+
+  state.expanded = true
+  if state.status == "ready" or state.status == "error" or state.status == "fallback" then
+    refresh_view(view)
+    return
+  end
+
+  state.status = "loading"
+  refresh_view(view)
+
+  local resolver = type(view.callbacks.resolve_thread_fix_diff) == "function" and view.callbacks.resolve_thread_fix_diff or nil
+  if not resolver then
+    state.status = "error"
+    state.error = "Thread fix diff resolver is unavailable"
+    refresh_view(view)
+    return
+  end
+
+  local payload = vim.deepcopy(action)
+  if type(payload.pr_number) ~= "number" then
+    payload.pr_number = tonumber(view.model and view.model.number) or nil
+  end
+
+  local result = resolver(payload, thread_fix_diff_inline_request_opts(view))
+  if type(result) == "table" and result.ok == true then
+    state.status = "ready"
+    state.error = ""
+    state.lines = type(result.lines) == "table" and result.lines or {}
+    state.diff_entries = type(result.diff_entries) == "table" and result.diff_entries or nil
+    state.commit_oid = utils.safe_string(result.commit_oid, "")
+    state.path = utils.safe_string(result.path, utils.safe_string(action.path, ""))
+    state.fallback_opened = false
+  elseif type(result) == "table" and result.fallback_opened == true then
+    state.status = "fallback"
+    state.error = utils.safe_string(result.error, "Opened legacy diff buffer fallback")
+    state.lines = {}
+    state.diff_entries = nil
+    state.commit_oid = utils.safe_string(result.commit_oid, "")
+    state.path = utils.safe_string(result.path, utils.safe_string(action.path, ""))
+    state.fallback_opened = true
+  else
+    state.status = "error"
+    state.error = utils.safe_string(type(result) == "table" and result.error or "", "Unable to resolve thread fix diff")
+    state.lines = {}
+    state.diff_entries = nil
+    state.commit_oid = utils.safe_string(type(result) == "table" and result.commit_oid or "", "")
+    state.path = utils.safe_string(type(result) == "table" and result.path or "", utils.safe_string(action.path, ""))
+    state.fallback_opened = false
+  end
+
+  refresh_view(view)
+end
+
 local function execute_action(view, action, variant)
   if type(action) ~= "table" then
+    return
+  end
+
+  if action.kind == "open_thread_fix_diff" then
+    if thread_fix_diff_inline_enabled(view) then
+      toggle_thread_fix_diff_inline(view, action)
+      return
+    end
+    if type(view.callbacks.open_thread_fix_diff) == "function" then
+      view.callbacks.open_thread_fix_diff(action)
+    end
+    return
+  end
+
+  if action.kind == "open_thread_comment_evolution_diff" then
+    if type(view.callbacks.open_thread_comment_evolution_diff) == "function" then
+      view.callbacks.open_thread_comment_evolution_diff(action)
+      return
+    end
+    if type(view.callbacks.open_thread_comment_commit_diff) == "function" then
+      view.callbacks.open_thread_comment_commit_diff(action)
+      return
+    end
+    if type(action.fallback_target) == "table" and type(view.callbacks.open_location) == "function" then
+      view.callbacks.open_location(action.fallback_target)
+      return
+    end
+    utils.open_url(action.fallback_url)
+    return
+  end
+
+  if action.kind == "toggle_activity_thread" then
+    local thread_id = type(action.thread_id) == "string" and action.thread_id or ""
+    if thread_id == "" then
+      return
+    end
+    view.activity_folds = type(view.activity_folds) == "table" and view.activity_folds or {}
+    local winid = utils.current_win_for_buf(view.bufnr)
+    if winid then
+      local cursor = vim.api.nvim_win_get_cursor(winid)
+      view.cursor_by_tab[view.current_tab] = cursor[1]
+    end
+    local current_expanded = action.expanded == true
+    local next_expanded = not current_expanded
+    local default_expanded = action.default_expanded == true
+
+    if next_expanded == default_expanded then
+      view.activity_folds[thread_id] = nil
+    else
+      view.activity_folds[thread_id] = next_expanded
+    end
+    refresh_view(view)
     return
   end
 
@@ -152,6 +321,58 @@ local function execute_action(view, action, variant)
   end
 end
 
+local function resolve_thread_fix_action(view)
+  local action = current_action(view)
+  if type(action) == "table" then
+    if action.kind == "open_thread_fix_diff" then
+      return action
+    end
+    if type(action.thread_fix_action) == "table" and action.thread_fix_action.kind == "open_thread_fix_diff" then
+      return action.thread_fix_action
+    end
+  end
+
+  local winid = utils.current_win_for_buf(view.bufnr)
+  if not winid then
+    return nil
+  end
+  local cursor = vim.api.nvim_win_get_cursor(winid)
+  local line = tonumber(cursor[1]) or 1
+  local nearby = {
+    type(view.line_actions) == "table" and view.line_actions[line - 1] or nil,
+    type(view.line_actions) == "table" and view.line_actions[line + 1] or nil,
+  }
+  for _, candidate in ipairs(nearby) do
+    if type(candidate) == "table" and candidate.kind == "open_thread_fix_diff" then
+      return candidate
+    end
+  end
+
+  local search_start = math.max(1, line - 4)
+  local search_lines = vim.api.nvim_buf_get_lines(view.bufnr, search_start - 1, line, false)
+  for index = #search_lines, 1, -1 do
+    local text = vim.trim(utils.safe_string(search_lines[index], ""))
+    local path, line_str = text:match("^(.+):(%d+)%s*%[")
+    if not path then
+      path, line_str = text:match("^(.+):(%d+)$")
+    end
+    if type(path) == "string" and path ~= "" and path:find("[/\\]") and type(line_str) == "string" then
+      local resolved_line = tonumber(line_str) or 0
+      if resolved_line > 0 then
+        return {
+          kind = "open_thread_fix_diff",
+          path = path,
+          line = resolved_line,
+          original_line = resolved_line,
+          side = "head",
+        }
+      end
+    end
+  end
+
+  return nil
+end
+
 local function switch_tab(view, index)
   if index < 1 or index > #view.tabs then
     return
@@ -174,12 +395,26 @@ end
 
 local function run_more_current(view)
   local tab_def = renderer.TAB_DEFS[view.current_tab]
-  if not tab_def or not tab_def.section then
+  if tab_def and tab_def.section then
+    if type(view.callbacks.more_section) == "function" then
+      view.callbacks.more_section(tab_def.section)
+    end
     return
   end
 
-  if type(view.callbacks.more_section) == "function" then
-    view.callbacks.more_section(tab_def.section)
+  if view.current_tab == "summary" and type(view.callbacks.more_section) == "function" then
+    local show = type(view.show) == "table" and view.show or {}
+    if show.timeline == false then
+      return
+    end
+    if show.comments == false
+      and show.reviews == false
+      and show.threads == false
+      and show.commits == false
+      and show.pr_changes == false then
+      return
+    end
+    view.callbacks.more_section("timeline")
   end
 end
 
@@ -317,6 +552,21 @@ local function ensure_keymaps(view)
     end), "GH PR Overview: preview markdown link")
   end
 
+  local fix_diff_key = ""
+  if type(view.thread_fix_diff) == "table" and view.thread_fix_diff.enabled ~= false then
+    fix_diff_key = type(view.thread_fix_diff.keymap) == "string" and view.thread_fix_diff.keymap or "gf"
+  end
+  if fix_diff_key ~= "" then
+    map(bufnr, fix_diff_key, with_view(function(current)
+      local action = resolve_thread_fix_action(current)
+      if type(action) ~= "table" or action.kind ~= "open_thread_fix_diff" then
+        vim.notify("No thread fix diff action available under cursor", vim.log.levels.WARN)
+        return
+      end
+      execute_action(current, action, "default")
+    end), "GH PR Overview: open thread fix diff")
+  end
+
   map(bufnr, "gr", with_view(function(current)
     run_more_current(current)
   end), "GH PR Overview: load more")
@@ -368,7 +618,8 @@ local function ensure_keymaps(view)
 end
 
 local function open_window(Snacks, view)
-  utils.ensure_buffer_options(view.bufnr)
+  local overview_ft = overview_buffer_filetype(view)
+  utils.ensure_buffer_options(view.bufnr, { filetype = overview_ft })
 
   local spec = {
     show = true,
@@ -381,7 +632,7 @@ local function open_window(Snacks, view)
       bufhidden = "wipe",
       swapfile = false,
       modifiable = false,
-      filetype = "ghpr_overview",
+      filetype = overview_ft,
     },
     wo = {
       number = false,
@@ -455,6 +706,8 @@ function M.open(model, opts)
     tabs = tabs,
     current_tab = tabs[1],
     cursor_by_tab = {},
+    activity_folds = {},
+    thread_fix_inline = {},
     line_actions = {},
     inline_actions = {},
     keymaps_set = false,
@@ -463,16 +716,21 @@ function M.open(model, opts)
 
   view.bufnr = bufnr
   view.tabs = tabs
+  view.activity_folds = type(view.activity_folds) == "table" and view.activity_folds or {}
+  view.thread_fix_inline = type(view.thread_fix_inline) == "table" and view.thread_fix_inline or {}
   view.current_tab = renderer.TAB_ALIASES[view.current_tab] or view.current_tab
   if not renderer.TAB_DEFS[view.current_tab] or not tab_exists(tabs, view.current_tab) then
     view.current_tab = tabs[1]
   end
   view.model = model
   view.callbacks = callbacks
+  view.show = type(opts.show) == "table" and vim.deepcopy(opts.show) or {}
   view.date_format = utils.safe_string(opts.date_format, "%Y-%m-%d %H:%M")
   view.window = utils.sanitize_window_opts(opts.window)
   view.theme = utils.sanitize_theme_opts(opts.theme)
   view.markdown = utils.sanitize_markdown_opts(opts.markdown)
+  view.thread_snippet = utils.sanitize_thread_snippet_opts(opts.thread_snippet)
+  view.thread_fix_diff = utils.sanitize_thread_fix_diff_opts(opts.thread_fix_diff)
 
   if type(opts.cursor_line) == "number" then
     view.cursor_by_tab[view.current_tab] = math.max(1, math.floor(opts.cursor_line))

@@ -189,6 +189,7 @@ local function build_line_comment_context(pr_number)
 
   return {
     index = index,
+    threads = threads,
     keymap = options.keymap,
     signs = options.signs,
     max_popup_width = options.max_popup_width,
@@ -2437,6 +2438,12 @@ local function timeline_kind_label(item)
     return "COMMENT"
   end
 
+  if item.kind == "commit" then
+    return "COMMIT"
+  end
+  if item.kind == "pr_change" then
+    return "PR CHANGE"
+  end
   if item.kind == "thread_comment" then
     return "THREAD COMMENT"
   end
@@ -2466,10 +2473,33 @@ local function timeline_item_lines(item)
   local created_at = type(item.created_at) == "string" and item.created_at or ""
   local url = type(item.url) == "string" and item.url or ""
   local body = type(item.body) == "string" and item.body or ""
+  local kind = type(item.kind) == "string" and item.kind or "comment"
+  if kind == "commit" and body == "" then
+    local headline = type(item.headline) == "string" and item.headline or "(no commit headline)"
+    body = headline
+  end
+  if kind == "pr_change" and body == "" then
+    local summary = type(item.change_summary) == "string" and item.change_summary or "(pull request updated)"
+    local details = type(item.change_details) == "string" and item.change_details or ""
+    body = summary
+    if details ~= "" then
+      body = body .. "\n" .. details
+    end
+  end
   local lines = {
     string.format("Type: %s", timeline_kind_label(item)),
     string.format("Author: @%s", author),
   }
+
+  if kind == "commit" then
+    local oid = type(item.oid_short) == "string" and item.oid_short or ""
+    if oid == "" and type(item.oid) == "string" and item.oid ~= "" then
+      oid = item.oid:sub(1, 8)
+    end
+    if oid ~= "" then
+      lines[#lines + 1] = "Commit: " .. oid
+    end
+  end
 
   if created_at ~= "" then
     lines[#lines + 1] = "Date: " .. created_at:gsub("T", " "):gsub("Z", "")
@@ -2484,7 +2514,7 @@ local function timeline_item_lines(item)
 
   local body_lines = vim.split(body, "\n", { plain = true })
   if vim.tbl_isempty(body_lines) then
-    body_lines = { "(empty comment)" }
+    body_lines = { "(no details)" }
   end
   for _, body_line in ipairs(body_lines) do
     lines[#lines + 1] = body_line
@@ -2536,7 +2566,8 @@ function M.open_timeline_item(item, opts)
   end
 end
 
-local function build_overview_callbacks(pr_number)
+local function build_overview_callbacks(pr_number, mode)
+  mode = mode == "v2" and "v2" or "v1"
   return {
     approve = function()
       M.review("approve")
@@ -2554,7 +2585,11 @@ local function build_overview_callbacks(pr_number)
       M.checkout(pr_number)
     end,
     refresh = function()
-      M.refresh_overview()
+      if mode == "v2" then
+        M.refresh_overview_v2()
+      else
+        M.refresh_overview()
+      end
     end,
     open_url = function()
       M.open_overview_url(pr_number)
@@ -2583,6 +2618,18 @@ local function build_overview_callbacks(pr_number)
     open_file_modified = function(file)
       M.open_modified(file)
     end,
+    open_thread_fix_diff = function(payload)
+      M.open_thread_fix_diff(payload)
+    end,
+    open_thread_comment_evolution_diff = function(payload)
+      M.open_thread_comment_evolution_diff(payload)
+    end,
+    open_thread_comment_commit_diff = function(payload)
+      M.open_thread_comment_commit_diff(payload)
+    end,
+    resolve_thread_fix_diff = function(payload, options)
+      return M.resolve_thread_fix_diff(payload, options)
+    end,
     preview_markdown_link = function(action)
       M.overview_preview_markdown_link(action)
     end,
@@ -2592,14 +2639,13 @@ local function build_overview_callbacks(pr_number)
   }
 end
 
-function M.open_overview(number, opts)
+function M.build_overview_model_for_overview(number, opts)
   opts = opts or {}
   local pr, details, err = resolve_active_pr(number, { refresh = opts.refresh == true })
   if not pr then
-    return notify_error(err)
+    return nil, nil, err
   end
 
-  local overview_config = (config.get() or {}).overview or {}
   local limits = normalize_overview_limits(opts.overview_limits)
   local threads, thread_err = pr_service.fetch_review_threads(pr.number, {
     threads_first = limits.threads,
@@ -2611,10 +2657,41 @@ function M.open_overview(number, opts)
   end
 
   local repository = normalize_repository(details) or ""
+  local pr_change_events, pr_change_err = pr_service.fetch_pr_change_events(pr.number, {
+    repository = repository,
+    pr_url = type(details.url) == "string" and details.url or "",
+    max_items = math.min(500, math.max(100, limits.timeline * 4)),
+    max_pages = 5,
+  })
+  if not pr_change_events then
+    pr_change_events = {}
+  end
+
   local model = pr_service.build_overview_model(details, threads, limits, {
     repository = repository,
     thread_error = thread_err,
+    pr_change_events = pr_change_events,
+    pr_change_error = pr_change_err,
   })
+
+  return pr, model, nil
+end
+
+function M.open_overview(number, opts)
+  opts = opts or {}
+
+  local plugin_config = config.get() or {}
+  local overview_v2_config = plugin_config.overview_v2 or {}
+  if overview_v2_config.enabled == true and opts.force_v1 ~= true then
+    return M.open_overview_v2(number, opts)
+  end
+
+  local pr, model, err = M.build_overview_model_for_overview(number, opts)
+  if not pr then
+    return notify_error(err)
+  end
+
+  local overview_config = plugin_config.overview or {}
 
   local target_bufnr = nil
   if is_valid_buf(opts.bufnr) then
@@ -2634,10 +2711,40 @@ function M.open_overview(number, opts)
     window = overview_config.window or {},
     theme = overview_config.theme or {},
     markdown = overview_config.markdown or {},
+    thread_snippet = overview_config.thread_snippet or {},
+    thread_fix_diff = overview_config.thread_fix_diff or {},
     tabs = overview_config.tabs,
     show = overview_config.show or {},
     date_format = overview_config.date_format or "%Y-%m-%d %H:%M",
-    actions = build_overview_callbacks(pr.number),
+    actions = build_overview_callbacks(pr.number, "v1"),
+  })
+end
+
+function M.open_overview_v2(number, opts)
+  opts = opts or {}
+
+  local pr, model, err = M.build_overview_model_for_overview(number, opts)
+  if not pr then
+    return notify_error(err)
+  end
+
+  local plugin_config = config.get() or {}
+  local overview_config = plugin_config.overview or {}
+  local overview_v2_config = plugin_config.overview_v2 or {}
+  local session_id = tonumber(opts.session_id) or nil
+
+  require("gh-pr.overview_v2").open(model, {
+    session_id = session_id,
+    window = overview_v2_config.window or overview_config.window or {},
+    layout = overview_v2_config.layout or {},
+    keymaps = overview_v2_config.keymaps or {},
+    activity = overview_v2_config.activity or {},
+    show = overview_v2_config.show or overview_config.show or {},
+    date_format = overview_v2_config.date_format or overview_config.date_format or "%Y-%m-%d %H:%M",
+    theme = overview_config.theme or {},
+    markdown = overview_config.markdown or {},
+    thread_snippet = overview_config.thread_snippet or {},
+    actions = build_overview_callbacks(pr.number, "v2"),
   })
 end
 
@@ -2648,11 +2755,30 @@ function M.refresh_overview()
     return notify_error("Current buffer is not a gh-pr overview")
   end
 
+  if vim.b[bufnr].gh_pr_overview_ui == "v2" then
+    return M.refresh_overview_v2()
+  end
+
   local cursor = vim.api.nvim_win_get_cursor(0)
   M.open_overview(number, {
     refresh = true,
     reuse_buffer = true,
     cursor_line = cursor[1],
+    overview_limits = current_overview_limits(),
+    force_v1 = true,
+  })
+end
+
+function M.refresh_overview_v2()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local number = vim.b[bufnr].gh_pr_number
+  if type(number) ~= "number" then
+    return notify_error("Current buffer is not a gh-pr overview")
+  end
+
+  M.open_overview_v2(number, {
+    refresh = true,
+    session_id = vim.b[bufnr].gh_pr_overview_v2_session,
     overview_limits = current_overview_limits(),
   })
 end
@@ -2670,9 +2796,12 @@ function M.refresh_visible_overview_for_pr(number)
   for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(current_tab)) do
     if is_valid_win(winid) then
       local bufnr = vim.api.nvim_win_get_buf(winid)
+      local overview_ui = vim.b[bufnr].gh_pr_overview_ui
+      local is_v1 = overview_ui == "snacks" or buffer_filetype(bufnr) == "ghpr_overview"
+      local is_v2 = overview_ui == "v2" and vim.b[bufnr].gh_pr_overview_v2_primary == true
       if is_valid_buf(bufnr)
         and not refreshed_buffers[bufnr]
-        and buffer_filetype(bufnr) == "ghpr_overview"
+        and (is_v1 or is_v2)
         and tonumber(vim.b[bufnr].gh_pr_number) == pr_number then
         local cursor = vim.api.nvim_win_get_cursor(winid)
         local cursor_line = type(cursor) == "table" and tonumber(cursor[1]) or nil
@@ -2680,13 +2809,22 @@ function M.refresh_visible_overview_for_pr(number)
           or nil
 
         local ok = pcall(vim.api.nvim_win_call, winid, function()
-          M.open_overview(pr_number, {
-            refresh = true,
+          if is_v2 then
+            M.open_overview_v2(pr_number, {
+              refresh = true,
+              session_id = vim.b[bufnr].gh_pr_overview_v2_session,
+              overview_limits = limits,
+            })
+          else
+            M.open_overview(pr_number, {
+              refresh = true,
             reuse_buffer = true,
             bufnr = bufnr,
             cursor_line = cursor_line,
             overview_limits = limits,
+            force_v1 = true,
           })
+          end
         end)
 
         if ok then
@@ -2714,6 +2852,7 @@ function M.overview_more(section, count)
   if type(number) ~= "number" then
     return notify_error("Current buffer is not a gh-pr overview")
   end
+  local overview_ui = vim.b[bufnr].gh_pr_overview_ui
 
   local overview_config = (config.get() or {}).overview or {}
   local step = positive_integer(count, positive_integer(overview_config.expand_step, 20))
@@ -2727,12 +2866,22 @@ function M.overview_more(section, count)
     limits[section] = positive_integer(limits[section], step) + step
   end
 
+  if overview_ui == "v2" then
+    M.open_overview_v2(number, {
+      refresh = true,
+      session_id = vim.b[bufnr].gh_pr_overview_v2_session,
+      overview_limits = limits,
+    })
+    return
+  end
+
   local cursor = vim.api.nvim_win_get_cursor(0)
   M.open_overview(number, {
     refresh = true,
     reuse_buffer = true,
     cursor_line = cursor[1],
     overview_limits = limits,
+    force_v1 = true,
   })
 end
 
@@ -3435,6 +3584,8 @@ local function capture_overview_context()
   local context = {
     bufnr = bufnr,
     pr_number = number,
+    overview_ui = vim.b[bufnr].gh_pr_overview_ui,
+    overview_v2_session = tonumber(vim.b[bufnr].gh_pr_overview_v2_session),
   }
 
   local winid = vim.fn.bufwinid(bufnr)
@@ -3458,23 +3609,30 @@ local function refresh_overview_after_edit(pr_number, context)
   local options = {
     refresh = true,
   }
+  local opener = M.open_overview
 
   if type(pr_number) ~= "number" then
     return
   end
 
-  if type(context) == "table" and is_valid_buf(context.bufnr) then
+  local is_v2 = type(context) == "table" and context.overview_ui == "v2"
+  if is_v2 then
+    opener = M.open_overview_v2
+    options.session_id = type(context) == "table" and context.overview_v2_session or nil
+  elseif type(context) == "table" and is_valid_buf(context.bufnr) then
     options.reuse_buffer = true
     options.bufnr = context.bufnr
     if type(context.cursor_line) == "number" then
       options.cursor_line = context.cursor_line
     end
-    if type(context.overview_limits) == "table" then
-      options.overview_limits = context.overview_limits
-    end
+    options.force_v1 = true
   end
 
-  local ok, err = pcall(M.open_overview, pr_number, options)
+  if type(context) == "table" and type(context.overview_limits) == "table" then
+    options.overview_limits = context.overview_limits
+  end
+
+  local ok, err = pcall(opener, pr_number, options)
   if not ok then
     notify_warn("Overview updated remotely, but local refresh failed: " .. tostring(err))
   end
@@ -3795,6 +3953,859 @@ function M.open_commit_file_diff(commit, file, opts)
   elseif type(diff_result) == "table" and diff_result.file_mode == "removed_single" then
     notify_info("File was removed in selected commit. Opened single ORIGINAL buffer (diff layouts disabled).")
   end
+
+  local target_side = type(opts.target_side) == "string" and opts.target_side:lower() or "head"
+  if target_side ~= "base" then
+    target_side = "head"
+  end
+  local target_line = target_side == "base"
+      and positive_integer(opts.target_original_line, positive_integer(opts.target_line, nil))
+    or positive_integer(opts.target_line, positive_integer(opts.target_original_line, nil))
+  if type(target_line) == "number" and target_line > 0 and type(diff_result) == "table" then
+    local target_buf = nil
+    if target_side == "base" then
+      target_buf = tonumber(diff_result.base_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
+    else
+      target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
+    end
+    if not target_buf then
+      target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.base_buf)
+    end
+
+    if type(target_buf) == "number" and target_buf > 0 and is_valid_buf(target_buf) then
+      local winid = vim.fn.bufwinid(target_buf)
+      if type(winid) == "number" and winid > 0 and is_valid_win(winid) then
+        pcall(vim.api.nvim_set_current_win, winid)
+        restore_cursor_line(winid, target_line)
+      end
+    end
+  end
+
+  do
+    local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
+    if ok_panel and type(panel.sync_for_diff) == "function" then
+      pcall(panel.sync_for_diff, {
+        pr = pr,
+        details = details,
+        comments_ctx = nil,
+        pr_number = pr.number,
+      })
+    end
+  end
+end
+
+function M.open_thread_comment_evolution_diff(payload, opts)
+  payload = type(payload) == "table" and payload or {}
+  opts = type(opts) == "table" and opts or {}
+
+  local function thread_comment_side_from_payload_local()
+    if type(M._thread_fix_helpers) == "table" and type(M._thread_fix_helpers.normalize_target_side) == "function" then
+      return M._thread_fix_helpers.normalize_target_side(payload.side)
+    end
+
+    local value = type(payload.side) == "string" and payload.side:lower() or "head"
+    if value == "left" or value == "base" then
+      return "base"
+    end
+    return "head"
+  end
+
+  local function build_fallback_target(target_path, target_side, target_line, target_original_line)
+    local fallback = type(payload.fallback_target) == "table" and vim.deepcopy(payload.fallback_target) or {}
+    fallback.path = type(fallback.path) == "string" and fallback.path ~= "" and fallback.path or target_path
+    fallback.side = type(fallback.side) == "string" and fallback.side ~= "" and fallback.side or target_side
+    fallback.line = tonumber(fallback.line) or target_line
+    fallback.original_line = tonumber(fallback.original_line) or target_original_line
+    return fallback
+  end
+
+  local function oid_candidates(target_side)
+    local first = ""
+    local second = ""
+    if target_side == "base" then
+      first = type(payload.comment_original_commit_oid) == "string" and payload.comment_original_commit_oid or ""
+      second = type(payload.comment_commit_oid) == "string" and payload.comment_commit_oid or ""
+    else
+      first = type(payload.comment_commit_oid) == "string" and payload.comment_commit_oid or ""
+      second = type(payload.comment_original_commit_oid) == "string" and payload.comment_original_commit_oid or ""
+    end
+    return first, second
+  end
+
+  local function fetch_comment_commit(pr, details, oid)
+    local target_oid = type(oid) == "string" and oid or ""
+    if target_oid == "" then
+      return nil, "Missing thread comment commit oid"
+    end
+
+    local repository = normalize_repository(details) or ""
+    return pr_service.fetch_commit_details(pr.number, target_oid, {
+      repository = repository,
+    })
+  end
+
+  local function find_commit_file_for_paths_local(commit_details, paths)
+    if type(commit_details) ~= "table" then
+      return nil
+    end
+    if type(paths) ~= "table" or vim.tbl_isempty(paths) then
+      return nil
+    end
+    if type(M._thread_fix_helpers) ~= "table" or type(M._thread_fix_helpers.find_file_in_commit) ~= "function" then
+      return nil
+    end
+
+    local seen = {}
+    for _, raw_path in ipairs(paths) do
+      local candidate = normalize_path(raw_path)
+      if candidate ~= "" and not seen[candidate] then
+        seen[candidate] = true
+        local file = M._thread_fix_helpers.find_file_in_commit(commit_details, candidate)
+        if file then
+          return file
+        end
+      end
+    end
+
+    return nil
+  end
+
+  local function build_compare_file(target_path, comment_file, latest_file)
+    local normalized_target = normalize_path(target_path)
+    local comment_current = normalize_path(type(comment_file) == "table" and (comment_file.path or comment_file.filename) or "")
+    local comment_previous = normalize_path(
+      type(comment_file) == "table" and (comment_file.previous_filename or comment_file.previousFilename) or ""
+    )
+    local latest_current = normalize_path(type(latest_file) == "table" and (latest_file.path or latest_file.filename) or "")
+    local latest_previous = normalize_path(
+      type(latest_file) == "table" and (latest_file.previous_filename or latest_file.previousFilename) or ""
+    )
+
+    local base_path = comment_current
+    if base_path == "" then
+      base_path = comment_previous
+    end
+    if base_path == "" then
+      base_path = normalized_target
+    end
+
+    local head_path = latest_current
+    if head_path == "" then
+      head_path = latest_previous
+    end
+    if head_path == "" then
+      head_path = normalized_target
+    end
+
+    local status = "modified"
+    local previous_filename = ""
+    if base_path == "" and head_path ~= "" then
+      status = "added"
+    elseif base_path ~= "" and head_path == "" then
+      status = "removed"
+      head_path = base_path
+    elseif base_path ~= "" and head_path ~= "" and base_path ~= head_path then
+      status = "renamed"
+      previous_filename = base_path
+    end
+
+    local path = head_path ~= "" and head_path or base_path
+    if status == "removed" then
+      path = base_path
+    end
+    if path == "" then
+      path = normalized_target
+    end
+
+    return {
+      path = path,
+      filename = path,
+      previous_filename = previous_filename,
+      previousFilename = previous_filename,
+      status = status,
+      additions = tonumber(type(latest_file) == "table" and latest_file.additions or nil) or 0,
+      deletions = tonumber(type(latest_file) == "table" and latest_file.deletions or nil) or 0,
+    }
+  end
+
+  local function build_compare_details(details, base_commit, head_commit)
+    local diff_details = vim.deepcopy(type(details) == "table" and details or {})
+    diff_details.baseRefName = type(base_commit) == "table" and type(base_commit.oid) == "string" and base_commit.oid or ""
+    diff_details.headRefName = type(head_commit) == "table" and type(head_commit.oid) == "string" and head_commit.oid or ""
+
+    local base_repository = type(base_commit) == "table" and repository_object_from_full_name(base_commit.repository) or nil
+    local head_repository = type(head_commit) == "table" and repository_object_from_full_name(head_commit.repository) or nil
+
+    if type(base_repository) == "table" then
+      diff_details.baseRepository = vim.deepcopy(base_repository)
+    end
+    if type(head_repository) == "table" then
+      diff_details.headRepository = vim.deepcopy(head_repository)
+    end
+
+    if type(diff_details.baseRepository) ~= "table" and type(diff_details.headRepository) == "table" then
+      diff_details.baseRepository = vim.deepcopy(diff_details.headRepository)
+    end
+    if type(diff_details.headRepository) ~= "table" and type(diff_details.baseRepository) == "table" then
+      diff_details.headRepository = vim.deepcopy(diff_details.baseRepository)
+    end
+
+    if (type(diff_details.url) ~= "string" or diff_details.url == "")
+      and type(head_commit) == "table"
+      and type(head_commit.url) == "string"
+      and head_commit.url ~= "" then
+      diff_details.url = head_commit.url
+    end
+
+    return diff_details
+  end
+
+  local function open_fallback(reason)
+    local fallback_target = type(payload._resolved_fallback_target) == "table" and payload._resolved_fallback_target
+      or (type(payload.fallback_target) == "table" and payload.fallback_target or nil)
+    if fallback_target then
+      M.open_comment_location(fallback_target)
+      if type(reason) == "string" and reason ~= "" then
+        notify_warn(reason)
+      end
+      return {
+        ok = false,
+        fallback = "location",
+        reason = reason,
+      }
+    end
+    if type(reason) == "string" and reason ~= "" then
+      notify_warn(reason)
+    end
+    return {
+      ok = false,
+      reason = reason,
+    }
+  end
+
+  local number = tonumber(payload.pr_number) or tonumber(vim.b.gh_pr_number)
+  local pr, details, err = resolve_active_pr(number)
+  if not pr then
+    return open_fallback(err)
+  end
+
+  local target_path = normalize_path(payload.path)
+  if target_path == "" then
+    return open_fallback("Unable to open thread comment diff: missing file path")
+  end
+
+  local target_side = thread_comment_side_from_payload_local()
+  local target_line = positive_integer(payload.line, positive_integer(payload.original_line, nil))
+  local target_original_line = positive_integer(payload.original_line, positive_integer(payload.line, nil))
+  payload._resolved_fallback_target = build_fallback_target(
+    target_path,
+    target_side,
+    target_line,
+    target_original_line
+  )
+
+  local primary_oid, secondary_oid = oid_candidates(target_side)
+  local comment_commit_oid = primary_oid ~= "" and primary_oid or secondary_oid
+  if comment_commit_oid == "" then
+    return open_fallback("Unable to resolve commit oid for selected thread comment")
+  end
+
+  local comment_commit, comment_err = fetch_comment_commit(pr, details, comment_commit_oid)
+  if not comment_commit then
+    return open_fallback("Unable to resolve comment commit details: " .. tostring(comment_err))
+  end
+
+  if type(M._thread_fix_helpers) ~= "table" or type(M._thread_fix_helpers.resolve_target) ~= "function" then
+    return open_fallback("Unable to resolve latest file commit for selected thread comment")
+  end
+
+  local resolved, resolve_err = M._thread_fix_helpers.resolve_target(pr, details, {
+    path = target_path,
+    side = target_side,
+    line = target_line,
+    original_line = target_original_line,
+    comment_commit_oid = comment_commit_oid,
+  })
+  if not resolved or type(resolved.commit) ~= "table" or type(resolved.file) ~= "table" then
+    return open_fallback("Unable to resolve latest commit for commented file: " .. tostring(resolve_err))
+  end
+
+  local latest_commit = resolved.commit
+  local latest_file = resolved.file
+  local latest_commit_oid = type(latest_commit.oid) == "string" and latest_commit.oid or ""
+  local selected_comment_commit = comment_commit
+  local selected_comment_commit_oid = type(comment_commit.oid) == "string" and comment_commit.oid or comment_commit_oid
+  local compare_path_candidates = {
+    target_path,
+    latest_file.path,
+    latest_file.filename,
+    latest_file.previous_filename,
+    latest_file.previousFilename,
+  }
+  local comment_file = find_commit_file_for_paths_local(selected_comment_commit, compare_path_candidates)
+
+  if latest_commit_oid ~= "" and selected_comment_commit_oid ~= "" and selected_comment_commit_oid == latest_commit_oid then
+    local tried_oids = {}
+    local alternate_oids = {
+      type(payload.comment_original_commit_oid) == "string" and payload.comment_original_commit_oid or "",
+      secondary_oid,
+      type(payload.comment_commit_oid) == "string" and payload.comment_commit_oid or "",
+      primary_oid,
+    }
+
+    for _, candidate_oid in ipairs(alternate_oids) do
+      local normalized_candidate = type(candidate_oid) == "string" and candidate_oid or ""
+      if normalized_candidate ~= ""
+        and normalized_candidate ~= latest_commit_oid
+        and not tried_oids[normalized_candidate] then
+        tried_oids[normalized_candidate] = true
+        local candidate_commit, candidate_err = fetch_comment_commit(pr, details, normalized_candidate)
+        if candidate_commit then
+          local candidate_file = find_commit_file_for_paths_local(candidate_commit, compare_path_candidates)
+          if candidate_file then
+            selected_comment_commit = candidate_commit
+            selected_comment_commit_oid = type(candidate_commit.oid) == "string"
+                and candidate_commit.oid ~= "" and candidate_commit.oid
+              or normalized_candidate
+            comment_file = candidate_file
+            break
+          end
+        elseif type(candidate_err) == "string" and candidate_err ~= "" then
+          -- keep trying alternate candidates
+        end
+      end
+    end
+  end
+
+  if latest_commit_oid ~= ""
+    and selected_comment_commit_oid ~= ""
+    and selected_comment_commit_oid == latest_commit_oid then
+    return open_fallback("No evolution diff available: selected comment already points to latest commit for this file.")
+  end
+
+  if not comment_file then
+    return open_fallback("Unable to find the commented file in the comment commit")
+  end
+
+  local compare_details = build_compare_details(details, selected_comment_commit, latest_commit)
+  if type(compare_details.baseRefName) ~= "string" or compare_details.baseRefName == "" then
+    return open_fallback("Unable to resolve base ref for thread comment evolution diff")
+  end
+  if type(compare_details.headRefName) ~= "string" or compare_details.headRefName == "" then
+    return open_fallback("Unable to resolve head ref for thread comment evolution diff")
+  end
+
+  local compare_file = build_compare_file(target_path, comment_file, latest_file)
+  if type(compare_file) ~= "table" or type(compare_file.path) ~= "string" or compare_file.path == "" then
+    return open_fallback("Unable to build compared file for thread comment evolution diff")
+  end
+
+  state.set_active_file(compare_file)
+  local diff_view = current_diff_view_preferences({
+    mode = opts.view_mode,
+    ignore_whitespace = opts.ignore_whitespace,
+    render_whitespace = opts.render_whitespace,
+    render_endlines = opts.render_endlines,
+  })
+
+  local diff_result, diff_err = virtual_files.open_diff(compare_details, pr, compare_file, {
+    line_comments = nil,
+    view_mode = diff_view.mode,
+    ignore_whitespace = diff_view.ignore_whitespace,
+    render_whitespace = diff_view.render_whitespace,
+    render_endlines = diff_view.render_endlines,
+    new_tab = opts.new_tab,
+  })
+  if diff_err then
+    return open_fallback(diff_err)
+  end
+
+  if type(diff_result) == "table" and diff_result.file_mode == "added_single" then
+    notify_info("File is new in compared commit range. Opened single MODIFIED buffer (diff layouts disabled).")
+  elseif type(diff_result) == "table" and diff_result.file_mode == "removed_single" then
+    notify_info("File was removed in compared commit range. Opened single ORIGINAL buffer (diff layouts disabled).")
+  end
+
+  local focus_side = target_side == "base" and "base" or "head"
+  local focus_line = focus_side == "base" and target_original_line or target_line
+  if type(focus_line) == "number" and focus_line > 0 and type(diff_result) == "table" then
+    local target_buf = nil
+    if focus_side == "base" then
+      target_buf = tonumber(diff_result.base_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
+    else
+      target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
+    end
+    if not target_buf then
+      target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.base_buf)
+    end
+    if type(target_buf) == "number" and target_buf > 0 and is_valid_buf(target_buf) then
+      local winid = vim.fn.bufwinid(target_buf)
+      if type(winid) == "number" and winid > 0 and is_valid_win(winid) then
+        pcall(vim.api.nvim_set_current_win, winid)
+        restore_cursor_line(winid, focus_line)
+      end
+    end
+  end
+
+  do
+    local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
+    if ok_panel and type(panel.sync_for_diff) == "function" then
+      pcall(panel.sync_for_diff, {
+        pr = pr,
+        details = details,
+        comments_ctx = nil,
+        pr_number = pr.number,
+      })
+    end
+  end
+
+  return {
+    ok = true,
+    base_commit_oid = selected_comment_commit_oid,
+    head_commit_oid = type(latest_commit.oid) == "string" and latest_commit.oid or "",
+    path = target_path,
+  }
+end
+
+function M.open_thread_comment_commit_diff(payload, opts)
+  -- Backward-compatible alias; behavior is evolution diff (comment commit -> latest file commit).
+  return M.open_thread_comment_evolution_diff(payload, opts)
+end
+
+M._thread_fix_helpers = type(M._thread_fix_helpers) == "table" and M._thread_fix_helpers or {}
+
+function M._thread_fix_helpers.non_negative_integer(value, fallback)
+  local number = tonumber(value)
+  if not number then
+    return fallback
+  end
+
+  number = math.floor(number)
+  if number < 0 then
+    return fallback
+  end
+
+  return number
+end
+
+function M._thread_fix_helpers.normalize_target_side(side)
+  local value = type(side) == "string" and side:lower() or "head"
+  if value == "left" or value == "base" then
+    return "base"
+  end
+  return "head"
+end
+
+function M._thread_fix_helpers.cache(pr, details)
+  local repository = normalize_repository(details) or ""
+  local cache_key = tostring(pr.number) .. "|" .. repository
+  M._overview_thread_fix_cache = type(M._overview_thread_fix_cache) == "table" and M._overview_thread_fix_cache or {}
+  local cache = M._overview_thread_fix_cache[cache_key]
+  if type(cache) ~= "table" then
+    cache = {
+      commit_details = {},
+    }
+    M._overview_thread_fix_cache[cache_key] = cache
+  end
+
+  cache.repository = repository
+  return cache
+end
+
+function M._thread_fix_helpers.fetch_commit(pr, cache, oid)
+  local commit_oid = type(oid) == "string" and oid or ""
+  if commit_oid == "" then
+    return nil, "Missing commit oid"
+  end
+  if type(cache.commit_details[commit_oid]) == "table" then
+    return cache.commit_details[commit_oid], nil
+  end
+
+  local commit_details, fetch_err = pr_service.fetch_commit_details(pr.number, commit_oid, {
+    repository = cache.repository or "",
+  })
+  if not commit_details then
+    return nil, fetch_err
+  end
+
+  cache.commit_details[commit_oid] = commit_details
+  return commit_details, nil
+end
+
+function M._thread_fix_helpers.find_file_in_commit(commit_details, target_path)
+  for _, item in ipairs(type(commit_details.files) == "table" and commit_details.files or {}) do
+    local item_path = normalize_path(item.path or item.filename)
+    local previous_path = normalize_path(item.previous_filename or item.previousFilename)
+    if item_path == target_path or previous_path == target_path then
+      return normalize_commit_file_for_diff(item)
+    end
+  end
+  return nil
+end
+
+function M._thread_fix_helpers.sorted_commit_candidates(details)
+  local commit_candidates = {}
+  for _, item in ipairs(type(details.commits) == "table" and details.commits or {}) do
+    local oid = type(item.oid) == "string" and item.oid or ""
+    if oid ~= "" then
+      commit_candidates[#commit_candidates + 1] = {
+        oid = oid,
+        committed_at = type(item.committedDate) == "string" and item.committedDate or "",
+      }
+    end
+  end
+
+  table.sort(commit_candidates, function(left, right)
+    local left_key = type(left.committed_at) == "string" and left.committed_at or ""
+    local right_key = type(right.committed_at) == "string" and right.committed_at or ""
+    if left_key == right_key then
+      return left.oid > right.oid
+    end
+    return left_key > right_key
+  end)
+
+  return commit_candidates
+end
+
+function M._thread_fix_helpers.resolve_target(pr, details, payload)
+  local target_path = normalize_path(payload.path)
+  if target_path == "" then
+    return nil, "Thread comment has no file path"
+  end
+
+  local cache = M._thread_fix_helpers.cache(pr, details)
+  local selected_commit = nil
+  local selected_file = nil
+  local last_fetch_err = nil
+
+  for _, candidate in ipairs(M._thread_fix_helpers.sorted_commit_candidates(details)) do
+    local commit_details, fetch_err = M._thread_fix_helpers.fetch_commit(pr, cache, candidate.oid)
+    if not commit_details then
+      last_fetch_err = fetch_err
+    else
+      local file = M._thread_fix_helpers.find_file_in_commit(commit_details, target_path)
+      if file then
+        selected_commit = commit_details
+        selected_file = file
+        break
+      end
+    end
+  end
+
+  if not selected_commit then
+    local fallback_oid = type(payload.comment_commit_oid) == "string" and payload.comment_commit_oid or ""
+    if fallback_oid ~= "" then
+      local commit_details, fetch_err = M._thread_fix_helpers.fetch_commit(pr, cache, fallback_oid)
+      if commit_details then
+        local file = M._thread_fix_helpers.find_file_in_commit(commit_details, target_path)
+        if file then
+          selected_commit = commit_details
+          selected_file = file
+        end
+      else
+        last_fetch_err = fetch_err
+      end
+    end
+  end
+
+  if not selected_commit or not selected_file then
+    if type(last_fetch_err) == "string" and last_fetch_err ~= "" then
+      return nil, "Unable to resolve fix diff commit: " .. last_fetch_err
+    end
+    return nil, "Unable to find a commit in this PR that modifies " .. target_path
+  end
+
+  local target_side = M._thread_fix_helpers.normalize_target_side(payload.side)
+  local target_line = positive_integer(payload.line, 0) or 0
+  local target_original_line = positive_integer(payload.original_line, 0) or 0
+
+  return {
+    commit = selected_commit,
+    file = selected_file,
+    path = target_path,
+    target_side = target_side,
+    target_line = target_line,
+    target_original_line = target_original_line,
+  }, nil
+end
+
+function M._thread_fix_helpers.parse_patch_hunk_header(line)
+  if type(line) ~= "string" then
+    return nil, nil
+  end
+
+  local old_start, _, new_start = line:match("^@@%s*%-(%d+),?(%d*)%s+%+(%d+),?(%d*)%s*@@")
+  if not old_start or not new_start then
+    return nil, nil
+  end
+  return tonumber(old_start), tonumber(new_start)
+end
+
+function M._thread_fix_helpers.parse_patch_lines(lines)
+  local parsed = {}
+  local old_line = nil
+  local new_line = nil
+
+  for index, line in ipairs(lines) do
+    local old_start, new_start = M._thread_fix_helpers.parse_patch_hunk_header(line)
+    if old_start and new_start then
+      old_line = old_start
+      new_line = new_start
+      parsed[#parsed + 1] = {
+        index = index,
+        is_header = true,
+      }
+    else
+      local item = {
+        index = index,
+        is_header = false,
+      }
+      local prefix = type(line) == "string" and line:sub(1, 1) or ""
+      if type(old_line) == "number" and type(new_line) == "number" then
+        if prefix == "-" and line:sub(1, 3) ~= "---" then
+          item.old_line = old_line
+          old_line = old_line + 1
+        elseif prefix == "+" and line:sub(1, 3) ~= "+++" then
+          item.new_line = new_line
+          new_line = new_line + 1
+        else
+          item.old_line = old_line
+          item.new_line = new_line
+          old_line = old_line + 1
+          new_line = new_line + 1
+        end
+      end
+
+      parsed[#parsed + 1] = item
+    end
+  end
+
+  return parsed
+end
+
+function M._thread_fix_helpers.best_patch_focus_index(parsed, side, line_number)
+  if type(line_number) ~= "number" or line_number < 1 then
+    return nil
+  end
+
+  local best_index = nil
+  local best_distance = nil
+  for _, item in ipairs(parsed) do
+    if item.is_header ~= true then
+      local candidate_line = side == "base" and item.old_line or item.new_line
+      if type(candidate_line) == "number" then
+        local distance = math.abs(candidate_line - line_number)
+        if best_distance == nil or distance < best_distance then
+          best_distance = distance
+          best_index = item.index
+          if distance == 0 then
+            break
+          end
+        end
+      end
+    end
+  end
+
+  return best_index
+end
+
+function M._thread_fix_helpers.first_patch_hunk_index(parsed)
+  for _, item in ipairs(parsed) do
+    if item.is_header == true then
+      return item.index
+    end
+  end
+  return nil
+end
+
+function M._thread_fix_helpers.trim_patch_snippet(patch, target_side, target_line, target_original_line, context_before, context_after)
+  local lines = vim.split(patch, "\n", { plain = true, trimempty = false })
+  if vim.tbl_isempty(lines) then
+    return nil, "No textual patch available for selected commit file"
+  end
+
+  local parsed = M._thread_fix_helpers.parse_patch_lines(lines)
+  if vim.tbl_isempty(parsed) then
+    return nil, "No textual patch available for selected commit file"
+  end
+
+  local focus_index = nil
+  if target_side == "base" then
+    focus_index = M._thread_fix_helpers.best_patch_focus_index(parsed, "base", target_original_line)
+    if not focus_index then
+      focus_index = M._thread_fix_helpers.best_patch_focus_index(parsed, "head", target_line)
+    end
+  else
+    focus_index = M._thread_fix_helpers.best_patch_focus_index(parsed, "head", target_line)
+    if not focus_index then
+      focus_index = M._thread_fix_helpers.best_patch_focus_index(parsed, "base", target_original_line)
+    end
+  end
+
+  if not focus_index then
+    focus_index = M._thread_fix_helpers.first_patch_hunk_index(parsed)
+  end
+  if not focus_index then
+    focus_index = 1
+  end
+
+  local start_index = math.max(1, focus_index - context_before)
+  local end_index = math.min(#lines, focus_index + context_after)
+  local snippet_lines = {}
+  local snippet_entries = {}
+
+  if start_index > 1 then
+    local trimmed = string.format("... (%d lines trimmed above)", start_index - 1)
+    snippet_lines[#snippet_lines + 1] = trimmed
+    snippet_entries[#snippet_entries + 1] = {
+      text = trimmed,
+    }
+  end
+  for index = start_index, end_index do
+    local text = lines[index]
+    local parsed_item = parsed[index] or {}
+    snippet_lines[#snippet_lines + 1] = text
+    snippet_entries[#snippet_entries + 1] = {
+      text = text,
+      old_line = parsed_item.old_line,
+      new_line = parsed_item.new_line,
+      is_header = parsed_item.is_header == true,
+    }
+  end
+  if end_index < #lines then
+    local trimmed = string.format("... (%d lines trimmed below)", #lines - end_index)
+    snippet_lines[#snippet_lines + 1] = trimmed
+    snippet_entries[#snippet_entries + 1] = {
+      text = trimmed,
+    }
+  end
+
+  return snippet_lines, nil, snippet_entries
+end
+
+function M._thread_fix_helpers.open_resolved_diff(resolved)
+  M.open_commit_file_diff(resolved.commit, resolved.file, {
+    target_side = resolved.target_side,
+    target_line = resolved.target_line,
+    target_original_line = resolved.target_original_line,
+  })
+end
+
+function M.resolve_thread_fix_diff(payload, opts)
+  payload = type(payload) == "table" and payload or {}
+  opts = type(opts) == "table" and opts or {}
+
+  local number = tonumber(payload.pr_number) or tonumber(vim.b.gh_pr_number)
+  local pr, details, err = resolve_active_pr(number)
+  if not pr then
+    return {
+      ok = false,
+      error = err,
+    }
+  end
+
+  local resolved, resolve_err = M._thread_fix_helpers.resolve_target(pr, details, payload)
+  if not resolved then
+    return {
+      ok = false,
+      error = resolve_err,
+    }
+  end
+
+  resolved.pr = pr
+  resolved.details = details
+
+  if opts.inline ~= true then
+    return {
+      ok = true,
+      commit = resolved.commit,
+      file = resolved.file,
+      path = resolved.path,
+      target_side = resolved.target_side,
+      target_line = resolved.target_line,
+      target_original_line = resolved.target_original_line,
+    }
+  end
+
+  local patch = type(resolved.file.patch) == "string" and resolved.file.patch or ""
+  if patch == "" then
+    local fallback_enabled = opts.fallback_to_buffer ~= false
+    if fallback_enabled then
+      M._thread_fix_helpers.open_resolved_diff(resolved)
+    end
+    return {
+      ok = false,
+      error = "No textual patch available for latest commit file",
+      fallback_opened = fallback_enabled,
+      commit_oid = type(resolved.commit.oid) == "string" and resolved.commit.oid or "",
+      path = resolved.path,
+    }
+  end
+
+  local context_before = M._thread_fix_helpers.non_negative_integer(opts.context_before, 5)
+  local context_after = M._thread_fix_helpers.non_negative_integer(opts.context_after, 5)
+  if type(context_before) ~= "number" then
+    context_before = 5
+  end
+  if type(context_after) ~= "number" then
+    context_after = 5
+  end
+  context_before = math.min(context_before, 200)
+  context_after = math.min(context_after, 200)
+
+  local snippet_lines, snippet_err, snippet_entries = M._thread_fix_helpers.trim_patch_snippet(
+    patch,
+    resolved.target_side,
+    resolved.target_line,
+    resolved.target_original_line,
+    context_before,
+    context_after
+  )
+  if not snippet_lines or vim.tbl_isempty(snippet_lines) then
+    local fallback_enabled = opts.fallback_to_buffer ~= false
+    if fallback_enabled then
+      M._thread_fix_helpers.open_resolved_diff(resolved)
+    end
+    return {
+      ok = false,
+      error = snippet_err or "Unable to build thread fix diff snippet",
+      fallback_opened = fallback_enabled,
+      commit_oid = type(resolved.commit.oid) == "string" and resolved.commit.oid or "",
+      path = resolved.path,
+    }
+  end
+
+  return {
+    ok = true,
+    commit = resolved.commit,
+    file = resolved.file,
+    path = resolved.path,
+    target_side = resolved.target_side,
+    target_line = resolved.target_line,
+    target_original_line = resolved.target_original_line,
+    commit_oid = type(resolved.commit.oid) == "string" and resolved.commit.oid or "",
+    lines = snippet_lines,
+    diff_entries = type(snippet_entries) == "table" and snippet_entries or nil,
+  }
+end
+
+function M.open_thread_fix_diff(payload, opts)
+  opts = type(opts) == "table" and opts or {}
+  local result = M.resolve_thread_fix_diff(payload, opts)
+  if opts.inline == true then
+    return result
+  end
+
+  if type(result) ~= "table" or result.ok ~= true then
+    if type(result) == "table" and result.fallback_opened == true then
+      return result
+    end
+    notify_warn(type(result) == "table" and result.error or "Unable to resolve thread fix diff")
+    return result
+  end
+
+  M._thread_fix_helpers.open_resolved_diff(result)
+  return result
 end
 
 function M.open_diff(file, opts)
@@ -3834,6 +4845,18 @@ function M.open_diff(file, opts)
     notify_info("File is new in this PR. Opened single MODIFIED buffer (diff layouts disabled).")
   elseif type(diff_result) == "table" and diff_result.file_mode == "removed_single" then
     notify_info("File was removed in this PR. Opened single ORIGINAL buffer (diff layouts disabled).")
+  end
+
+  do
+    local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
+    if ok_panel and type(panel.sync_for_diff) == "function" then
+      pcall(panel.sync_for_diff, {
+        pr = pr,
+        details = details,
+        comments_ctx = comments_ctx,
+        pr_number = pr.number,
+      })
+    end
   end
 end
 
@@ -3928,6 +4951,18 @@ local function reopen_current_diff_with_preferences_impl(opts)
     return false, open_err
   end
 
+  do
+    local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
+    if ok_panel and type(panel.sync_for_diff) == "function" then
+      pcall(panel.sync_for_diff, {
+        pr = pr,
+        details = details,
+        comments_ctx = comments_ctx,
+        pr_number = pr.number,
+      })
+    end
+  end
+
   local active_win = vim.api.nvim_get_current_win()
   if is_valid_win(current_win) then
     pcall(vim.api.nvim_set_current_win, current_win)
@@ -4014,13 +5049,38 @@ function M.close_quick()
   end
 
   close_current_diff_view()
+  local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
+  if ok_panel and type(panel.close_current_tab) == "function" then
+    pcall(panel.close_current_tab)
+  end
   open_review_tree_after_close()
 end
 
 function M.close_all_and_open_review()
+  local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
+  if ok_panel and type(panel.close_current_tab) == "function" then
+    pcall(panel.close_current_tab, { respect_close_with_dq = true })
+  end
+
   local kind = vim.b.gh_pr_file_kind
   if kind ~= "base" and kind ~= "head" and kind ~= "unified" and kind ~= "patch" then
-    return notify_error("Current buffer is not a gh-pr diff buffer")
+    local current_tab = vim.api.nvim_get_current_tabpage()
+    for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(current_tab)) do
+      if valid_window(winid) then
+        local bufnr = vim.api.nvim_win_get_buf(winid)
+        local candidate_kind = vim.b[bufnr].gh_pr_file_kind
+        if candidate_kind == "base" or candidate_kind == "head" or candidate_kind == "unified" or candidate_kind == "patch" then
+          pcall(vim.api.nvim_set_current_win, winid)
+          kind = candidate_kind
+          break
+        end
+      end
+    end
+  end
+
+  if kind ~= "base" and kind ~= "head" and kind ~= "unified" and kind ~= "patch" then
+    open_review_tree_after_close()
+    return
   end
 
   local base_win, head_win = find_diff_pair_windows_for_current_file()
@@ -4488,6 +5548,29 @@ function M.toggle_review_tree()
   local ok, err = open_review_tree_from_plugin({ toggle = true })
   if not ok and err then
     notify_error(err)
+  end
+end
+
+function M.toggle_diff_comments_panel()
+  local kind = vim.b.gh_pr_file_kind
+  if kind ~= "base" and kind ~= "head" and kind ~= "unified" then
+    return notify_error("Current buffer is not a gh-pr diff buffer")
+  end
+
+  local pr, details, err = resolve_active_pr(vim.b.gh_pr_number, { refresh = false })
+  if not pr then
+    return notify_error(err)
+  end
+
+  local comments_ctx = build_line_comment_context(pr.number)
+  local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
+  if ok_panel and type(panel.toggle) == "function" then
+    pcall(panel.toggle, {
+      pr = pr,
+      details = details,
+      comments_ctx = comments_ctx,
+      pr_number = pr.number,
+    })
   end
 end
 
@@ -5731,6 +6814,7 @@ local function diff_shortcut_lines(bufnr)
   add_shortcut(lines, shortcuts.refresh, "Refresh current diff from GitHub")
   add_shortcut(lines, shortcuts.close_quick, "Quick close (or close head in 2-way diff)")
   add_shortcut(lines, shortcuts.close_all_open_review, "Close view(s) and open PR Review")
+  add_shortcut(lines, shortcuts.toggle_comments_panel, "Toggle diff comments panel")
 
   if not is_image then
     add_shortcut(lines, shortcuts.toggle_render_whitespace, "Toggle leading/trailing space/tab symbols")
@@ -5867,3 +6951,4 @@ function M.current_viewed_state()
 end
 
 return M
+

@@ -19,6 +19,17 @@ local function notify_info(message)
   vim.notify(message, vim.log.levels.INFO)
 end
 
+local function ensure_required_dependencies()
+  local ok = pcall(require, "render-markdown")
+  if ok then
+    return true
+  end
+
+  local message = "Missing required dependency: MeanderingProgrammer/render-markdown.nvim"
+  notify_error(message)
+  error("gh-pr: " .. message)
+end
+
 local function with_telescope(handler_name, opts)
   local ok, telescope = pcall(require, "gh-pr.telescope")
   if not ok then
@@ -429,6 +440,7 @@ local function delete_query()
 end
 
 function M.setup(opts)
+  ensure_required_dependencies()
   config.setup(opts or {})
   runtime_state.setup()
   queries.setup((opts or {}).queries ~= nil)
@@ -539,8 +551,16 @@ function M.open_overview()
   actions.open_overview()
 end
 
+function M.open_overview_v2()
+  actions.open_overview_v2()
+end
+
 function M.refresh_overview()
   actions.refresh_overview()
+end
+
+function M.refresh_overview_v2()
+  actions.refresh_overview_v2()
 end
 
 function M.overview_more(section, count)

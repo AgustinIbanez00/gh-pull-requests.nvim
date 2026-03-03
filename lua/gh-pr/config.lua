@@ -88,11 +88,15 @@ local defaults = {
     },
     markdown = {
       enabled = true,
-      provider = "auto",
+      mode = "full",
+      provider = "render-markdown",
       max_lines = 500,
       code_block_border = false,
       link_preview_keymap = "gp",
       link_preview_max_bytes = 10485760,
+      github_style = true,
+      github_style_separators = "rules",
+      diff_gutter = "none",
       link_preview_renderable_extensions = {
         "txt",
         "md",
@@ -108,11 +112,23 @@ local defaults = {
       },
       link_preview_open_local = "system",
     },
+    thread_snippet = {
+      context_before = 5,
+      context_after = 5,
+    },
+    thread_fix_diff = {
+      enabled = true,
+      show_action_line = true,
+      keymap = "gf",
+      inline = true,
+      context_before = 5,
+      context_after = 5,
+      fallback_to_buffer = true,
+    },
     tabs = {
       "summary",
       "checks",
       "commits",
-      "timeline",
       "files",
     },
     max_items = {
@@ -130,7 +146,60 @@ local defaults = {
       comments = true,
       reviews = true,
       threads = true,
+      pr_changes = true,
       labels = true,
+    },
+  },
+  overview_v2 = {
+    enabled = false,
+    date_format = "%Y-%m-%d %H:%M",
+    window = {
+      enabled = true,
+      border = "rounded",
+      width_ratio = 0.9,
+      height_ratio = 0.9,
+      min_width = 110,
+      min_height = 30,
+      max_width = 220,
+      max_height = 80,
+      backdrop = 0,
+      enter = true,
+    },
+    layout = {
+      sidebar_width_ratio = 0.34,
+      summary_height_ratio = 0.38,
+      gap = 1,
+      min_left_width = 58,
+      min_sidebar_width = 30,
+      min_summary_height = 10,
+      min_activity_height = 12,
+    },
+    activity = {
+      max_body_lines = 8,
+      max_events = 120,
+      show_code_context = true,
+    },
+    show = {
+      checks = true,
+      commits = true,
+      timeline = true,
+      comments = true,
+      reviews = true,
+      threads = true,
+      pr_changes = true,
+      labels = true,
+    },
+    keymaps = {
+      cycle_next = "<Tab>",
+      cycle_prev = "<S-Tab>",
+      focus_summary = "g1",
+      focus_activity = "g2",
+      focus_meta = "g3",
+      help = "?",
+      focus_left = "<C-h>",
+      focus_down = "<C-j>",
+      focus_up = "<C-k>",
+      focus_right = "<C-l>",
     },
   },
   cache = {
@@ -180,6 +249,17 @@ local defaults = {
       highlight_group = "GhPrDiffEndline",
     },
     shortcuts = vim.deepcopy(diff_shortcuts.defaults),
+    comments_panel = {
+      enabled = true,
+      auto_open = "if_comments",
+      height_ratio = 0.28,
+      min_height = 8,
+      max_height = 18,
+      follow_cursor = true,
+      show_resolved = true,
+      show_outdated = true,
+      close_with_dq = true,
+    },
     images = {
       enabled = true,
       backend = "snacks",
@@ -298,6 +378,19 @@ local function sanitize_positive_integer(value, default_value)
   return rounded
 end
 
+local function sanitize_non_negative_integer(value, default_value)
+  if type(value) ~= "number" then
+    return default_value
+  end
+
+  local rounded = math.floor(value)
+  if rounded < 0 then
+    return default_value
+  end
+
+  return rounded
+end
+
 local function sanitize_ratio(value, default_value)
   if type(value) ~= "number" then
     return default_value
@@ -322,16 +415,17 @@ local function sanitize_overview_tabs(tabs)
     summary = true,
     checks = true,
     commits = true,
-    timeline = true,
     comments = true,
     reviews = true,
     threads = true,
+    timeline = true,
     files = true,
   }
   local aliases = {
-    comments = "timeline",
-    reviews = "timeline",
-    threads = "timeline",
+    timeline = "summary",
+    comments = "summary",
+    reviews = "summary",
+    threads = "summary",
   }
 
   local source = type(tabs) == "table" and tabs or defaults.overview.tabs
@@ -452,13 +546,19 @@ local function sanitize_overview(overview)
   if type(result.markdown.enabled) ~= "boolean" then
     result.markdown.enabled = defaults.overview.markdown.enabled
   end
+  if type(result.markdown.mode) == "string" then
+    result.markdown.mode = result.markdown.mode:lower()
+  end
+  if result.markdown.mode ~= "full" and result.markdown.mode ~= "legacy" then
+    result.markdown.mode = defaults.overview.markdown.mode
+  end
   if type(result.markdown.provider) == "string" then
     result.markdown.provider = result.markdown.provider:lower()
   end
-  if result.markdown.provider ~= "auto"
-    and result.markdown.provider ~= "builtin"
-    and result.markdown.provider ~= "render-markdown"
-    and result.markdown.provider ~= "markview" then
+  if result.markdown.provider == "auto" or result.markdown.provider == "markview" then
+    result.markdown.provider = "render-markdown"
+  end
+  if result.markdown.provider ~= "builtin" and result.markdown.provider ~= "render-markdown" then
     result.markdown.provider = defaults.overview.markdown.provider
   end
   result.markdown.max_lines = sanitize_positive_integer(result.markdown.max_lines, defaults.overview.markdown.max_lines)
@@ -486,6 +586,71 @@ local function sanitize_overview(overview)
   if result.markdown.link_preview_open_local ~= "system" then
     result.markdown.link_preview_open_local = defaults.overview.markdown.link_preview_open_local
   end
+  if type(result.markdown.github_style) ~= "boolean" then
+    result.markdown.github_style = defaults.overview.markdown.github_style
+  end
+  if type(result.markdown.github_style_separators) == "string" then
+    result.markdown.github_style_separators = result.markdown.github_style_separators:lower()
+  end
+  if result.markdown.github_style_separators ~= "rules" then
+    result.markdown.github_style_separators = defaults.overview.markdown.github_style_separators
+  end
+  if type(result.markdown.diff_gutter) == "string" then
+    result.markdown.diff_gutter = result.markdown.diff_gutter:lower()
+  end
+  if result.markdown.diff_gutter ~= "old_new_code" and result.markdown.diff_gutter ~= "none" then
+    result.markdown.diff_gutter = defaults.overview.markdown.diff_gutter
+  end
+  if result.markdown.diff_gutter == "old_new_code" then
+    result.markdown.diff_gutter = "none"
+  end
+
+  result.thread_snippet = type(result.thread_snippet) == "table" and result.thread_snippet or {}
+  result.thread_snippet.context_before = sanitize_non_negative_integer(
+    result.thread_snippet.context_before,
+    defaults.overview.thread_snippet.context_before
+  )
+  result.thread_snippet.context_after = sanitize_non_negative_integer(
+    result.thread_snippet.context_after,
+    defaults.overview.thread_snippet.context_after
+  )
+  if result.thread_snippet.context_before > 200 then
+    result.thread_snippet.context_before = 200
+  end
+  if result.thread_snippet.context_after > 200 then
+    result.thread_snippet.context_after = 200
+  end
+
+  result.thread_fix_diff = type(result.thread_fix_diff) == "table" and result.thread_fix_diff or {}
+  if type(result.thread_fix_diff.enabled) ~= "boolean" then
+    result.thread_fix_diff.enabled = defaults.overview.thread_fix_diff.enabled
+  end
+  if type(result.thread_fix_diff.show_action_line) ~= "boolean" then
+    result.thread_fix_diff.show_action_line = defaults.overview.thread_fix_diff.show_action_line
+  end
+  if type(result.thread_fix_diff.keymap) ~= "string" then
+    result.thread_fix_diff.keymap = defaults.overview.thread_fix_diff.keymap
+  end
+  if type(result.thread_fix_diff.inline) ~= "boolean" then
+    result.thread_fix_diff.inline = defaults.overview.thread_fix_diff.inline
+  end
+  result.thread_fix_diff.context_before = sanitize_non_negative_integer(
+    result.thread_fix_diff.context_before,
+    defaults.overview.thread_fix_diff.context_before
+  )
+  result.thread_fix_diff.context_after = sanitize_non_negative_integer(
+    result.thread_fix_diff.context_after,
+    defaults.overview.thread_fix_diff.context_after
+  )
+  if result.thread_fix_diff.context_before > 200 then
+    result.thread_fix_diff.context_before = 200
+  end
+  if result.thread_fix_diff.context_after > 200 then
+    result.thread_fix_diff.context_after = 200
+  end
+  if type(result.thread_fix_diff.fallback_to_buffer) ~= "boolean" then
+    result.thread_fix_diff.fallback_to_buffer = defaults.overview.thread_fix_diff.fallback_to_buffer
+  end
 
   result.tabs = sanitize_overview_tabs(result.tabs)
   result.expand_step = sanitize_positive_integer(result.expand_step, defaults.overview.expand_step)
@@ -499,13 +664,178 @@ local function sanitize_overview(overview)
   result.max_items.threads = result.max_items.timeline
 
   result.show = type(result.show) == "table" and result.show or {}
-  result.show.checks = type(result.show.checks) == "boolean" and result.show.checks or defaults.overview.show.checks
-  result.show.commits = type(result.show.commits) == "boolean" and result.show.commits or defaults.overview.show.commits
-  result.show.timeline = type(result.show.timeline) == "boolean" and result.show.timeline or defaults.overview.show.timeline
-  result.show.comments = type(result.show.comments) == "boolean" and result.show.comments or defaults.overview.show.comments
-  result.show.reviews = type(result.show.reviews) == "boolean" and result.show.reviews or defaults.overview.show.reviews
-  result.show.threads = type(result.show.threads) == "boolean" and result.show.threads or defaults.overview.show.threads
-  result.show.labels = type(result.show.labels) == "boolean" and result.show.labels or defaults.overview.show.labels
+  if type(result.show.checks) ~= "boolean" then
+    result.show.checks = defaults.overview.show.checks
+  end
+  if type(result.show.commits) ~= "boolean" then
+    result.show.commits = defaults.overview.show.commits
+  end
+  if type(result.show.timeline) ~= "boolean" then
+    result.show.timeline = defaults.overview.show.timeline
+  end
+  if type(result.show.comments) ~= "boolean" then
+    result.show.comments = defaults.overview.show.comments
+  end
+  if type(result.show.reviews) ~= "boolean" then
+    result.show.reviews = defaults.overview.show.reviews
+  end
+  if type(result.show.threads) ~= "boolean" then
+    result.show.threads = defaults.overview.show.threads
+  end
+  if type(result.show.pr_changes) ~= "boolean" then
+    result.show.pr_changes = defaults.overview.show.pr_changes
+  end
+  if type(result.show.labels) ~= "boolean" then
+    result.show.labels = defaults.overview.show.labels
+  end
+
+  return result
+end
+
+local function sanitize_overview_v2(overview_v2)
+  if type(overview_v2) ~= "table" then
+    return vim.deepcopy(defaults.overview_v2)
+  end
+
+  local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.overview_v2), overview_v2)
+
+  if type(result.enabled) ~= "boolean" then
+    result.enabled = defaults.overview_v2.enabled
+  end
+
+  if type(result.date_format) ~= "string" or result.date_format == "" then
+    result.date_format = defaults.overview_v2.date_format
+  end
+
+  result.window = type(result.window) == "table" and result.window or {}
+  if type(result.window.enabled) ~= "boolean" then
+    result.window.enabled = defaults.overview_v2.window.enabled
+  end
+  if result.window.border ~= "rounded"
+    and result.window.border ~= "single"
+    and result.window.border ~= "double"
+    and result.window.border ~= "solid"
+    and result.window.border ~= "shadow"
+    and result.window.border ~= "none" then
+    result.window.border = defaults.overview_v2.window.border
+  end
+  result.window.width_ratio = sanitize_ratio(result.window.width_ratio, defaults.overview_v2.window.width_ratio)
+  result.window.height_ratio = sanitize_ratio(result.window.height_ratio, defaults.overview_v2.window.height_ratio)
+  result.window.min_width = sanitize_positive_integer(result.window.min_width, defaults.overview_v2.window.min_width)
+  result.window.min_height = sanitize_positive_integer(result.window.min_height, defaults.overview_v2.window.min_height)
+  result.window.max_width = sanitize_positive_integer(result.window.max_width, defaults.overview_v2.window.max_width)
+  result.window.max_height = sanitize_positive_integer(result.window.max_height, defaults.overview_v2.window.max_height)
+  if result.window.max_width < result.window.min_width then
+    result.window.max_width = result.window.min_width
+  end
+  if result.window.max_height < result.window.min_height then
+    result.window.max_height = result.window.min_height
+  end
+  if type(result.window.backdrop) == "number" then
+    result.window.backdrop = math.max(0, math.min(100, math.floor(result.window.backdrop)))
+  elseif result.window.backdrop ~= false then
+    result.window.backdrop = defaults.overview_v2.window.backdrop
+  end
+  if type(result.window.enter) ~= "boolean" then
+    result.window.enter = defaults.overview_v2.window.enter
+  end
+
+  result.layout = type(result.layout) == "table" and result.layout or {}
+  local sidebar_ratio = tonumber(result.layout.sidebar_width_ratio)
+  if type(sidebar_ratio) ~= "number" or sidebar_ratio < 0.2 or sidebar_ratio > 0.6 then
+    sidebar_ratio = defaults.overview_v2.layout.sidebar_width_ratio
+  end
+  result.layout.sidebar_width_ratio = sidebar_ratio
+  local summary_ratio = tonumber(result.layout.summary_height_ratio)
+  if type(summary_ratio) ~= "number" or summary_ratio < 0.2 or summary_ratio > 0.8 then
+    summary_ratio = defaults.overview_v2.layout.summary_height_ratio
+  end
+  result.layout.summary_height_ratio = summary_ratio
+  result.layout.gap = sanitize_non_negative_integer(result.layout.gap, defaults.overview_v2.layout.gap)
+  if result.layout.gap > 3 then
+    result.layout.gap = defaults.overview_v2.layout.gap
+  end
+  result.layout.min_left_width = sanitize_positive_integer(result.layout.min_left_width, defaults.overview_v2.layout.min_left_width)
+  result.layout.min_sidebar_width = sanitize_positive_integer(
+    result.layout.min_sidebar_width,
+    defaults.overview_v2.layout.min_sidebar_width
+  )
+  result.layout.min_summary_height = sanitize_positive_integer(
+    result.layout.min_summary_height,
+    defaults.overview_v2.layout.min_summary_height
+  )
+  result.layout.min_activity_height = sanitize_positive_integer(
+    result.layout.min_activity_height,
+    defaults.overview_v2.layout.min_activity_height
+  )
+
+  result.activity = type(result.activity) == "table" and result.activity or {}
+  result.activity.max_body_lines = sanitize_positive_integer(
+    result.activity.max_body_lines,
+    defaults.overview_v2.activity.max_body_lines
+  )
+  result.activity.max_events = sanitize_positive_integer(result.activity.max_events, defaults.overview_v2.activity.max_events)
+  if type(result.activity.show_code_context) ~= "boolean" then
+    result.activity.show_code_context = defaults.overview_v2.activity.show_code_context
+  end
+
+  result.show = type(result.show) == "table" and result.show or {}
+  if type(result.show.checks) ~= "boolean" then
+    result.show.checks = defaults.overview_v2.show.checks
+  end
+  if type(result.show.commits) ~= "boolean" then
+    result.show.commits = defaults.overview_v2.show.commits
+  end
+  if type(result.show.timeline) ~= "boolean" then
+    result.show.timeline = defaults.overview_v2.show.timeline
+  end
+  if type(result.show.comments) ~= "boolean" then
+    result.show.comments = defaults.overview_v2.show.comments
+  end
+  if type(result.show.reviews) ~= "boolean" then
+    result.show.reviews = defaults.overview_v2.show.reviews
+  end
+  if type(result.show.threads) ~= "boolean" then
+    result.show.threads = defaults.overview_v2.show.threads
+  end
+  if type(result.show.pr_changes) ~= "boolean" then
+    result.show.pr_changes = defaults.overview_v2.show.pr_changes
+  end
+  if type(result.show.labels) ~= "boolean" then
+    result.show.labels = defaults.overview_v2.show.labels
+  end
+
+  result.keymaps = type(result.keymaps) == "table" and result.keymaps or {}
+  if type(result.keymaps.cycle_next) ~= "string" then
+    result.keymaps.cycle_next = defaults.overview_v2.keymaps.cycle_next
+  end
+  if type(result.keymaps.cycle_prev) ~= "string" then
+    result.keymaps.cycle_prev = defaults.overview_v2.keymaps.cycle_prev
+  end
+  if type(result.keymaps.focus_summary) ~= "string" then
+    result.keymaps.focus_summary = defaults.overview_v2.keymaps.focus_summary
+  end
+  if type(result.keymaps.focus_activity) ~= "string" then
+    result.keymaps.focus_activity = defaults.overview_v2.keymaps.focus_activity
+  end
+  if type(result.keymaps.focus_meta) ~= "string" then
+    result.keymaps.focus_meta = defaults.overview_v2.keymaps.focus_meta
+  end
+  if type(result.keymaps.help) ~= "string" then
+    result.keymaps.help = defaults.overview_v2.keymaps.help
+  end
+  if type(result.keymaps.focus_left) ~= "string" then
+    result.keymaps.focus_left = defaults.overview_v2.keymaps.focus_left
+  end
+  if type(result.keymaps.focus_down) ~= "string" then
+    result.keymaps.focus_down = defaults.overview_v2.keymaps.focus_down
+  end
+  if type(result.keymaps.focus_up) ~= "string" then
+    result.keymaps.focus_up = defaults.overview_v2.keymaps.focus_up
+  end
+  if type(result.keymaps.focus_right) ~= "string" then
+    result.keymaps.focus_right = defaults.overview_v2.keymaps.focus_right
+  end
 
   return result
 end
@@ -852,6 +1182,55 @@ local function sanitize_diff_view(diff_view)
 
   result.shortcuts = diff_shortcuts.resolve(result.shortcuts)
 
+  result.comments_panel = type(result.comments_panel) == "table" and result.comments_panel or {}
+  if type(result.comments_panel.enabled) ~= "boolean" then
+    result.comments_panel.enabled = defaults.diff_view.comments_panel.enabled
+  end
+  if result.comments_panel.auto_open ~= "never"
+    and result.comments_panel.auto_open ~= "if_comments"
+    and result.comments_panel.auto_open ~= "always" then
+    result.comments_panel.auto_open = defaults.diff_view.comments_panel.auto_open
+  end
+
+  local comments_panel_height_ratio = tonumber(result.comments_panel.height_ratio)
+  if type(comments_panel_height_ratio) ~= "number" or comments_panel_height_ratio < 0.10 or comments_panel_height_ratio > 0.80 then
+    comments_panel_height_ratio = defaults.diff_view.comments_panel.height_ratio
+  end
+  result.comments_panel.height_ratio = comments_panel_height_ratio
+
+  local comments_panel_min_height = tonumber(result.comments_panel.min_height)
+  if type(comments_panel_min_height) ~= "number" then
+    comments_panel_min_height = defaults.diff_view.comments_panel.min_height
+  end
+  comments_panel_min_height = math.floor(comments_panel_min_height)
+  if comments_panel_min_height < 3 then
+    comments_panel_min_height = defaults.diff_view.comments_panel.min_height
+  end
+  result.comments_panel.min_height = comments_panel_min_height
+
+  local comments_panel_max_height = tonumber(result.comments_panel.max_height)
+  if type(comments_panel_max_height) ~= "number" then
+    comments_panel_max_height = defaults.diff_view.comments_panel.max_height
+  end
+  comments_panel_max_height = math.floor(comments_panel_max_height)
+  if comments_panel_max_height < comments_panel_min_height then
+    comments_panel_max_height = math.max(comments_panel_min_height, defaults.diff_view.comments_panel.max_height)
+  end
+  result.comments_panel.max_height = comments_panel_max_height
+
+  if type(result.comments_panel.follow_cursor) ~= "boolean" then
+    result.comments_panel.follow_cursor = defaults.diff_view.comments_panel.follow_cursor
+  end
+  if type(result.comments_panel.show_resolved) ~= "boolean" then
+    result.comments_panel.show_resolved = defaults.diff_view.comments_panel.show_resolved
+  end
+  if type(result.comments_panel.show_outdated) ~= "boolean" then
+    result.comments_panel.show_outdated = defaults.diff_view.comments_panel.show_outdated
+  end
+  if type(result.comments_panel.close_with_dq) ~= "boolean" then
+    result.comments_panel.close_with_dq = defaults.diff_view.comments_panel.close_with_dq
+  end
+
   result.images = type(result.images) == "table" and result.images or {}
   if type(result.images.enabled) ~= "boolean" then
     result.images.enabled = defaults.diff_view.images.enabled
@@ -984,6 +1363,7 @@ function M.setup(opts)
 
   state.line_comments = sanitize_line_comments(state.line_comments)
   state.overview = sanitize_overview(state.overview)
+  state.overview_v2 = sanitize_overview_v2(state.overview_v2)
   state.cache = sanitize_cache(state.cache)
   state.follow_current_file = sanitize_follow_current_file(state.follow_current_file)
   state.diff_view = sanitize_diff_view(state.diff_view)

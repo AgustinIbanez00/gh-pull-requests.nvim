@@ -22,6 +22,8 @@ local TIMELINE_HIGHLIGHT = {
   comment = "GhPrOverviewTimelineComment",
   review = "GhPrOverviewTimelineReview",
   thread_comment = "GhPrOverviewTimelineThread",
+  commit = "GhPrOverviewTimelineCommit",
+  pr_change = "GhPrOverviewTimelinePrChange",
 }
 
 local function normalize_hex_color(value)
@@ -97,6 +99,8 @@ function M.ensure_base_highlights()
   vim.api.nvim_set_hl(0, "GhPrOverviewTimelineComment", { default = true, link = "DiagnosticInfo" })
   vim.api.nvim_set_hl(0, "GhPrOverviewTimelineReview", { default = true, link = "DiagnosticWarn" })
   vim.api.nvim_set_hl(0, "GhPrOverviewTimelineThread", { default = true, link = "Identifier" })
+  vim.api.nvim_set_hl(0, "GhPrOverviewTimelineCommit", { default = true, link = "Special" })
+  vim.api.nvim_set_hl(0, "GhPrOverviewTimelinePrChange", { default = true, link = "Type" })
   vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownHeading", { default = true, link = "Title" })
   vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownCode", { default = true, link = "String" })
   vim.api.nvim_set_hl(0, "GhPrOverviewMarkdownCodeFence", { default = true, link = "SpecialComment" })

@@ -3,6 +3,7 @@ local utils = require("gh-pr.overview_utils")
 local M = {}
 
 local warned = {}
+local module_cache = {}
 
 local function warn_once(key, message)
   if warned[key] then
@@ -188,6 +189,48 @@ local function render_plain(text, opts)
   return trim_to_max_lines(payload, opts.max_lines)
 end
 
+local function collect_raw_links(payload)
+  for line_number, text in ipairs(payload.lines or {}) do
+    local source = type(text) == "string" and text or ""
+    local cursor = 1
+    while cursor <= #source do
+      local start_idx, end_idx, label, url = source:find("%[([^%]]+)%]%(([^%)]+)%)", cursor)
+      if not start_idx then
+        break
+      end
+
+      local cleaned_url = type(url) == "string" and vim.trim(url) or ""
+      if cleaned_url ~= "" then
+        payload.links[#payload.links + 1] = {
+          line = line_number,
+          start_col = start_idx - 1,
+          end_col = end_idx,
+          label = type(label) == "string" and label or cleaned_url,
+          url = cleaned_url,
+        }
+      end
+
+      cursor = end_idx + 1
+    end
+  end
+end
+
+local function render_full_markdown(text, opts)
+  local payload = {
+    lines = utils.split_lines(text),
+    highlights = {},
+    links = {},
+  }
+
+  if vim.tbl_isempty(payload.lines) then
+    payload.lines = { "(no pull request description)" }
+  end
+
+  payload = trim_to_max_lines(payload, opts.max_lines)
+  collect_raw_links(payload)
+  return payload
+end
+
 local function render_builtin(text, opts)
   local payload = {
     lines = {},
@@ -290,64 +333,54 @@ local function render_builtin(text, opts)
 end
 
 local function module_available(module_name)
+  if module_cache[module_name] ~= nil then
+    return module_cache[module_name] == true
+  end
+
   local ok = pcall(require, module_name)
-  return ok
+  module_cache[module_name] = ok == true
+  return ok == true
 end
 
 local function resolve_provider(opts)
-  local requested = utils.safe_string(opts.provider, "auto"):lower()
+  local requested = utils.safe_string(opts.provider, "render-markdown"):lower()
 
   if requested == "builtin" then
     return "builtin"
   end
 
-  if requested == "render-markdown" then
-    if module_available("render-markdown") then
-      warn_once(
-        "overview-md-render-markdown-adapter",
-        "gh-pr: render-markdown.nvim detected, using builtin inline renderer (adapter pending)."
-      )
-      return "builtin"
-    end
-    warn_once(
-      "overview-md-render-markdown-missing",
-      "gh-pr: overview.markdown.provider=render-markdown but plugin is not installed; falling back to builtin."
-    )
-    return "builtin"
-  end
-
-  if requested == "markview" then
-    if module_available("markview") then
-      warn_once(
-        "overview-md-markview-adapter",
-        "gh-pr: markview.nvim detected, using builtin inline renderer (adapter pending)."
-      )
-      return "builtin"
-    end
-    warn_once(
-      "overview-md-markview-missing",
-      "gh-pr: overview.markdown.provider=markview but plugin is not installed; falling back to builtin."
-    )
-    return "builtin"
-  end
-
   if module_available("render-markdown") then
-    warn_once(
-      "overview-md-auto-render-markdown-adapter",
-      "gh-pr: render-markdown.nvim detected, using builtin inline renderer (adapter pending)."
-    )
-    return "builtin"
+    return "render-markdown"
   end
 
-  if module_available("markview") then
-    warn_once(
-      "overview-md-auto-markview-adapter",
-      "gh-pr: markview.nvim detected, using builtin inline renderer (adapter pending)."
-    )
-    return "builtin"
-  end
+  warn_once(
+    "overview-md-render-markdown-missing",
+    "gh-pr: missing required dependency render-markdown.nvim; falling back to builtin markdown renderer."
+  )
 
   return "builtin"
+end
+
+function M.resolve_provider(options)
+  local opts = utils.sanitize_markdown_opts(options)
+  return resolve_provider(opts)
+end
+
+local function render_external_provider(text, opts, provider)
+  local ok, payload = pcall(render_full_markdown, text, opts)
+  if not ok or type(payload) ~= "table" then
+    warn_once(
+      "overview-md-external-provider-fallback",
+      string.format("gh-pr: %s renderer failed; falling back to builtin.", provider)
+    )
+    local fallback = render_builtin(text, opts)
+    fallback.provider = "builtin"
+    return fallback
+  end
+
+  payload.provider = provider
+  payload.markdown_block = true
+  return payload
 end
 
 function M.render(text, options)
@@ -366,7 +399,7 @@ function M.render(text, options)
         },
       },
       links = {},
-      provider = "builtin",
+      provider = opts.mode == "full" and "full" or "builtin",
     }
   end
 
@@ -377,10 +410,20 @@ function M.render(text, options)
     return plain
   end
 
+  if opts.mode == "full" then
+    local payload = render_full_markdown(markdown, opts)
+    payload.provider = "full"
+    return payload
+  end
+
   local provider = resolve_provider(opts)
-  local payload = render_builtin(markdown, opts)
-  payload.provider = provider
-  return payload
+  if provider == "render-markdown" then
+    return render_external_provider(markdown, opts, provider)
+  end
+
+  local builtin_payload = render_builtin(markdown, opts)
+  builtin_payload.provider = "builtin"
+  return builtin_payload
 end
 
 return M
