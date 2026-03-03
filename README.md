@@ -1,34 +1,77 @@
 # gh-pull-requests.nvim
 
-A Neovim plugin that brings a GitHub Pull Requests workflow (similar to VSCode) to Neovim, using `gh` CLI as backend.
+A GitHub Pull Request workflow for Neovim (VSCode-like), powered by the GitHub CLI (`gh`).
+
+[![Neovim](https://img.shields.io/badge/Neovim-0.9%2B-57A143?logo=neovim&logoColor=white)](#requirements)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Release](https://img.shields.io/github/v/release/agustinibanez/gh-pull-requests.nvim)](https://github.com/agustinibanez/gh-pull-requests.nvim/releases)
+[![Last Commit](https://img.shields.io/github/last-commit/agustinibanez/gh-pull-requests.nvim)](https://github.com/agustinibanez/gh-pull-requests.nvim/commits/main)
+[![Stars](https://img.shields.io/github/stars/agustinibanez/gh-pull-requests.nvim?style=social)](https://github.com/agustinibanez/gh-pull-requests.nvim/stargazers)
+[![Validation](https://img.shields.io/badge/Validation-scripts%2Fvalidate.ps1-blue)](#validation)
+
+Quick links: [Installation](#installation) · [Quick Start](#quick-start) · [Commands](#commands) · [Keymaps](#keymaps) · [Query Placeholders](#query-placeholders)
+
+## Table of Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Validation](#validation)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Query Placeholders](#query-placeholders)
+- [Commands](#commands)
+- [Keymaps](#keymaps)
+- [Troubleshooting](#troubleshooting)
+- [Consolidated architecture](#consolidated-architecture)
+- [Migration notes (legacy overview path removal)](#migration-notes-legacy-overview-path-removal)
+- [Neo-tree source](#neo-tree-source)
+- [Highlights](#highlights)
+- [Notes](#notes)
 
 ## Features
 
+### 📂 PR Discovery
+
 - Query-based PR lists grouped by folders.
-- Neo-tree source (`gh_pr`) as primary UI.
-- Telescope fallback picker.
+- Neo-tree source (`gh_pr`) as primary UI, with Telescope fallback.
+- Query expansion with placeholders (`${user}`, `${owner}`, `${repository}`, `@org`).
+
+### 🧠 Review Workspace
+
+- Dedicated review workspace source (`gh_pr_review`) with sections: Overview, Labels, Files, Reviewers, Commits, Checks, Comments.
+- Start review flow from PR nodes (`r`) with optional GitHub pending-review creation.
+- Review actions: approve, request changes, comment, merge (`merge/squash/rebase`).
+
+### 📝 Overview + Activity
+
+- Multi-pane overview (Summary + Activity + Collaboration).
+- Summary embeds a chronological activity stream (comments, reviews, commits, thread comments, PR state changes).
+- Open commit diffs from overview without checkout (virtual patch buffers).
+
+### 🧩 Diff + File UX
+
+- Virtual readonly buffers for base/head versions and commit-scoped diffs.
+- Configurable diff layouts (`vertical` / `horizontal` / `unified`).
+- Whitespace/endline toggles and optional image preview with fallback actions.
+- Line-comment indicators and thread popups in virtual PR buffers.
+
+### ⚙️ Reliability + State
+
+- Viewed/unviewed state persisted in `stdpath("state")`.
+- Cache persisted per source/repo key.
+- Headless smoke + helptags validation script (`scripts/validate.ps1`).
+
+<details>
+<summary>More feature details</summary>
+
 - Pull request overview interactive tabs UI (Snacks-based) with inline markdown rendering in PR description, link label rendering, and link preview support.
-- Multi-pane overview layout (Summary + Activity + Collaboration) in independent, scrollable buffers.
-- Summary tab now embeds Activity below PR description, merging comments, reviews, review-thread comments, commits, and PR change events in chronological order.
 - Open commit diffs directly from Overview > Commits (virtual patch buffers, no checkout).
 - PR Review > Commits supports per-commit file browsing and opens commit-scoped diffs (`parent[1] -> commit`).
-- Virtual readonly file buffers for base/head versions (no disk writes).
-- Configurable diff rendering for changed files: vertical split, horizontal split, or unified inline.
-- Toggle whitespace-sensitive vs whitespace-ignored diff rendering in file buffers.
-- Image file preview in PR diffs (`png/jpg/jpeg/gif/webp/bmp/svg`) with configurable fallback actions (local open, GitHub compare URL, metadata diff text).
 - Configurable path rendering in `Files` and `Comments` trees (`compact`, `tree`, `flat`).
-- Line comment indicators in PR file buffers (signcolumn + virtual text).
-- Floating modal popup with PR line comments on a configurable keymap in virtual PR buffers.
-- Dedicated review workspace source (`gh_pr_review`) with sections: Overview, Labels, Files, Reviewers, Commits, Checks, Comments.
-- Start review flow from PR source (`r`) with optional GitHub pending review creation ("started a review").
 - Comments view migrated into PR Review > Comments (Problems-like navigation and preview preserved).
-- PR checkout (`gh pr checkout`).
-- Review actions:
-  - approve
-  - request changes
-  - general comment
-  - merge (merge/squash/rebase)
-- Local viewed/unviewed file state persisted in `stdpath("state")`.
+- PR checkout via `gh pr checkout`.
+
+</details>
 
 ## Requirements
 
@@ -382,6 +425,53 @@ Validation prerequisites:
 }
 ```
 
+## Quick Start
+
+1. Authenticate once with GitHub CLI:
+
+```bash
+gh auth login
+```
+
+2. Open any local Git repository in Neovim.
+3. Run:
+
+```vim
+:GhPrOpen
+```
+
+Tip: if you prefer explicit review flow from a selected PR, use `:GhPrStartReview`.
+
+## Query placeholders
+
+`queries[*].query` supports runtime placeholders:
+
+| Placeholder | Resolves to | Example |
+| --- | --- | --- |
+| `${user}` | Current authenticated GitHub login | `is:open author:${user}` |
+| `${owner}` | Owner of the repository resolved from configured remotes | `is:open repo:${owner}/my-repo` |
+| `${repository}` | Repository name resolved from configured remotes | `is:open repo:my-org/${repository}` |
+| `@org` | Alias for current repository owner | `is:open org:@org review-requested:@me` |
+
+Scope behavior:
+
+- If query contains neither `repo:` nor `org:`, gh-pr appends `repo:<owner>/<repo>`.
+- If query already contains `repo:` or `org:`, gh-pr does not append `repo:`.
+
+Examples:
+
+- `is:open review-requested:@me org:@org`
+- `is:open author:${user} org:@org`
+
+## Troubleshooting
+
+| Symptom | Check | Fix |
+| --- | --- | --- |
+| No PRs are shown | Are you in a git repo? | Open a repository and run `:GhPrOpen` again. |
+| `gh` errors / auth failures | `gh auth status` | Run `gh auth login` and retry. |
+| Neo-tree source not opening | Neo-tree installed and configured? | Use fallback `:GhPrTelescope` or install/enable Neo-tree dependency. |
+| Docs/commands seem out of sync | Health + validation | Run `:checkhealth gh-pr` and `pwsh -File scripts/validate.ps1`. |
+
 ## Consolidated architecture
 
 - Lazy entrypoint: `plugin/gh-pr.lua` (commands + `<Plug>` wiring only).
@@ -414,6 +504,23 @@ Compatibility aliases kept for user-facing behavior:
 - `require("gh-pr").open_overview_v2()` and `require("gh-pr").refresh_overview_v2()` still dispatch to canonical overview actions.
 
 ## Commands
+
+| Command | Description | Typical use |
+| --- | --- | --- |
+| `:GhPrOpen` | Open PR UI (Neo-tree first, Telescope fallback) | Start a PR browsing session |
+| `:GhPrStartReview [number]` | Start review flow for selected PR | Enter review workspace quickly |
+| `:GhPrReviewTree` | Toggle PR Review source | Jump between list and review tree |
+| `:GhPrOverview` | Open active PR overview panes | Inspect summary/activity/collaboration |
+| `:GhPrOpenDiff` | Open selected file in virtual base/head diff | Review code changes |
+| `:GhPrOpenCommitPatch` | Open selected commit patch in virtual buffer | Inspect commit-level patch |
+| `:GhPrToggleReviewed` | Toggle local viewed state | Track reviewed files |
+| `:GhPrRefresh` | Refresh data | Sync UI with latest PR state |
+| `:GhPRReviewRefresh` / `:GhPrReviewRefresh` | Force background refresh of active PR Review | Refresh stale review tree |
+| `:GhPrMerge [merge|squash|rebase]` | Merge active PR | Complete review flow |
+| `:GhPrQueryAdd` / `:GhPrQueryEdit` / `:GhPrQueryDelete` | Manage saved PR queries | Customize PR inbox filters |
+
+<details>
+<summary>Full command reference</summary>
 
 - `:GhPrOpen` open PR UI (Neo-tree first, Telescope fallback).
 - `:GhPrList` open Telescope query/PR picker.
@@ -450,37 +557,34 @@ Compatibility aliases kept for user-facing behavior:
 - `:GhPrQueryEdit` edit query.
 - `:GhPrQueryDelete` delete query.
 
+</details>
+
 ## Keymaps
 
 Top-level mappings are exposed through `<Plug>` and global `<leader>` mappings are disabled by default.
 
-`<Plug>` mappings:
+### `<Plug>` mapping API
 
-- `<Plug>(gh-pr-open)` open PR UI.
-- `<Plug>(gh-pr-list)` open Telescope list.
-- `<Plug>(gh-pr-comments)` open PR comments tree.
-- `<Plug>(gh-pr-start-review)` start PR review flow.
-- `<Plug>(gh-pr-review-tree)` toggle PR Review source.
-- `<Plug>(gh-pr-refresh)` refresh PR data.
-- `<Plug>(gh-pr-review-refresh)` force refresh PR Review data.
-- `<Plug>(gh-pr-overview)` open PR overview.
-- `<Plug>(gh-pr-overview-refresh)` refresh PR overview.
-- `<Plug>(gh-pr-checkout)` checkout PR branch.
-- `<Plug>(gh-pr-open-diff)` open PR file diff.
-- `<Plug>(gh-pr-open-original)` open PR file base version.
-- `<Plug>(gh-pr-open-modified)` open PR file head version.
-- `<Plug>(gh-pr-open-commit-patch)` open selected commit patch.
-- `<Plug>(gh-pr-toggle-reviewed)` toggle viewed state.
-- `<Plug>(gh-pr-next-change)` jump to next diff hunk.
-- `<Plug>(gh-pr-prev-change)` jump to previous diff hunk.
-- `<Plug>(gh-pr-approve)` approve active PR.
-- `<Plug>(gh-pr-request-changes)` request changes on active PR.
-- `<Plug>(gh-pr-comment)` submit PR comment review.
-- `<Plug>(gh-pr-review-submit)` submit pending review as comment.
-- `<Plug>(gh-pr-review-approve)` submit pending review as approve.
-- `<Plug>(gh-pr-review-request-changes)` submit pending review as request changes.
-- `<Plug>(gh-pr-review-discard)` discard pending review.
-- `<Plug>(gh-pr-merge)` merge active PR.
+| Mapping | Action |
+| --- | --- |
+| `<Plug>(gh-pr-open)` | Open PR UI |
+| `<Plug>(gh-pr-list)` | Open Telescope PR list |
+| `<Plug>(gh-pr-comments)` | Open PR comments tree |
+| `<Plug>(gh-pr-start-review)` | Start PR review flow |
+| `<Plug>(gh-pr-review-tree)` | Toggle PR Review source |
+| `<Plug>(gh-pr-refresh)` | Refresh PR data |
+| `<Plug>(gh-pr-review-refresh)` | Force refresh PR Review data |
+| `<Plug>(gh-pr-overview)` | Open PR overview |
+| `<Plug>(gh-pr-overview-refresh)` | Refresh PR overview |
+| `<Plug>(gh-pr-checkout)` | Checkout PR branch |
+| `<Plug>(gh-pr-open-diff)` | Open PR file diff |
+| `<Plug>(gh-pr-open-original)` / `<Plug>(gh-pr-open-modified)` | Open base/head version |
+| `<Plug>(gh-pr-open-commit-patch)` | Open selected commit patch |
+| `<Plug>(gh-pr-toggle-reviewed)` | Toggle viewed state |
+| `<Plug>(gh-pr-next-change)` / `<Plug>(gh-pr-prev-change)` | Jump diff hunks |
+| `<Plug>(gh-pr-approve)` / `<Plug>(gh-pr-request-changes)` / `<Plug>(gh-pr-comment)` | Review decisions |
+| `<Plug>(gh-pr-review-submit)` / `<Plug>(gh-pr-review-approve)` / `<Plug>(gh-pr-review-request-changes)` / `<Plug>(gh-pr-review-discard)` | Pending review workflow |
+| `<Plug>(gh-pr-merge)` | Merge active PR |
 
 Example user mappings:
 
@@ -500,6 +604,48 @@ require("gh-pr").setup({
   },
 })
 ```
+
+### Shortcut tables (at a glance)
+
+#### Neo-tree `gh_pr` source
+
+| Key | Action |
+| --- | --- |
+| `r` | Start review flow for selected PR |
+| `ra` / `rc` / `rr` / `rd` | Approve / comment / request changes / discard |
+| `m` | Open merge flow |
+| `b` | Open selected PR in browser |
+| `k` | Checkout selected PR |
+
+#### Overview buffer
+
+| Key | Action |
+| --- | --- |
+| `a` / `d` / `c` / `m` / `k` / `b` | Review + merge + checkout + browser actions |
+| `R` | Refresh overview |
+| `gp` | Preview markdown link |
+| `gf` | Toggle thread fix diff |
+| `gr` | Load more activity |
+| `D` / `O` / `M` | Open diff / original / modified |
+| `et` / `eb` / `el` / `er` / `ea` / `em` / `es` / `ed` | Edit PR metadata |
+
+#### Diff buffer (`<localleader>` namespace)
+
+| Key | Action |
+| --- | --- |
+| `<localleader>dr` | Refresh current diff buffer |
+| `<localleader>dq` / `<localleader>dQ` | Quick close / close and open review |
+| `<localleader>dn` / `<localleader>dp` | Next / previous diff change |
+| `<localleader>df` / `<localleader>dF` | Next / previous file |
+| `<localleader>dv` / `<localleader>dV` | Next / previous reviewed file |
+| `<localleader>ic` / `<localleader>is` | Inline comment / inline suggestion |
+| `<localleader>tw` / `<localleader>ts` / `<localleader>te` | Whitespace + symbol toggles |
+| `<localleader>mm` / `<localleader>mv` / `<localleader>mh` / `<localleader>mu` | Diff mode controls |
+| `<localleader>ra` / `<localleader>rc` / `<localleader>rr` / `<localleader>rd` | Pending review actions |
+| `<localleader>rx` | Toggle PR Review source |
+
+<details>
+<summary>Detailed keymap behavior and edge cases</summary>
 
 - `gh_pr` source PR nodes expose only one child section: `Overview` (no `Files` subtree).
 - `r` in `gh_pr` Neo-tree source starts review for selected PR.
@@ -685,6 +831,8 @@ Inside `gh_pr_review` Neo-tree source:
 - `zc` collapse `Comments > By File`.
 - `zG` expand `Comments > Global` (including subgroups).
 - `zg` collapse `Comments > Global` (including subgroups).
+
+</details>
 
 ## Neo-tree source
 
