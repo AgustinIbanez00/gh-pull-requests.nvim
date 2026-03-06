@@ -22,6 +22,17 @@ local function normalize_key(value)
   return normalize_string(value):lower()
 end
 
+local function multiline_lines(value)
+  if type(value) ~= "string" or value == "" then
+    return { "" }
+  end
+  local lines = vim.split(value, "\n", { plain = true })
+  if vim.tbl_isempty(lines) then
+    return { "" }
+  end
+  return lines
+end
+
 local function extract_name(item)
   if type(item) == "string" then
     return normalize_string(item)
@@ -302,7 +313,43 @@ function M.pick(kind, payload, pr, details, action_label, ctx, callback)
     return open_reviewer_multi_select(pr, details, ctx, callback)
   end
 
+  if kind == "edit_body" then
+    local current = payload.current
+    if type(current) ~= "string" then
+      current = type(details.body) == "string" and details.body or ""
+    end
+
+    if type(ctx.open_multiline_editor) == "function" then
+      ctx.open_multiline_editor({
+        title = string.format("PR #%d - Edit description", tonumber(pr.number) or 0),
+        filetype = "markdown",
+        border = "rounded",
+        width_ratio = 0.90,
+        height_ratio = 0.85,
+        min_width = 110,
+        min_height = 18,
+        max_width = 220,
+        max_height = 80,
+        initial_lines = multiline_lines(current),
+        enter = true,
+        on_cancel = function()
+          callback(nil)
+        end,
+        on_submit = function(text)
+          callback(type(text) == "string" and text or "")
+        end,
+      })
+      return
+    end
+  end
+
   if kind == "change_state" then
+    local target = normalize_key(payload.target)
+    if target == "open" or target == "closed" then
+      callback(target)
+      return
+    end
+
     vim.ui.select({ "open", "closed" }, {
       prompt = "Target state:",
     }, function(choice)
@@ -312,6 +359,12 @@ function M.pick(kind, payload, pr, details, action_label, ctx, callback)
   end
 
   if kind == "change_draft" then
+    local target = normalize_key(payload.target)
+    if target == "ready" or target == "draft" then
+      callback(target)
+      return
+    end
+
     vim.ui.select({ "ready", "draft" }, {
       prompt = "Target draft status:",
     }, function(choice)

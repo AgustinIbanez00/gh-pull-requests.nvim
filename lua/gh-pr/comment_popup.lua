@@ -27,6 +27,7 @@ local function sanitize_modal_window(winid)
   pcall(vim.api.nvim_set_option_value, "scrollbind", false, { win = winid })
   pcall(vim.api.nvim_set_option_value, "cursorbind", false, { win = winid })
   pcall(vim.api.nvim_set_option_value, "diff", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "spell", false, { win = winid })
 end
 
 local function clamp(value, minimum, maximum)
@@ -305,6 +306,7 @@ function M.open(opts)
   vim.api.nvim_buf_set_option(popup_buf, "filetype", safe_string(opts.filetype, "markdown"))
   vim.api.nvim_buf_set_lines(popup_buf, 0, -1, false, lines)
   vim.api.nvim_buf_set_option(popup_buf, "modifiable", false)
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = popup_buf })
 
   local enter_popup = opts.enter == true
   local popup_win = vim.api.nvim_open_win(popup_buf, enter_popup, {

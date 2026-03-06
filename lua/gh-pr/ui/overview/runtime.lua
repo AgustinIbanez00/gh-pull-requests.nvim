@@ -19,6 +19,43 @@ local sessions = {}
 local sessions_by_pr = {}
 local next_session_id = 1
 
+local function tabpage_valid(tabpage)
+  return type(tabpage) == "number" and tabpage > 0 and vim.api.nvim_tabpage_is_valid(tabpage)
+end
+
+local function first_window_for_buffer(bufnr)
+  if not utils.valid_buf(bufnr) then
+    return nil
+  end
+  local winids = vim.fn.win_findbuf(bufnr)
+  for _, winid in ipairs(type(winids) == "table" and winids or {}) do
+    if utils.valid_win(winid) then
+      return winid
+    end
+  end
+  return nil
+end
+
+local function sync_session_windows(session)
+  if type(session) ~= "table" then
+    return
+  end
+  session.windows = type(session.windows) == "table" and session.windows or {}
+  for _, role in ipairs(pane_roles) do
+    local winid = session.windows[role]
+    if not utils.valid_win(winid) then
+      winid = first_window_for_buffer(session.buffers[role])
+    end
+    session.windows[role] = winid
+  end
+  local summary_win = session.windows.summary
+  if utils.valid_win(summary_win) then
+    session.tabpage = vim.api.nvim_win_get_tabpage(summary_win)
+  elseif not tabpage_valid(session.tabpage) then
+    session.tabpage = nil
+  end
+end
+
 local function default_value(value, fallback)
   if value ~= nil then
     return value
@@ -62,6 +99,7 @@ local function close_session(session)
     return
   end
   session.closing = true
+  sync_session_windows(session)
 
   for _, role in ipairs(pane_roles) do
     local winid = session.windows[role]
@@ -78,6 +116,7 @@ local function close_session(session)
   end
 
   clear_session_links(session)
+  session.tabpage = nil
 end
 
 local function session_from_id(session_id)
@@ -89,6 +128,7 @@ local function session_from_id(session_id)
   if type(session) ~= "table" then
     return nil
   end
+  sync_session_windows(session)
   if not all_buffers_valid(session) then
     close_session(session)
     return nil
@@ -127,6 +167,7 @@ local function attach_buffer_metadata(session, role)
   vim.b[bufnr].gh_pr_overview_session = session.id
   vim.b[bufnr].gh_pr_overview_role = role
   vim.b[bufnr].gh_pr_overview_primary = role == "summary"
+  vim.b[bufnr].gh_pr_overview_tabpage = session.tabpage
   vim.b[bufnr].gh_pr_overview_limits = vim.deepcopy(model.limits or {})
   vim.b[bufnr].gh_pr_overview_sections = {
     checks = model.checks and model.checks.total or 0,
@@ -172,33 +213,74 @@ local function apply_payload_to_buffer(session, role, payload)
     end
   end
   vim.api.nvim_set_option_value("modifiable", false, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = bufnr })
   session.line_actions[role] = actions
 
   local winid = session.windows[role]
   if utils.valid_win(winid) then
+    utils.ensure_window_options(winid)
     local line = utils.clamp_line(bufnr, default_value(session.cursor[role], 1))
     pcall(vim.api.nvim_win_set_cursor, winid, { line, 0 })
   end
 
   attach_buffer_metadata(session, role)
 end
+local execute_action
 
-local function execute_action(session, action, variant)
+local function open_action_menu(session, action, variant, fallback_title)
+  local options = {}
+  for _, item in ipairs(type(action.options) == "table" and action.options or {}) do
+    if type(item) == "table" and type(item.label) == "string" and item.label ~= "" and type(item.action) == "table" then
+      options[#options + 1] = item
+    end
+  end
+
+  if vim.tbl_isempty(options) then
+    return
+  end
+
+  vim.ui.select(options, {
+    prompt = utils.safe_string(action.title, fallback_title or "Choose action"),
+    format_item = function(item)
+      return utils.safe_string(type(item) == "table" and item.label or "", "(unknown action)")
+    end,
+  }, function(selected)
+    if type(selected) == "table" and type(selected.action) == "table" then
+      execute_action(session, selected.action, variant)
+    end
+  end)
+end
+
+execute_action = function(session, action, variant)
   if type(action) ~= "table" then
     return
   end
 
-  if action.kind == "toggle_activity_thread" then
-    local thread_id = utils.safe_string(action.thread_id, "")
-    if thread_id == "" then
+  if action.kind == "open_activity_thread_workspace" then
+    if type(session.callbacks.open_activity_thread_workspace) == "function"
+      and type(action.payload) == "table" then
+      session.callbacks.open_activity_thread_workspace(action.payload)
+    end
+    return
+  end
+
+  if action.kind == "thread_comment_menu" then
+    open_action_menu(session, action, variant, "Thread comment action")
+    return
+  end
+
+  if action.kind == "action_menu" then
+    open_action_menu(session, action, variant, "Select action")
+    return
+  end
+
+  if action.kind == "preview_markdown_link" then
+    if type(session.callbacks.preview_markdown_link) == "function" then
+      session.callbacks.preview_markdown_link(action)
       return
     end
-    session.activity_folds = type(session.activity_folds) == "table" and session.activity_folds or {}
-    local next_expanded = not (action.expanded == true)
-    if next_expanded == (action.default_expanded == true) then
-      session.activity_folds[thread_id] = nil
-    else
-      session.activity_folds[thread_id] = next_expanded
+    if type(action.url) == "string" and action.url ~= "" then
+      utils.open_url(action.url)
     end
     return
   end
@@ -213,6 +295,22 @@ local function execute_action(session, action, variant)
       session.callbacks.open_location(action.target)
       return
     end
+    utils.open_url(action.fallback_url)
+    return
+  end
+
+  if action.kind == "thread_fix_diff" and type(action.payload) == "table" then
+    if type(session.callbacks.open_thread_fix_diff) == "function" then
+      session.callbacks.open_thread_fix_diff(action.payload)
+      return
+    end
+
+    local fallback = type(action.payload.fallback_target) == "table" and action.payload.fallback_target or nil
+    if fallback and type(session.callbacks.open_location) == "function" then
+      session.callbacks.open_location(fallback)
+      return
+    end
+
     utils.open_url(action.fallback_url)
     return
   end
@@ -291,7 +389,6 @@ local function execute_action(session, action, variant)
     return
   end
 end
-
 local function render_session(session)
   capture_cursor_state(session)
   local payloads = renderer.render(session)
@@ -301,12 +398,29 @@ local function render_session(session)
 end
 
 local function ensure_windows(session, focus_role)
-  if layout.windows_valid(session.windows) then
-    return
+  sync_session_windows(session)
+  if not layout.windows_valid(session.windows) then
+    local windows, tabpage = layout.open_windows(session.buffers, session.window, session.layout, focus_role)
+    session.windows = windows
+    session.tabpage = tabpage
+  elseif type(focus_role) == "string" and focus_role ~= "" then
+    local winid = session.windows[focus_role]
+    if utils.valid_win(winid) then
+      local tabpage = vim.api.nvim_win_get_tabpage(winid)
+      if tabpage_valid(tabpage) and vim.api.nvim_get_current_tabpage() ~= tabpage then
+        pcall(vim.api.nvim_set_current_tabpage, tabpage)
+      end
+      pcall(vim.api.nvim_set_current_win, winid)
+    end
   end
-  session.windows = layout.open_windows(session.buffers, session.window, session.layout, focus_role)
-end
 
+  for _, role in ipairs(pane_roles) do
+    local winid = session.windows[role]
+    if utils.valid_win(winid) then
+      utils.ensure_window_options(winid)
+    end
+  end
+end
 local function ensure_buffer_options(session)
   for _, role in ipairs(pane_roles) do
     local bufnr = session.buffers[role]
@@ -317,13 +431,22 @@ local function ensure_buffer_options(session)
 end
 
 local function focus_pane(session, role)
+  sync_session_windows(session)
   local winid = session.windows[role]
+  if not utils.valid_win(winid) and role ~= "summary" then
+    winid = session.windows.summary
+  end
   if utils.valid_win(winid) then
+    local tabpage = vim.api.nvim_win_get_tabpage(winid)
+    if tabpage_valid(tabpage) and vim.api.nvim_get_current_tabpage() ~= tabpage then
+      pcall(vim.api.nvim_set_current_tabpage, tabpage)
+    end
     pcall(vim.api.nvim_set_current_win, winid)
   end
 end
 
 local function role_from_current_window(session)
+  sync_session_windows(session)
   local current = vim.api.nvim_get_current_win()
   for _, role in ipairs(pane_roles) do
     if session.windows[role] == current then
@@ -421,26 +544,6 @@ local function open_help_popup(session, role)
   end
 end
 
-local function callback_payload_for_edit(session, kind)
-  local summary = type(session.model) == "table" and type(session.model.summary) == "table" and session.model.summary or {}
-  if kind == "edit_title" then
-    return { current = session.model.title }
-  end
-  if kind == "edit_body" then
-    return { current = session.model.description }
-  end
-  if kind == "edit_milestone" then
-    return { current = utils.safe_string(summary.milestone, "") }
-  end
-  if kind == "change_state" then
-    return { current = utils.safe_string(summary.state, "") }
-  end
-  if kind == "change_draft" then
-    return { current = summary.is_draft == true and "draft" or "ready" }
-  end
-  return {}
-end
-
 local function ensure_keymaps(session)
   session.keymaps_set = type(session.keymaps_set) == "table" and session.keymaps_set or {}
   for _, role in ipairs(pane_roles) do
@@ -461,9 +564,6 @@ local function ensure_keymaps(session)
           local line = tonumber(cursor[1]) or 1
           local action = type(session.line_actions[target_role]) == "table" and session.line_actions[target_role][line] or nil
           execute_action(session, action, variant)
-          if action and action.kind == "toggle_activity_thread" then
-            render_session(session)
-          end
         end,
         focus = function(target_role)
           focus_pane(session, target_role)
@@ -485,11 +585,6 @@ local function ensure_keymaps(session)
         more = function()
           if type(session.callbacks.more_section) == "function" then
             session.callbacks.more_section("timeline")
-          end
-        end,
-        edit = function(kind)
-          if type(session.callbacks.edit_stub) == "function" then
-            session.callbacks.edit_stub(kind, callback_payload_for_edit(session, kind))
           end
         end,
       })
@@ -539,6 +634,7 @@ function M.open(model, opts)
       activity_folds = {},
       cleanup_registered = false,
       keymaps_set = {},
+      tabpage = nil,
       closing = false,
     }
     next_session_id = next_session_id + 1
@@ -564,6 +660,7 @@ function M.open(model, opts)
   session.theme = utils.sanitize_theme_opts(opts.theme)
   session.markdown = utils.sanitize_markdown_opts(opts.markdown)
   session.thread_snippet = utils.sanitize_thread_snippet_opts(opts.thread_snippet)
+  session.thread_fix_diff = utils.sanitize_thread_fix_diff_opts(opts.thread_fix_diff)
   session.keymaps = keymaps.sanitize(opts.keymaps)
 
   ensure_buffer_options(session)
@@ -600,6 +697,47 @@ function M.session_id_for_buf(bufnr)
     return nil
   end
   return id
+end
+
+function M.session_id_for_pr(pr_number)
+  local session = session_from_pr(pr_number)
+  if not session then
+    return nil
+  end
+  return session.id
+end
+
+function M.focus_for_pr(pr_number, role)
+  local session = session_from_pr(pr_number)
+  if not session then
+    return nil
+  end
+  ensure_windows(session, role or "summary")
+  return session.id
+end
+
+function M.overview_limits_for_session(session_id)
+  local session = session_from_id(session_id)
+  if not session then
+    return nil
+  end
+  local limits = type(session.model) == "table" and type(session.model.limits) == "table" and session.model.limits or nil
+  if type(limits) == "table" then
+    return vim.deepcopy(limits)
+  end
+  local summary_buf = session.buffers.summary
+  if utils.valid_buf(summary_buf) and type(vim.b[summary_buf].gh_pr_overview_limits) == "table" then
+    return vim.deepcopy(vim.b[summary_buf].gh_pr_overview_limits)
+  end
+  return nil
+end
+
+function M.overview_limits_for_pr(pr_number)
+  local session = session_from_pr(pr_number)
+  if not session then
+    return nil
+  end
+  return M.overview_limits_for_session(session.id)
 end
 
 return M

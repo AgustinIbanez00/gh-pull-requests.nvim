@@ -110,12 +110,45 @@ function M.get_current_user_login()
   return get_user_login()
 end
 
+local function has_search_qualifier(query, qualifier)
+  if type(query) ~= "string" or query == "" then
+    return false
+  end
+
+  if type(qualifier) ~= "string" or qualifier == "" then
+    return false
+  end
+
+  local pattern = string.format("%%f[%%w_]%s:", qualifier:lower())
+  return query:lower():find(pattern) ~= nil
+end
+
+local function should_append_repo_filter(query)
+  return not has_search_qualifier(query, "repo") and not has_search_qualifier(query, "org")
+end
+
 local function append_repo_filter(query, repository)
-  if query:find("repo:", 1, true) then
+  if not should_append_repo_filter(query) then
     return query
   end
 
   return string.format("%s repo:%s", query, repository.full_name)
+end
+
+local function apply_query_placeholders(query, context)
+  local normalized = type(query) == "string" and query or ""
+  context = type(context) == "table" and context or {}
+
+  local user = type(context.user) == "string" and context.user or ""
+  local owner = type(context.owner) == "string" and context.owner or ""
+  local repository_name = type(context.repository) == "string" and context.repository or ""
+
+  normalized = normalized:gsub("%${user}", user)
+  normalized = normalized:gsub("%${owner}", owner)
+  normalized = normalized:gsub("%${repository}", repository_name)
+  normalized = normalized:gsub("@org", owner)
+
+  return normalized
 end
 
 local function expand_query(raw_query, repository)
@@ -129,9 +162,11 @@ local function expand_query(raw_query, repository)
     return nil, user_err
   end
 
-  query = query:gsub("%${user}", user)
-  query = query:gsub("%${owner}", repository.owner)
-  query = query:gsub("%${repository}", repository.name)
+  query = apply_query_placeholders(query, {
+    user = user,
+    owner = repository.owner,
+    repository = repository.name,
+  })
   query = append_repo_filter(query, repository)
 
   return query, nil
@@ -150,10 +185,11 @@ local function expand_query_async(raw_query, repository, callback)
       return
     end
 
-    local query = raw_query
-    query = query:gsub("%${user}", user)
-    query = query:gsub("%${owner}", repository.owner)
-    query = query:gsub("%${repository}", repository.name)
+    local query = apply_query_placeholders(raw_query, {
+      user = user,
+      owner = repository.owner,
+      repository = repository.name,
+    })
     query = append_repo_filter(query, repository)
     callback(query, nil)
   end)
@@ -1234,6 +1270,41 @@ local function run_graphql(query, variables)
   return response, nil
 end
 
+local function run_graphql_async(query, variables, callback)
+  callback = callback or function() end
+
+  local args = {
+    "api",
+    "graphql",
+    "-f",
+    "query=" .. query,
+  }
+
+  for _, variable in ipairs(type(variables) == "table" and variables or {}) do
+    local key = type(variable.key) == "string" and variable.key or nil
+    local value = variable.value
+    if key and value ~= nil then
+      local flag = variable.flag == "-F" and "-F" or "-f"
+      table.insert(args, flag)
+      table.insert(args, key .. "=" .. tostring(value))
+    end
+  end
+
+  gh.run_json_async(args, nil, function(response, err)
+    if not response then
+      callback(nil, err)
+      return
+    end
+
+    if type(response.errors) == "table" and #response.errors > 0 then
+      callback(nil, graphql_error_message(response))
+      return
+    end
+
+    callback(response, nil)
+  end)
+end
+
 local function timeline_service_context()
   local normalize_diff_side = function(value)
     return pr_threads.normalize_diff_side(value, {
@@ -1248,6 +1319,7 @@ local function timeline_service_context()
     resolve_repository = M.resolve_repository,
     normalize_repository_from_input = normalize_repository_from_input,
     run_graphql = run_graphql,
+    run_graphql_async = run_graphql_async,
     normalize_diff_side = normalize_diff_side,
     first_positive_line = pr_threads.first_positive_line,
   }
@@ -1255,6 +1327,10 @@ end
 
 function M.fetch_pr_change_events(number, opts)
   return pr_timeline.fetch_pr_change_events(number, opts, timeline_service_context())
+end
+
+function M.fetch_pr_change_events_async(number, opts, callback)
+  return pr_timeline.fetch_pr_change_events_async(number, opts, callback, timeline_service_context())
 end
 local function fetch_review_context(number)
   local repository, repo_err = M.resolve_repository()

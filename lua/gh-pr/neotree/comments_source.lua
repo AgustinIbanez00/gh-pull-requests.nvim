@@ -626,4 +626,6 @@ function M.build_section_nodes(pr, details, opts)
   return vim.deepcopy(root.children), nil
 end
 
+require("gh-pr.neotree.registry").register("gh_pr_comments", M)
+
 return M

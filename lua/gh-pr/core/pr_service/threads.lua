@@ -1,5 +1,8 @@
 local M = {}
 
+local MAX_COMMENT_RANGE_LINES = 200
+local COMMENT_RANGE_EDGE_SEGMENT = math.floor(MAX_COMMENT_RANGE_LINES / 2)
+
 local review_threads_query = [[
 query($owner:String!, $name:String!, $number:Int!, $threadsFirst:Int!, $commentsFirst:Int!) {
   repository(owner:$owner, name:$name) {
@@ -193,6 +196,91 @@ local function add_line_item(index, path, side, line, item)
   bucket[side][line][#bucket[side][line] + 1] = item
 end
 
+local function add_line_items_with_range(index, path, side, lines, item)
+  if type(lines) ~= "table" or vim.tbl_isempty(lines) then
+    return
+  end
+
+  local range_start = tonumber(lines[1])
+  local range_end = tonumber(lines[#lines])
+  local range_length = #lines
+
+  for position, line in ipairs(lines) do
+    local ranged_item = vim.tbl_extend("force", {}, item, {
+      range_side = side,
+      range_start = range_start,
+      range_end = range_end,
+      range_length = range_length,
+      range_index = position,
+    })
+    add_line_item(index, path, side, line, ranged_item)
+  end
+end
+
+local function normalize_line_range(start_line, end_line)
+  local start_value = tonumber(start_line)
+  local end_value = tonumber(end_line)
+
+  if start_value then
+    start_value = math.floor(start_value)
+  end
+  if end_value then
+    end_value = math.floor(end_value)
+  end
+
+  if not start_value or start_value < 1 then
+    start_value = nil
+  end
+  if not end_value or end_value < 1 then
+    end_value = nil
+  end
+
+  if not start_value and not end_value then
+    return nil, nil
+  end
+
+  if not start_value then
+    start_value = end_value
+  elseif not end_value then
+    end_value = start_value
+  end
+
+  if start_value > end_value then
+    start_value, end_value = end_value, start_value
+  end
+
+  return start_value, end_value
+end
+
+local function expand_line_range(start_line, end_line)
+  local range_start, range_end = normalize_line_range(start_line, end_line)
+  if not range_start or not range_end then
+    return {}
+  end
+
+  local total = range_end - range_start + 1
+  local lines = {}
+
+  if total <= MAX_COMMENT_RANGE_LINES then
+    for line = range_start, range_end do
+      lines[#lines + 1] = line
+    end
+    return lines
+  end
+
+  local first_end = math.min(range_end, range_start + COMMENT_RANGE_EDGE_SEGMENT - 1)
+  local second_start = math.max(range_start, range_end - COMMENT_RANGE_EDGE_SEGMENT + 1)
+
+  for line = range_start, first_end do
+    lines[#lines + 1] = line
+  end
+  for line = second_start, range_end do
+    lines[#lines + 1] = line
+  end
+
+  return lines
+end
+
 local function sort_line_index(index, ctx)
   for _, sides in pairs(index) do
     for _, side in ipairs({ "head", "base" }) do
@@ -242,6 +330,18 @@ function M.build_line_comment_index(threads, opts, ctx)
         base_line = M.first_positive_line(thread.original_line, thread.original_start_line)
       end
 
+      local head_start = M.first_positive_line(thread.start_line)
+      local base_start = M.first_positive_line(thread.original_start_line)
+      local head_range = expand_line_range(head_start, head_line)
+      local base_range = expand_line_range(base_start, base_line)
+
+      if vim.tbl_isempty(head_range) and type(head_line) == "number" and head_line > 0 then
+        head_range = { head_line }
+      end
+      if vim.tbl_isempty(base_range) and type(base_line) == "number" and base_line > 0 then
+        base_range = { base_line }
+      end
+
       local entry = {
         thread_id = thread.id,
         comment_id = comment.id,
@@ -258,8 +358,8 @@ function M.build_line_comment_index(threads, opts, ctx)
         original_line = base_line,
       }
 
-      add_line_item(index, path, "head", head_line, entry)
-      add_line_item(index, path, "base", base_line, entry)
+      add_line_items_with_range(index, path, "head", head_range, entry)
+      add_line_items_with_range(index, path, "base", base_range, entry)
     end
 
     ::continue::

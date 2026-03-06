@@ -1,9 +1,15 @@
-local actions = require("gh-pr.actions")
-local comments_source = require("gh-pr.neotree.comments_source")
 local cc = require("neo-tree.sources.common.commands")
 local manager = require("neo-tree.sources.manager")
 
 local M = {}
+
+local function get_actions()
+  return require("gh-pr.actions")
+end
+
+local function get_comments_source()
+  return require("gh-pr.neotree.comments_source")
+end
 
 local function current_node(state)
   if not state or not state.tree then
@@ -23,7 +29,7 @@ local function apply_context(node)
   end
 
   if node.extra.pr and node.extra.details then
-    actions.set_active_pr(node.extra.pr, node.extra.details)
+    get_actions().set_active_pr(node.extra.pr, node.extra.details)
   end
 end
 
@@ -34,7 +40,7 @@ local function open_target_from_node(node)
 
   local target = node.extra and node.extra.target
   if type(target) == "table" then
-    actions.open_comment_location(target, {
+    get_actions().open_comment_location(target, {
       open_thread_popup = true,
       popup_mode = "open",
       focus_thread_popup = true,
@@ -49,7 +55,7 @@ local function preview_target_from_node(node)
 
   local target = node.extra and node.extra.target
   if type(target) == "table" then
-    actions.preview_comment_location(target, {
+    get_actions().preview_comment_location(target, {
       open_thread_popup = true,
       popup_mode = "preview",
       focus_thread_popup = true,
@@ -60,7 +66,7 @@ end
 M.noop = function() end
 
 M.refresh = function(state)
-  comments_source.invalidate_cache()
+  get_comments_source().invalidate_cache()
   manager.refresh("gh_pr_comments", state)
 end
 

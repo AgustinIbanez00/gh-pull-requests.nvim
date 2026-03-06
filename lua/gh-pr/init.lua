@@ -75,12 +75,12 @@ local function open_neotree(source_name, source_module_name, opts)
 end
 
 local function open_default_view()
-  if not get_repo().ensure_git_repo() then
+  local options = config.get()
+  if options.ui.use_neotree and open_neotree("gh_pr", "gh_pr", { toggle = false }) then
     return
   end
 
-  local options = config.get()
-  if options.ui.use_neotree and open_neotree("gh_pr", "gh_pr") then
+  if not get_repo().ensure_git_repo() then
     return
   end
 
@@ -97,9 +97,10 @@ local function open_comments_view(number)
     return
   end
 
-  pcall(function()
-    require("gh-pr.neotree.comments_source").invalidate_cache()
-  end)
+  local comments_source = require("gh-pr.neotree.registry").get("gh_pr_comments")
+  if type(comments_source) == "table" and type(comments_source.invalidate_cache) == "function" then
+    pcall(comments_source.invalidate_cache)
+  end
 
   if number ~= nil then
     local actions = get_actions()
@@ -274,8 +275,8 @@ end
 
 function M.refresh_review()
   return with_runtime(function()
-    local ok_source, review_source = pcall(require, "gh-pr.neotree.review_source")
-    if not ok_source or type(review_source.request_refresh) ~= "function" then
+    local review_source = require("gh-pr.neotree.registry").get("gh_pr_review")
+    if type(review_source) ~= "table" or type(review_source.request_refresh) ~= "function" then
       notify_error("Unable to load PR Review source refresh handler")
       return
     end

@@ -231,23 +231,21 @@ local function normalize_asset_path(path)
   return path:gsub("\\", "/")
 end
 
-local function fetch_asset(repository, ref, path, image_options)
-  if not repository or not ref or not path then
-    return nil, "Missing repository/ref/path to fetch content"
-  end
+local function empty_asset(path)
+  return {
+    path = normalize_asset_path(path),
+    ext = image_renderer.extension(normalize_asset_path(path)),
+    size = 0,
+    sha = "",
+    encoding = "",
+    is_image = false,
+    bytes = "",
+    text = "",
+    skipped = false,
+  }
+end
 
-  local api = string.format(
-    "repos/%s/%s/contents/%s?ref=%s",
-    repository.owner,
-    repository.name,
-    encode_path(path),
-    url_encode(ref)
-  )
-  local payload, err = gh.run_json({ "api", api })
-  if not payload then
-    return nil, err
-  end
-
+local function asset_from_payload(path, payload, image_options)
   local size = tonumber(payload.size) or 0
   local normalized_path = normalize_asset_path(path)
   local ext = image_renderer.extension(normalized_path)
@@ -296,6 +294,51 @@ local function fetch_asset(repository, ref, path, image_options)
   }, nil
 end
 
+local function fetch_asset(repository, ref, path, image_options)
+  if not repository or not ref or not path then
+    return nil, "Missing repository/ref/path to fetch content"
+  end
+
+  local api = string.format(
+    "repos/%s/%s/contents/%s?ref=%s",
+    repository.owner,
+    repository.name,
+    encode_path(path),
+    url_encode(ref)
+  )
+  local payload, err = gh.run_json({ "api", api })
+  if not payload then
+    return nil, err
+  end
+
+  return asset_from_payload(path, payload, image_options)
+end
+
+local function fetch_asset_async(repository, ref, path, image_options, callback)
+  callback = callback or function() end
+  if not repository or not ref or not path then
+    callback(nil, "Missing repository/ref/path to fetch content")
+    return
+  end
+
+  local api = string.format(
+    "repos/%s/%s/contents/%s?ref=%s",
+    repository.owner,
+    repository.name,
+    encode_path(path),
+    url_encode(ref)
+  )
+  gh.run_json_async({ "api", api }, nil, function(payload, err)
+    if not payload then
+      callback(nil, err)
+      return
+    end
+
+    local asset, asset_err = asset_from_payload(path, payload, image_options)
+    callback(asset, asset_err)
+  end)
+end
+
 local function is_not_found_error(err)
   if type(err) ~= "string" then
     return false
@@ -313,6 +356,7 @@ local function set_buffer_content(bufnr, lines)
   end
   vim.api.nvim_buf_set_option(bufnr, "modifiable", true)
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = bufnr })
   vim.api.nvim_buf_set_option(bufnr, "modifiable", false)
   if was_readonly then
     vim.api.nvim_buf_set_option(bufnr, "readonly", true)
@@ -1099,6 +1143,7 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
   vim.b[bufnr].gh_pr_number = pr.number
   vim.b[bufnr].gh_pr_file_kind = kind
   vim.b[bufnr].gh_pr_file_mode = type(buffer_opts.file_mode) == "string" and buffer_opts.file_mode or nil
+  vim.b[bufnr].gh_pr_diff_backend = "virtual"
   vim.b[bufnr].gh_pr_is_image = is_image
   vim.b[bufnr].gh_pr_image_side = is_image and image_side or nil
   vim.b[bufnr].gh_pr_image_cache_path = nil
@@ -1180,64 +1225,15 @@ local function resolve_paths(file)
   return current_path, current_path
 end
 
-local function read_base_and_head(details, _, file)
-  local base_repository = resolve_base_repository(details)
-  local head_repository = resolve_head_repository(details, base_repository)
-  local image_options = resolve_image_options()
-
-  if not base_repository then
-    return nil, "Unable to resolve base repository"
-  end
-
-  local base_path, head_path = resolve_paths(file)
-  if not head_path or head_path == "" then
-    return nil, "Unable to resolve file path"
-  end
-
-  local status = (file.status or ""):lower()
-
-  local base_content = ""
-  local head_content = ""
-  local base_asset = {
-    path = normalize_asset_path(base_path),
-    size = 0,
-    sha = "",
-    is_image = false,
-    bytes = "",
-    text = "",
-    skipped = false,
-  }
-  local head_asset = {
-    path = normalize_asset_path(head_path),
-    size = 0,
-    sha = "",
-    is_image = false,
-    bytes = "",
-    text = "",
-    skipped = false,
-  }
+local function finalize_remote_pair(opts)
+  opts = type(opts) == "table" and opts or {}
+  local base_asset = type(opts.base_asset) == "table" and opts.base_asset or empty_asset(opts.base_path)
+  local head_asset = type(opts.head_asset) == "table" and opts.head_asset or empty_asset(opts.head_path)
+  local status = type(opts.status) == "string" and opts.status or ""
   local errors = {}
   local file_mode = "diff_pair"
-  local fetch_base_err = nil
-  local fetch_head_err = nil
-
-  if status ~= "added" then
-    base_asset, fetch_base_err = fetch_asset(base_repository, details.baseRefName, base_path, image_options)
-    if fetch_base_err then
-      table.insert(errors, "base: " .. fetch_base_err)
-    elseif type(base_asset) == "table" then
-      base_content = base_asset.text or ""
-    end
-  end
-
-  if status ~= "removed" then
-    head_asset, fetch_head_err = fetch_asset(head_repository, details.headRefName, head_path, image_options)
-    if fetch_head_err then
-      table.insert(errors, "head: " .. fetch_head_err)
-    elseif type(head_asset) == "table" then
-      head_content = head_asset.text or ""
-    end
-  end
+  local fetch_base_err = opts.fetch_base_err
+  local fetch_head_err = opts.fetch_head_err
 
   if status == "added" then
     file_mode = "added_single"
@@ -1261,19 +1257,131 @@ local function read_base_and_head(details, _, file)
   end
 
   return {
-    base_content = base_content or "",
-    head_content = head_content or "",
-    base_path = base_path,
-    head_path = head_path,
-    repo = base_repository,
+    base_content = base_asset.text or "",
+    head_content = head_asset.text or "",
+    base_path = opts.base_path,
+    head_path = opts.head_path,
+    repo = opts.base_repository,
+    base_repo = opts.base_repository,
+    head_repo = opts.head_repository,
     file_mode = file_mode,
     status = status,
-    image_options = image_options,
+    image_options = opts.image_options,
     base_asset = base_asset,
     head_asset = head_asset,
     is_image = (type(base_asset) == "table" and base_asset.is_image == true)
       or (type(head_asset) == "table" and head_asset.is_image == true),
   }, nil
+end
+
+local function read_base_and_head(details, _, file)
+  local base_repository = resolve_base_repository(details)
+  local head_repository = resolve_head_repository(details, base_repository)
+  local image_options = resolve_image_options()
+
+  if not base_repository then
+    return nil, "Unable to resolve base repository"
+  end
+
+  local base_path, head_path = resolve_paths(file)
+  if not head_path or head_path == "" then
+    return nil, "Unable to resolve file path"
+  end
+
+  local status = (file.status or ""):lower()
+  local base_asset = empty_asset(base_path)
+  local head_asset = empty_asset(head_path)
+  local fetch_base_err = nil
+  local fetch_head_err = nil
+
+  if status ~= "added" then
+    base_asset, fetch_base_err = fetch_asset(base_repository, details.baseRefName, base_path, image_options)
+  end
+
+  if status ~= "removed" then
+    head_asset, fetch_head_err = fetch_asset(head_repository, details.headRefName, head_path, image_options)
+  end
+
+  return finalize_remote_pair({
+    status = status,
+    base_path = base_path,
+    head_path = head_path,
+    image_options = image_options,
+    base_repository = base_repository,
+    head_repository = head_repository,
+    base_asset = base_asset,
+    head_asset = head_asset,
+    fetch_base_err = fetch_base_err,
+    fetch_head_err = fetch_head_err,
+  })
+end
+
+local function read_base_and_head_async(details, _, file, callback)
+  callback = callback or function() end
+
+  local base_repository = resolve_base_repository(details)
+  local head_repository = resolve_head_repository(details, base_repository)
+  local image_options = resolve_image_options()
+
+  if not base_repository then
+    callback(nil, "Unable to resolve base repository")
+    return
+  end
+
+  local base_path, head_path = resolve_paths(file)
+  if not head_path or head_path == "" then
+    callback(nil, "Unable to resolve file path")
+    return
+  end
+
+  local status = (file.status or ""):lower()
+  local base_asset = empty_asset(base_path)
+  local head_asset = empty_asset(head_path)
+  local fetch_base_err = nil
+  local fetch_head_err = nil
+  local pending = 0
+  local finished = false
+
+  local function maybe_finish()
+    if finished or pending > 0 then
+      return
+    end
+    finished = true
+    callback(finalize_remote_pair({
+      status = status,
+      base_path = base_path,
+      head_path = head_path,
+      image_options = image_options,
+      base_repository = base_repository,
+      head_repository = head_repository,
+      base_asset = base_asset,
+      head_asset = head_asset,
+      fetch_base_err = fetch_base_err,
+      fetch_head_err = fetch_head_err,
+    }))
+  end
+
+  if status ~= "added" then
+    pending = pending + 1
+    fetch_asset_async(base_repository, details.baseRefName, base_path, image_options, function(asset, err)
+      base_asset = type(asset) == "table" and asset or empty_asset(base_path)
+      fetch_base_err = err
+      pending = pending - 1
+      maybe_finish()
+    end)
+  end
+
+  if status ~= "removed" then
+    pending = pending + 1
+    fetch_asset_async(head_repository, details.headRefName, head_path, image_options, function(asset, err)
+      head_asset = type(asset) == "table" and asset or empty_asset(head_path)
+      fetch_head_err = err
+      pending = pending - 1
+      maybe_finish()
+    end)
+  end
+
+  maybe_finish()
 end
 
 local function normalize_commit_file(file)
@@ -2311,6 +2419,7 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
   local canonical_path = normalize_path(file.path or file.filename)
   vim.b[bufnr].gh_pr_file_path = canonical_path ~= "" and canonical_path or nil
   vim.b[bufnr].gh_pr_file_mode = file_mode
+  vim.b[bufnr].gh_pr_diff_backend = "virtual"
   vim.b[bufnr].gh_pr_is_image = is_image_buffer
   vim.b[bufnr].gh_pr_image_side = is_image_buffer and image_side or nil
   vim.b[bufnr].gh_pr_image_status = is_image_buffer and data.status or nil
@@ -2405,6 +2514,14 @@ function M.sync_visible_pr_buffers(details_by_pr, opts)
       vim.log.levels.INFO
     )
   end
+end
+
+function M.load_remote_file_pair(details, file)
+  return read_base_and_head(details, nil, file)
+end
+
+function M.load_remote_file_pair_async(details, file, callback)
+  return read_base_and_head_async(details, nil, file, callback)
 end
 
 return M

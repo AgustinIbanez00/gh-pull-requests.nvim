@@ -45,15 +45,16 @@ Quick links: [Installation](#installation) · [Quick Start](#quick-start) · [Co
 ### 📝 Overview + Activity
 
 - Multi-pane overview (Summary + Activity + Collaboration).
+- Overview panes open in a dedicated tabpage using normal windows (not fullscreen float popups).
 - Summary embeds a chronological activity stream (comments, reviews, commits, thread comments, PR state changes).
-- Open commit diffs from overview without checkout (virtual patch buffers).
+- Open commit diffs from overview without checkout (`codediff` backend).
 
 ### 🧩 Diff + File UX
 
-- Virtual readonly buffers for base/head versions and commit-scoped diffs.
-- Configurable diff layouts (`vertical` / `horizontal` / `unified`).
-- Whitespace/endline toggles and optional image preview with fallback actions.
-- Line-comment indicators and thread popups in virtual PR buffers.
+- `codediff.nvim` backend for PR file diffs, commit diffs and thread/comment location navigation.
+- No-fetch strategy for file diffs: content is downloaded from GitHub and opened through temporary files.
+- Session prompt fallback to legacy virtual backend when `codediff` is missing/fails.
+- Optional image preview and metadata fallback actions in legacy virtual backend.
 
 ### ⚙️ Reliability + State
 
@@ -65,7 +66,7 @@ Quick links: [Installation](#installation) · [Quick Start](#quick-start) · [Co
 <summary>More feature details</summary>
 
 - Pull request overview interactive tabs UI (Snacks-based) with inline markdown rendering in PR description, link label rendering, and link preview support.
-- Open commit diffs directly from Overview > Commits (virtual patch buffers, no checkout).
+- Open commit diffs directly from Overview > Commits (`codediff`, no checkout).
 - PR Review > Commits supports per-commit file browsing and opens commit-scoped diffs (`parent[1] -> commit`).
 - Configurable path rendering in `Files` and `Comments` trees (`compact`, `tree`, `flat`).
 - Comments view migrated into PR Review > Comments (Problems-like navigation and preview preserved).
@@ -84,6 +85,7 @@ Optional:
 
 - [neo-tree.nvim](https://github.com/nvim-neo-tree/neo-tree.nvim) (primary UI)
 - [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim) (fallback UI)
+- [codediff.nvim](https://github.com/esmuellert/codediff.nvim) (primary diff backend; without it gh-pr can use session fallback to legacy virtual buffers)
 - [snacks.nvim](https://github.com/folke/snacks.nvim) (required for interactive PR overview)
 
 ## Validation
@@ -95,6 +97,11 @@ pwsh -File scripts/validate.ps1
 ```
 
 This command runs headless smoke checks and helptags generation in one step.
+It now includes:
+
+- command and entrypoint smoke (`scripts/headless_smoke.ps1`)
+- Neo-tree lazy/gating smoke (`scripts/neotree_lazy_smoke.ps1`)
+- `:helptags doc` validation
 
 Optional checks:
 
@@ -133,6 +140,11 @@ Validation prerequisites:
       separator = "/", -- visual separator for compact directories
       show_status_prefix = true, -- show [M]/[A]/... in Files nodes
     },
+    pr_review = {
+      files = {
+        flat = false, -- PR Review > Files list mode (no folder tree)
+      },
+    },
     hide_viewed_files = false,
     line_comments = {
       enabled = true,
@@ -155,6 +167,8 @@ Validation prerequisites:
         enabled = true,
         prefix = "C",
         show_count = true,
+        show_authors = true, -- when true multiline labels include author: "💬 Lx/N @user"
+        max_authors = 2, -- max authors shown before "+N"
         position = "eol", -- "eol" | "inline"
       },
       comments_tree = {
@@ -206,13 +220,14 @@ Validation prerequisites:
         layout = {
           sidebar_width_ratio = 0.34, -- right panel width ratio
           summary_height_ratio = 0.38, -- top-left panel height ratio
-          gap = 1, -- gap between pane floats
+          gap = 1, -- compatibility spacing option for pane layout
           min_left_width = 58,
           min_sidebar_width = 30,
           min_summary_height = 10,
           min_activity_height = 12,
         },
         activity = {
+          visual_style = "minimal", -- "minimal" | "classic"
           max_body_lines = 8, -- max body lines per event/comment block
           max_events = 120, -- max rendered timeline events in activity pane
           show_code_context = true, -- render diffHunk snippet in thread blocks
@@ -258,9 +273,9 @@ Validation prerequisites:
       },
       thread_fix_diff = {
         enabled = true,
-        show_action_line = true, -- show "View fix diff" line under thread comments
-        keymap = "gf", -- toggle fix diff from thread comment context
-        inline = true, -- render latest-commit patch inline in Overview
+        show_action_line = true, -- compatibility toggle for legacy explicit action line
+        keymap = "gf", -- compatibility key (default activity flow uses <CR> contextual menu)
+        inline = true, -- compatibility for inline patch consumers; overview default opens diff buffer
         context_before = 5, -- lines above focused fix line in latest commit patch
         context_after = 5, -- lines below focused fix line in latest commit patch
         fallback_to_buffer = true, -- fallback to legacy diff buffer if inline patch is unavailable
@@ -318,6 +333,9 @@ Validation prerequisites:
       ignore_whitespace = false,
       render_whitespace = true,
       render_endlines = false, -- render LF/CRLF/CR markers at EOL
+      debug = {
+        codediff_failures = false, -- when true, show debug notifications for codediff errors/fallback decisions and review prefetch activity
+      },
       whitespace = {
         tab = ">-", -- symbol for leading/trailing tabs
         space = ".", -- symbol for leading spaces
@@ -348,13 +366,13 @@ Validation prerequisites:
         prev_file = "<localleader>dF",
         next_reviewed_file = "<localleader>dv",
         prev_reviewed_file = "<localleader>dV",
-        toggle_whitespace = "<localleader>tw",
-        toggle_render_whitespace = "<localleader>ts",
-        toggle_render_endlines = "<localleader>te",
-        cycle_mode = "<localleader>mm",
-        set_vertical = "<localleader>mv",
-        set_horizontal = "<localleader>mh",
-        set_unified = "<localleader>mu",
+        toggle_whitespace = "", -- removed default mapping (legacy virtual-only feature)
+        toggle_render_whitespace = "",
+        toggle_render_endlines = "",
+        cycle_mode = "",
+        set_vertical = "",
+        set_horizontal = "",
+        set_unified = "",
         submit_pending_comment = "<localleader>rc",
         submit_pending_approve = "<localleader>ra",
         submit_pending_request_changes = "<localleader>rr",
@@ -367,7 +385,7 @@ Validation prerequisites:
       },
       comments_panel = {
         enabled = true,
-        auto_open = "if_comments", -- "if_comments" | "never" | "always"
+        auto_open = "if_comments", -- current diff file only; "if_comments" | "never" | "always" (also accepts true => "if_comments", false => "never")
         height_ratio = 0.28,
         min_height = 8,
         max_height = 18,
@@ -392,6 +410,11 @@ Validation prerequisites:
         metadata_external_command = { "magick", "identify", "-format", "%w %h", "{file}" },
         max_bytes = 25 * 1024 * 1024,
       },
+      prefetch = {
+        enabled = true,
+        concurrency = 4,
+        text_extensions = { "lua", "md", "json", "yml", "yaml", "toml", "ts", "tsx", "js", "css", "html", "xml", "sh", "ps1", "sql", "txt", "log", "csv" },
+      },
     },
     queries = {
       { folder = "Inbox", label = "Waiting For My Review", query = "is:open review-requested:@me" },
@@ -402,6 +425,13 @@ Validation prerequisites:
     ui = {
       use_neotree = true,
       telescope_fallback = true,
+      neotree_sources = {
+        pr = {
+          auto_register = true,
+          gate = "github_repo", -- "github_repo" | "git_repo" | "manual"
+          workspace = "cwd", -- "cwd" | "buffer_repo" | "neotree_root"
+        },
+      },
     },
     mappings = {
       global = {
@@ -440,6 +470,8 @@ gh auth login
 :GhPrOpen
 ```
 
+By default, the Neo-tree `PR` source appears only after gh-pr confirms that the current workspace (`cwd`) is a git repository with a GitHub remote.
+
 Tip: if you prefer explicit review flow from a selected PR, use `:GhPrStartReview`.
 
 ## Query placeholders
@@ -468,6 +500,7 @@ Examples:
 | Symptom | Check | Fix |
 | --- | --- | --- |
 | No PRs are shown | Are you in a git repo? | Open a repository and run `:GhPrOpen` again. |
+| `PR` source tab is missing in Neo-tree | Does the current workspace have a GitHub remote? | Default `ui.neotree_sources.pr.gate = "github_repo"` hides `gh_pr` outside GitHub repos. Use a GitHub checkout, switch `workspace`, or set `gate = "git_repo"` / `manual`. |
 | `gh` errors / auth failures | `gh auth status` | Run `gh auth login` and retry. |
 | Neo-tree source not opening | Neo-tree installed and configured? | Use fallback `:GhPrTelescope` or install/enable Neo-tree dependency. |
 | Docs/commands seem out of sync | Health + validation | Run `:checkhealth gh-pr` and `pwsh -File scripts/validate.ps1`. |
@@ -507,12 +540,12 @@ Compatibility aliases kept for user-facing behavior:
 
 | Command | Description | Typical use |
 | --- | --- | --- |
-| `:GhPrOpen` | Open PR UI (Neo-tree first, Telescope fallback) | Start a PR browsing session |
-| `:GhPrStartReview [number]` | Start review flow for selected PR | Enter review workspace quickly |
+| `:GhPrOpen` | Focus/open PR UI (idempotent; Neo-tree first, Telescope fallback) | Start or refocus a PR browsing session |
+| `:GhPrStartReview [number]` | Start review flow for selected PR | Enter review workspace quickly and warm textual diffs in background |
 | `:GhPrReviewTree` | Toggle PR Review source | Jump between list and review tree |
 | `:GhPrOverview` | Open active PR overview panes | Inspect summary/activity/collaboration |
-| `:GhPrOpenDiff` | Open selected file in virtual base/head diff | Review code changes |
-| `:GhPrOpenCommitPatch` | Open selected commit patch in virtual buffer | Inspect commit-level patch |
+| `:GhPrOpenDiff` | Open selected file diff in codediff (primary backend) | Review code changes |
+| `:GhPrOpenCommitPatch` | Open selected commit diff in codediff | Inspect commit-level changes |
 | `:GhPrToggleReviewed` | Toggle local viewed state | Track reviewed files |
 | `:GhPrRefresh` | Refresh data | Sync UI with latest PR state |
 | `:GhPRReviewRefresh` / `:GhPrReviewRefresh` | Force background refresh of active PR Review | Refresh stale review tree |
@@ -538,10 +571,10 @@ Compatibility aliases kept for user-facing behavior:
 - `:GhPrOverviewV2Refresh` alias of `:GhPrOverviewRefresh` (kept for compatibility).
 - `:GhPrOverviewMore <checks|commits|comments|reviews|threads> [count]` load more section items.
 - `:GhPrCheckout [number]` checkout PR branch.
-- `:GhPrOpenDiff` open selected file in virtual base/head diff.
-- `:GhPrOpenOriginal` open base version buffer.
-- `:GhPrOpenModified` open head version buffer.
-- `:GhPrOpenCommitPatch` open selected commit patch in virtual buffer.
+- `:GhPrOpenDiff` open selected file diff in codediff (primary backend).
+- `:GhPrOpenOriginal` open selected file and focus base side in codediff when possible.
+- `:GhPrOpenModified` open selected file and focus head side in codediff when possible.
+- `:GhPrOpenCommitPatch` open selected commit diff in codediff.
 - `:GhPrToggleReviewed` toggle local viewed state.
 - `:GhPrNextChange` jump to next diff hunk.
 - `:GhPrPrevChange` jump to previous diff hunk.
@@ -623,11 +656,13 @@ require("gh-pr").setup({
 | --- | --- |
 | `a` / `d` / `c` / `m` / `k` / `b` | Review + merge + checkout + browser actions |
 | `R` | Refresh overview |
-| `gp` | Preview markdown link |
-| `gf` | Toggle thread fix diff |
+| `gp` | Preview markdown link under cursor (description) |
+| `<CR>` on metadata rows | Edit title / description / state / draft / labels / reviewers / assignees / milestone |
+| `<CR>` on `## Description` | Edit description in multiline composer |
+| `<CR>` on description link line | Preview attachment or confirm-open link (multiple links => selector) |
+| `<CR>` on thread header | Open dedicated thread workspace (diff + markdown thread panel) |
 | `gr` | Load more activity |
 | `D` / `O` / `M` | Open diff / original / modified |
-| `et` / `eb` / `el` / `er` / `ea` / `em` / `es` / `ed` | Edit PR metadata |
 
 #### Diff buffer (`<localleader>` namespace)
 
@@ -639,8 +674,6 @@ require("gh-pr").setup({
 | `<localleader>df` / `<localleader>dF` | Next / previous file |
 | `<localleader>dv` / `<localleader>dV` | Next / previous reviewed file |
 | `<localleader>ic` / `<localleader>is` | Inline comment / inline suggestion |
-| `<localleader>tw` / `<localleader>ts` / `<localleader>te` | Whitespace + symbol toggles |
-| `<localleader>mm` / `<localleader>mv` / `<localleader>mh` / `<localleader>mu` | Diff mode controls |
 | `<localleader>ra` / `<localleader>rc` / `<localleader>rr` / `<localleader>rd` | Pending review actions |
 | `<localleader>rx` | Toggle PR Review source |
 
@@ -666,6 +699,7 @@ require("gh-pr").setup({
 - `c` in `gh_pr_review` publishes a regular PR comment (`gh pr comment`).
 - `gh_pr` and `gh_pr_review` do not bind `<space>` by default (keeps `<leader>` available when `mapleader = " "`).
 - `gh_pr` and `gh_pr_review` prioritize PR-specific mappings over generic Neo-tree filesystem mappings.
+- Opening `Overview` from Neo-tree reuses/focuses existing overview session for that PR and triggers silent background refresh.
 
 Inside the overview buffer:
 - `a` approve review
@@ -679,19 +713,17 @@ Inside the overview buffer:
 - `q` close overview
 - `H` / `L` previous/next tab
 - `1..9` jump to tab
-- `et` edit title
-- `eb` edit description
-- `el` edit labels (multi-select, replacement mode)
-- `er` edit reviewers (multi-select, replacement mode; users + teams)
-- `ea` edit assignees (comma-separated, replacement mode)
-- `em` edit milestone (empty input removes milestone)
-- `es` change state (`open`/`closed`)
-- `ed` toggle draft status (`ready`/`draft`)
 - `<CR>` open selected row action
-- `<CR>` on `Commits` opens commit diff details in a virtual patch buffer
-- `<CR>` on `Summary > Activity` thread headers toggles expand/collapse
+- `<CR>` on metadata rows edits title/description/state/draft/labels/reviewers/assignees/milestone
+- `<CR>` on `## Description` heading opens a large multiline composer preloaded with current body (`<C-s>` submit, `q`/`<Esc>` cancel)
+- `<CR>` on a description body line with a single markdown/http(s) link opens preview/link action for that link
+- `<CR>` on a description body line with multiple links opens a selector menu first
+- state row uses direct toggle (`open`/`closed`) with confirmation
+- draft row uses direct toggle (`ready`/`draft`) with confirmation
+- `<CR>` on `Commits` opens commit diff details in codediff (or legacy virtual fallback if selected for this session)
+- `<CR>` on `Summary > Activity` thread headers opens a dedicated thread workspace tab
 - `gp` preview markdown link under cursor in PR description
-- `gf` toggle fix diff for thread comment (latest commit patch touching the file)
+- Thread workspace opens with codediff unified (`inline`) on the left and readonly markdown thread history on the right
 - `gr` load more for current section tab (`Summary` loads more Activity)
 - `D` open diff for selected row (file or commit)
 - `O` open original file for selected file row
@@ -701,35 +733,61 @@ Inside the overview buffer:
 - In `overview.markdown.mode = "full"`, PR description keeps raw markdown and fenced blocks (including `diff`) use native markdown syntax highlighting.
 - In `overview.markdown.mode = "legacy"`, markdown renderer is selected by `overview.markdown.provider` (`render-markdown`/`builtin`).
 - `overview.markdown.github_style = true` applies GitHub-like markdown structure in `Summary` (headings + separators for Activity/threads).
-- `overview.markdown.diff_gutter = "none"` keeps thread snippets and inline fix diffs as clean `diff` blocks (no per-line numbering).
-- Markdown links in description can be previewed with `gp`.
+- `overview.markdown.diff_gutter = "none"` keeps thread snippets and markdown `diff` blocks clean (no per-line numbering).
+- Markdown links in description can be previewed with `gp` or directly with `<CR>` on the link line.
+- `<CR>` priority in description: heading edits body; link lines preview/open links.
 - Link preview download is only used for GitHub attachments; non-attachment links prompt `open link` / `cancel` and open in browser when confirmed.
+- If browser open fails for a description/check/commit URL action, gh-pr now shows an explicit error notification with the opener failure reason.
+- Renderable GitHub attachments open in a full-screen readonly preview tab (`q` / `<Esc>` closes).
 - Overview markdown normalizes CRLF/LF line endings to avoid `^M` artifacts on Windows.
 - PR metadata (`state/review/merge/branches/stats`) is rendered globally at the top for all tabs.
 - `Summary` no longer renders the old `Actions` block.
 - `Summary > Activity` includes commit upload events and PR change events (labels/review requests/assignees/milestones/title/base-ref/draft/ready/close/reopen/merge/force-push).
 - Commit events in `Summary > Activity` can be opened with `<CR>` to view commit diff.
-- Threads in `Summary > Activity` open by default; resolved/outdated threads start collapsed.
-- Thread comments in `Summary > Activity` show foldable markdown code blocks (`diffHunk`, fenced as `diff`) with syntax-aware rendering and two-level indentation (thread start + replies).
-- Thread code snippets are trimmed around the commented line and configurable with `overview.thread_snippet.context_before/context_after` (default `5/5`).
-- Thread comments can show `↪ View fix diff` and toggle an inline markdown `diff` block from the latest commit touching that file (`overview.thread_fix_diff`).
-- Thread comments in `Summary > Activity` also show `↪ View evolution diff`, which opens virtual diff buffer between comment commit and latest commit touching that file (no patch buffers).
+- `Summary > Activity` thread rows are rendered header-only for low-noise navigation.
+- `<CR>` on a thread header opens a dedicated workspace tab with full thread metadata/comments and code context.
 - If inline patch resolution fails, `overview.thread_fix_diff.fallback_to_buffer = true` falls back to legacy diff buffers.
 - `,x` toggle PR Review source while staying in review flow.
+- gh-pr UI windows (overview panes, popups and composer) force `nospell` without affecting regular file buffers.
 
 Inside overview panes (`:GhPrOverview`, alias `:GhPrOverviewV2`):
+- Panes are rendered in one dedicated tabpage with three normal windows (Summary/Activity/Collaboration).
 - `a`/`d`/`c`/`m`/`k`/`b` keep the same review/browser actions.
 - `<CR>` executes the action under cursor in the focused pane.
-- Thread comments show explicit `↪ View evolution diff` action (comment commit -> latest commit touching file) using virtual diff buffer.
+- `<CR>` on metadata rows handles PR edits contextually (title/description/state/draft/labels/reviewers/assignees/milestone).
+- `<CR>` on `## Description` heading opens multiline composer (preloaded text, `<C-s>` submit, `q`/`<Esc>` cancel).
+- `<CR>` on description link lines previews GitHub attachments or confirms browser-open for non-attachment links (multiple links => selector).
+- `<CR>` on `Activity` thread headers opens dedicated thread workspace tab (codediff unified + markdown thread panel).
 - `gr` loads more activity events.
-- `et`/`eb`/`el`/`er`/`ea`/`em`/`es`/`ed` trigger metadata edits.
 - `?` opens floating shortcuts help.
 - `<Tab>` / `<S-Tab>` cycle panes.
 - `g1` / `g2` / `g3` focus Summary / Activity / Collaboration.
 - `<C-h>`/`<C-j>`/`<C-k>`/`<C-l>` switch focus between Summary/Activity/Collaboration panes.
 - `<C-w>w` / `<C-w>W` cycle panes, `<C-w>h/j/k/l` focus Summary/Activity/Summary/Collaboration.
 
-Inside PR virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenModified`):
+Diff backend behavior:
+- gh-pr uses `codediff.nvim` as the primary backend for `Files`, `Commits`, overview diff actions, and comment/thread location opens.
+- For PR/commit file diffs, gh-pr downloads base/head content from GitHub and opens codediff without git fetch.
+- Starting or refreshing an active PR review warms textual PR file pairs in the background under the codediff temp cache, so later diff opens reuse local temp files.
+- Diffs opened by gh-pr in codediff are forced to side-by-side layout, except Overview thread workspace (`<CR>` on thread header) which uses inline/unified layout.
+- codediff windows opened by gh-pr force `number = true` and `relativenumber = true`.
+- codediff temp buffers opened by gh-pr are forced readonly/non-modifiable (`nomodified`, `noswapfile`) to avoid save prompts on exit.
+- gh-pr read-only URI buffers (`ghpr://...`, including virtual fallback diffs/overview preview surfaces) are kept `nomodified` via write guards + runtime safety-net to avoid accidental save prompts on exit.
+- Binary/image/non-renderable content automatically falls back to the virtual backend path.
+- If codediff is unavailable or fails, gh-pr prompts once per session to decide whether to use legacy virtual fallback backend.
+- If fallback is rejected, diff open actions return explicit errors.
+- Inline comments/suggestions and diff comments panel are available in codediff file diffs (`head` side for inline actions).
+- The diff comments panel is scoped to the currently open diff file, renders immediately, and loads comment entries lazily in the background.
+- `<localleader>dc` reports explicit errors when diff comments panel cannot be opened/refreshed.
+- Line comment virtual text can show compact comment authors (`💬 @user1, @user2 +N`) in both codediff and virtual fallback buffers.
+- Multiline review comments now mark the full line range (`startLine -> line`) in diff indicators.
+- For multiline ranges longer than 200 lines, gh-pr marks the first 100 and last 100 lines.
+- For a single multiline comment, each marked line shows progress label `💬 Lx/N` (and `@user` when `show_authors = true`).
+- When a line has multiple comments, gh-pr shows compact overlap label `💬 N comments`.
+- Legacy whitespace/layout toggle shortcuts are removed from defaults (`""`) and are only relevant in virtual fallback mode when explicitly mapped.
+- Set `diff_view.debug.codediff_failures = true` to show reason/decision debug notifications for codediff failures, fallback routing, and review prefetch start/result events.
+
+Inside legacy virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenModified`) when session fallback is active:
 - all gh-pr diff actions are namespaced under `<localleader>` to avoid overriding native Neovim keys
 - if `vim.g.maplocalleader` is unset, gh-pr uses `,` as fallback for diff-buffer shortcuts
 - `<localleader>dk` show PR comments for the current line in a modal floating window (`base`/`head` views)
@@ -738,13 +796,6 @@ Inside PR virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenMod
 - `<localleader>d?` show floating help with available PR diff shortcuts
 - `<localleader>dq` quick close: in 2-way diff closes `modified/head`; in single-buffer view closes and opens `PR Review`
 - `<localleader>dQ` close current diff view(s) and open/focus `PR Review`
-- `<localleader>tw` toggle whitespace diff mode (ignored/strict)
-- `<localleader>ts` toggle leading/trailing whitespace/tab symbol rendering
-- `<localleader>te` toggle endline rendering (`LF`/`CRLF`/`CR`)
-- `<localleader>mm` cycle diff mode (`vertical` -> `horizontal` -> `unified`)
-- `<localleader>mv` force vertical split mode
-- `<localleader>mh` force horizontal split mode
-- `<localleader>mu` force unified mode (single virtual diff buffer)
 - `<localleader>ic` add inline review comment at current line (`MODIFIED`/head or `unified`)
 - visual `<localleader>ic` add inline review comment for selected line range (`v`/`V`, `MODIFIED`/head or `unified`)
 - `<localleader>is` add inline suggestion comment at current line (`suggestion` template)
@@ -753,7 +804,7 @@ Inside PR virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpenMod
 - virtual file content normalizes CRLF/LF/CR line endings, preventing `^M` artifacts
 - for image files (`png/jpg/jpeg/gif/webp/bmp/svg`), previews are rendered in virtual buffers when supported by `snacks.image`
 - for image files in `unified` mode, plugin forces split view (vertical/horizontal) instead of unified text diff
-- for image files, line-comments popup and inline/suggestion/hunk shortcuts (`<localleader>dk`, `<localleader>ic`, `<localleader>is`, `<localleader>dn`, `<localleader>dp`, `<localleader>te`) are disabled
+- for image files, line-comments popup and inline/suggestion/hunk shortcuts (`<localleader>dk`, `<localleader>ic`, `<localleader>is`, `<localleader>dn`, `<localleader>dp`) are disabled
 - for image files, `<localleader>io` runs the configured default fallback action and `<localleader>im` opens fallback actions menu
 - if image render backend is unavailable/unsupported, gh-pr opens the image fallback menu (configurable), can open local cached files, open GitHub compare URL, and can render metadata diff text (resolution/size/sha)
 - in `ADDED` single-buffer mode, `<localleader>ic` is allowed on any line/range
@@ -799,18 +850,25 @@ Inside `gh_pr_review` Neo-tree source:
   - `Commits` expands selected commit and lists changed files
   - `Commit file` opens diff scoped to selected commit (`parent[1] -> commit`)
   - `Checks` opens check URL
-  - `Comments` is a tree with `By File` and `Global` sections
-  - `By File` groups comment threads by path/file and thread labels show status badges
-    (`[UNRESOLVED]`, `[RESOLVED]`, `[CLOSED]`)
-- `Global` includes review events and general PR comments
+  - `Comments` keeps `Global` section (reviews, general comments, and orphan threads without file path)
+- `Global` includes review events, general PR comments, and orphan threads
 - Thread nodes/items open file/line and thread popup when location exists
 - Review/general comment nodes open timeline popup
+- In `Files`, each file row uses right-aligned fixed indicators:
+  - status letter (`A`/`M`/`D`/`R`/`C`) with status highlight,
+  - viewed check icon (replaces textual `VIEWED`),
+  - comment badge (`icon xN`) where `N` is total file comments (all states).
+  - badges are rendered as one fixed right-side block to stay stable when toggling width (`e`) or resizing the Neo-tree window.
+- In flat list mode (`zt`), each file row also shows muted parent-path context:
+  - `filename.ext · path/to/parent`
+  - long paths are compacted from the left (`…/Carpeta2/Carpeta3`).
+- In `Files`, `zt` toggles a flat list mode (`no tree`) and persists globally.
 - In `Files`, directory nodes show a yellow prefix `X/Y VIEWED` when at least one descendant file is viewed
   (counts are recursive and include subfolders).
 - `v` on files toggles viewed state and refreshes PR state immediately.
 - Marking viewed/unviewed from `gh_pr_review` does not force-focus `gh_pr` panel.
 - `R` forces a refresh from GitHub for the active review PR.
-- `:GhPrOpenCommitPatch` opens full patch for selected commit.
+- `:GhPrOpenCommitPatch` opens selected commit diff in codediff (or virtual patch in session fallback backend).
 - `r` re-runs start-review flow for selected PR context.
 - `ra` submit pending review as approve.
 - `rc` submit pending review as comment.
@@ -825,10 +883,9 @@ Inside `gh_pr_review` Neo-tree source:
 - `za` collapse all review nodes.
 - `zF` expand `Files` subtree.
 - `zf` collapse `Files` subtree.
+- `zt` toggle `Files` list/tree mode (persisted globally).
 - `zV` expand paths that contain viewed files.
 - `zv` collapse paths that contain viewed files.
-- `zC` expand `Comments > By File`.
-- `zc` collapse `Comments > By File`.
 - `zG` expand `Comments > Global` (including subgroups).
 - `zg` collapse `Comments > Global` (including subgroups).
 
@@ -840,7 +897,34 @@ The plugin exposes source modules:
 - `gh_pr` (`lua/gh_pr.lua`)
 - `gh_pr_review` (`lua/gh_pr_review.lua`)
 
-`GhPrOpen`, `GhPrStartReview`, and `GhPrReviewTree` auto-register required sources in Neo-tree config at runtime.
+`GhPrOpen` auto-manages `gh_pr` lazily:
+
+- By default, `gh_pr` is auto-registered only when the current workspace passes an async Git probe and has a GitHub remote.
+- `GhPrOpen` is idempotent: it focuses/shows `gh_pr` and does not toggle it closed on repeated calls.
+- If the workspace probe is still running, `GhPrOpen` queues the open and completes it when the probe resolves.
+- Registering `gh_pr` does not fetch PR data. The first fetch starts when Neo-tree navigates that source.
+- `GhPrReviewTree` keeps toggle behavior for `gh_pr_review`.
+
+Public config for PR source registration:
+
+```lua
+require("gh-pr").setup({
+  ui = {
+    neotree_sources = {
+      pr = {
+        auto_register = true,
+        gate = "github_repo", -- "github_repo" | "git_repo" | "manual"
+        workspace = "cwd", -- "cwd" | "buffer_repo" | "neotree_root"
+      },
+    },
+  },
+})
+```
+
+- `gate = "github_repo"` keeps `gh_pr` hidden unless the workspace resolves to a GitHub remote.
+- `gate = "git_repo"` exposes `gh_pr` for any git repository.
+- `gate = "manual"` disables auto-registration and preserves explicit source insertion only.
+- `workspace = "cwd"` is the default. `buffer_repo` probes from the current buffer path, and `neotree_root` probes from the active Neo-tree root when available.
 
 ## Highlights
 
@@ -863,7 +947,9 @@ vim.api.nvim_create_autocmd("ColorScheme", {
 - Viewed file state is persisted in `stdpath("state")/gh-pr/state.json`.
 - Diff view preferences (`mode`, `ignore_whitespace`, `render_whitespace`, `render_endlines`) are persisted in `stdpath("state")/gh-pr/state.json`.
 - Image fallback default action is persisted in `stdpath("state")/gh-pr/state.json`.
+- PR Review Files mode (`tree/list`) is persisted in `stdpath("state")/gh-pr/state.json`.
 - PR cache is persisted in `stdpath("state")/gh-pr/pr_cache.json`.
 - Cache entries are scoped per source and repository key (`gh_pr` and `gh_pr_review`).
 - File content is fetched from GitHub API through `gh api` and opened in readonly buffers.
+- Read-only gh-pr UI buffers are kept `nomodified` and should not require save confirmation when closing Neovim.
 - File open in PR views no longer falls back to patch (`@@`) buffers when content fetch fails; commit patch views remain explicit.

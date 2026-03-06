@@ -190,8 +190,104 @@ local function virtual_text_options(lc_config)
     enabled = source.enabled ~= false,
     prefix = safe_string(source.prefix, "C"),
     show_count = source.show_count ~= false,
+    show_authors = source.show_authors ~= false,
+    max_authors = math.max(1, math.floor(tonumber(source.max_authors) or 2)),
     position = source.position == "inline" and "inline" or "eol",
   }
+end
+
+local function normalize_author_login(author)
+  local login = vim.trim(safe_string(author, ""))
+  if login == "" then
+    return ""
+  end
+  if login:sub(1, 1) == "@" then
+    login = login:sub(2)
+  end
+  return vim.trim(login)
+end
+
+local function build_count_virtual_label(entries, vt_opts)
+  local label = vt_opts.prefix
+  if vt_opts.show_count then
+    label = string.format("%s x%d", label, #entries)
+  end
+  if label == "" then
+    label = string.format("x%d", #entries)
+  end
+  return label
+end
+
+local function build_authors_virtual_label(entries, vt_opts)
+  if type(entries) ~= "table" or vim.tbl_isempty(entries) then
+    return ""
+  end
+
+  local seen = {}
+  local selected = {}
+  local unique_total = 0
+  local max_authors = math.max(1, math.floor(tonumber(vt_opts.max_authors) or 2))
+
+  for index = #entries, 1, -1 do
+    local entry = entries[index]
+    local login = normalize_author_login(type(entry) == "table" and entry.author or "")
+    if login ~= "" and login ~= "unknown" then
+      local dedup_key = login:lower()
+      if not seen[dedup_key] then
+        seen[dedup_key] = true
+        unique_total = unique_total + 1
+        if #selected < max_authors then
+          selected[#selected + 1] = "@" .. login
+        end
+      end
+    end
+  end
+
+  if unique_total == 0 or #selected == 0 then
+    return ""
+  end
+
+  local label = "💬 " .. table.concat(selected, ", ")
+  local remaining = unique_total - #selected
+  if remaining > 0 then
+    label = string.format("%s +%d", label, remaining)
+  end
+  return label
+end
+
+local function build_multiline_progress_label(entries, vt_opts)
+  if type(entries) ~= "table" or vim.tbl_isempty(entries) then
+    return ""
+  end
+
+  if #entries > 1 then
+    return string.format("💬 %d comments", #entries)
+  end
+
+  local entry = entries[1]
+  if type(entry) ~= "table" then
+    return ""
+  end
+
+  local range_length = math.floor(tonumber(entry.range_length) or 0)
+  local range_index = math.floor(tonumber(entry.range_index) or 0)
+  if range_length < 2 or range_index < 1 then
+    return ""
+  end
+
+  if range_index > range_length then
+    range_index = range_length
+  end
+
+  local label = string.format("💬 L%d/%d", range_index, range_length)
+  if vt_opts.show_authors then
+    local login = normalize_author_login(entry.author)
+    if login ~= "" and login:lower() ~= "unknown" then
+      label = string.format("%s @%s", label, login)
+    end
+  end
+
+  return label
 end
 
 local function popup_options(bufnr, lc_config)
@@ -355,16 +451,25 @@ function M.attach_to_buffer(bufnr, ctx)
     end
 
     if flags.virtual_text and vt_opts.enabled then
-      local label = vt_opts.prefix
-      if vt_opts.show_count then
-        label = string.format("%s x%d", label, #entries)
+      local label = ""
+      local virt_hl_group = virt_hl_groups[kind]
+
+      label = build_multiline_progress_label(entries, vt_opts)
+      if label ~= "" then
+        virt_hl_group = "GhPrCommentVirtAuthors"
+      elseif vt_opts.show_authors then
+        label = build_authors_virtual_label(entries, vt_opts)
+        if label ~= "" then
+          virt_hl_group = "GhPrCommentVirtAuthors"
+        end
       end
+
       if label == "" then
-        label = string.format("x%d", #entries)
+        label = build_count_virtual_label(entries, vt_opts)
       end
 
       pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, line - 1, 0, {
-        virt_text = { { label, virt_hl_groups[kind] } },
+        virt_text = { { label, virt_hl_group } },
         virt_text_pos = vt_opts.position,
         priority = 60,
       })

@@ -130,6 +130,7 @@ local function render(state)
   vim.api.nvim_buf_set_option(state.bufnr, "modifiable", true)
   vim.api.nvim_buf_set_lines(state.bufnr, 0, -1, false, lines)
   vim.api.nvim_buf_set_option(state.bufnr, "modifiable", false)
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = state.bufnr })
 
   vim.api.nvim_buf_clear_namespace(state.bufnr, state.namespace, 0, -1)
   vim.api.nvim_buf_add_highlight(state.bufnr, state.namespace, "Title", 0, 0, -1)

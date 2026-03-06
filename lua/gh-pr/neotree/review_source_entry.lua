@@ -1,0 +1,127 @@
+local highlights = require("gh-pr.highlights")
+local registry = require("gh-pr.neotree.registry")
+
+local M = {
+  name = "gh_pr_review",
+  display_name = "GH PR Review",
+}
+
+local DEFAULT_RENDERERS = {
+  folder = {
+    { "indent", with_expanders = true },
+    { "kind_icon" },
+    { "container", width = "100%", content = { { "folder_viewed_badge", zindex = 10 }, { "name", zindex = 11 } } },
+  },
+  files = {
+    { "indent", with_expanders = true },
+    { "kind_icon" },
+    { "container", width = "100%", content = { { "name", zindex = 10 } } },
+  },
+  overview = {
+    { "indent", with_expanders = false },
+    { "kind_icon" },
+    { "container", width = "100%", content = { { "name", zindex = 10 } } },
+  },
+  directory = {
+    { "indent", with_expanders = true },
+    { "kind_icon" },
+    { "container", width = "100%", content = { { "folder_viewed_badge", zindex = 10 }, { "name", zindex = 11 } } },
+  },
+  file = {
+    { "indent", with_expanders = false },
+    { "kind_icon" },
+    {
+      "container",
+      width = "100%",
+      content = {
+        { "name", zindex = 10 },
+        { "file_parent_path", zindex = 10 },
+        { "file_review_badges", zindex = 20, align = "right" },
+      },
+    },
+  },
+  comment_file = {
+    { "indent", with_expanders = true },
+    { "kind_icon" },
+    { "container", width = "100%", content = { { "name", zindex = 10 } } },
+  },
+  message = {
+    { "indent", with_markers = false, with_expanders = false },
+    { "kind_icon" },
+    { "name", highlight = "NeoTreeMessage" },
+  },
+}
+
+local function get_impl()
+  local source = registry.get("gh_pr_review")
+  if source then
+    return source
+  end
+
+  source = require("gh-pr.neotree.review_source")
+  registry.register("gh_pr_review", source)
+  return source
+end
+
+function M.setup(source_config, _)
+  highlights.ensure_baseline_links()
+
+  local commands = require("gh-pr.neotree.review_commands")
+  local components = require("gh-pr.neotree.components")
+
+  source_config.commands = vim.tbl_deep_extend("force", source_config.commands or {}, commands)
+  source_config.components = source_config.components or components
+  source_config.renderers = vim.tbl_deep_extend("force", source_config.renderers or {}, DEFAULT_RENDERERS)
+
+  source_config.window = source_config.window or {}
+  source_config.window.mappings = source_config.window.mappings or {}
+
+  local default_mappings = {
+    ["<CR>"] = "gh_pr_review_open",
+    ["R"] = "refresh",
+    ["o"] = "open_overview",
+    ["b"] = "open_pr_browser",
+    ["T"] = "open_telescope_actions",
+    ["d"] = "open_diff",
+    ["O"] = "open_original",
+    ["M"] = "open_modified",
+    ["v"] = "toggle_viewed",
+    ["a"] = "edit_assignees_multi",
+    ["l"] = "edit_labels_multi",
+    ["u"] = "edit_reviewers_multi",
+    ["g"] = "comment_file_global",
+    ["c"] = "comment_pr",
+    ["r"] = "start_review",
+    ["ra"] = "submit_pending_approve_review",
+    ["rc"] = "submit_pending_comment_review",
+    ["rr"] = "submit_pending_request_changes_review",
+    ["rd"] = "discard_pending_review",
+    ["zA"] = "expand_all_review_nodes",
+    ["za"] = "collapse_all_review_nodes",
+    ["zF"] = "expand_files_nodes",
+    ["zf"] = "collapse_files_nodes",
+    ["zt"] = "toggle_files_flat_mode",
+    ["zV"] = "expand_viewed_file_paths",
+    ["zv"] = "collapse_viewed_file_paths",
+    ["zG"] = "expand_comments_global",
+    ["zg"] = "collapse_comments_global",
+    ["x"] = "toggle_review_tree",
+    ["e"] = "toggle_auto_expand_width",
+    ["q"] = "close_window",
+    ["?"] = "show_help",
+    ["<"] = "prev_source",
+    [">"] = "next_source",
+    ["y"] = "noop",
+    ["<C-r>"] = "noop",
+    ["t"] = "noop",
+    ["w"] = "noop",
+  }
+
+  source_config.window.mappings = vim.tbl_deep_extend("force", source_config.window.mappings, default_mappings)
+end
+
+function M.navigate(state, path, path_to_reveal, callback, async)
+  return get_impl().navigate(state, path, path_to_reveal, callback, async)
+end
+
+return M

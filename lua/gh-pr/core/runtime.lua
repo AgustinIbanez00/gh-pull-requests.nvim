@@ -1,6 +1,7 @@
 local M = {}
 
 local config = require("gh-pr.config")
+local registry = require("gh-pr.neotree.registry")
 local uv = vim.uv or vim.loop
 
 local runtime_initialized = false
@@ -54,8 +55,8 @@ local function start_auto_refresh_timer()
 
   local interval_ms = interval * 1000
   auto_refresh_timer:start(interval_ms, interval_ms, vim.schedule_wrap(function()
-    local source_ok, source = pcall(require, "gh-pr.neotree.source")
-    if gh_pr_enabled and source_ok and type(source.request_refresh) == "function" then
+    local source = registry.get("gh_pr")
+    if gh_pr_enabled and type(source) == "table" and type(source.request_refresh) == "function" then
       local focused = type(source.is_focused) == "function" and source.is_focused() == true
       pcall(source.request_refresh, nil, {
         force = false,
@@ -68,8 +69,8 @@ local function start_auto_refresh_timer()
       })
     end
 
-    local review_ok, review_source = pcall(require, "gh-pr.neotree.review_source")
-    if gh_pr_review_enabled and review_ok and type(review_source.request_refresh) == "function" then
+    local review_source = registry.get("gh_pr_review")
+    if gh_pr_review_enabled and type(review_source) == "table" and type(review_source.request_refresh) == "function" then
       local focused = type(review_source.is_focused) == "function" and review_source.is_focused() == true
       pcall(review_source.request_refresh, nil, {
         force = false,
@@ -116,20 +117,63 @@ local function schedule_follow_current_file()
 
     local review_visible = false
     if options.source_pr_review then
-      local review_ok, review_source = pcall(require, "gh-pr.neotree.review_source")
-      if review_ok and type(review_source.follow_current_file_if_visible) == "function" then
+      local review_source = registry.get("gh_pr_review")
+      if type(review_source) == "table" and type(review_source.follow_current_file_if_visible) == "function" then
         local ok, visible = pcall(review_source.follow_current_file_if_visible, { reason = "autocmd" })
         review_visible = ok and visible == true
       end
     end
 
     if not review_visible and options.source_pr then
-      local source_ok, source = pcall(require, "gh-pr.neotree.source")
-      if source_ok and type(source.follow_current_file_if_visible) == "function" then
+      local source = registry.get("gh_pr")
+      if type(source) == "table" and type(source.follow_current_file_if_visible) == "function" then
         pcall(source.follow_current_file_if_visible, { reason = "autocmd" })
       end
     end
   end, options.debounce_ms)
+end
+
+local function read_buffer_boolean_option(bufnr, option_name)
+  if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+
+  local ok, value = pcall(vim.api.nvim_get_option_value, option_name, { buf = bufnr })
+  if not ok then
+    return false
+  end
+  return value == true
+end
+
+local function has_ghpr_uri_name(bufnr)
+  if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+
+  local ok, name = pcall(vim.api.nvim_buf_get_name, bufnr)
+  if not ok or type(name) ~= "string" or name == "" then
+    return false
+  end
+
+  return name:sub(1, 7) == "ghpr://"
+end
+
+local function clear_modified_on_readonly_ghpr_buffer(bufnr)
+  if not has_ghpr_uri_name(bufnr) then
+    return
+  end
+
+  local readonly = read_buffer_boolean_option(bufnr, "readonly")
+  local modifiable = read_buffer_boolean_option(bufnr, "modifiable")
+  if (not readonly) and modifiable then
+    return
+  end
+
+  if not read_buffer_boolean_option(bufnr, "modified") then
+    return
+  end
+
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = bufnr })
 end
 
 function M.is_initialized()
@@ -181,6 +225,16 @@ function M.ensure_initialized(opts)
     vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
       group = auto_refresh_group,
       callback = schedule_follow_current_file,
+    })
+    vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter", "BufModifiedSet" }, {
+      group = auto_refresh_group,
+      callback = function(args)
+        local bufnr = type(args) == "table" and tonumber(args.buf) or nil
+        if type(bufnr) ~= "number" or bufnr < 1 then
+          bufnr = vim.api.nvim_get_current_buf()
+        end
+        clear_modified_on_readonly_ghpr_buffer(bufnr)
+      end,
     })
   end
 

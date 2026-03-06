@@ -6,6 +6,7 @@ local config = require("gh-pr.config")
 local diff_actions = require("gh-pr.core.diff_actions")
 local overview_actions = require("gh-pr.core.overview_actions")
 local overview_edit_actions = require("gh-pr.core.overview_edit_actions")
+local review_prefetch = require("gh-pr.core.review_prefetch")
 local review_actions = require("gh-pr.core.review_actions")
 local diff_shortcuts_config = require("gh-pr.diff_shortcuts")
 local gh = require("gh-pr.gh")
@@ -14,9 +15,16 @@ local line_comments = require("gh-pr.line_comments")
 local pr_service = require("gh-pr.pr_service")
 local state = require("gh-pr.state")
 local thread_popup = require("gh-pr.thread_popup")
+local url_open = require("gh-pr.url_open")
 local overview_edit_picker = require("gh-pr.ui.overview.edit_picker")
+local codediff_integration = require("gh-pr.integrations.codediff")
 local virtual_files = require("gh-pr.virtual_files")
 local uv = vim.uv or vim.loop
+
+local diff_backend_session = {
+  virtual_fallback = nil,
+  prompt_open = false,
+}
 
 local function normalize_repository(details)
   local repository = details.baseRepository or details.headRepository
@@ -62,6 +70,57 @@ end
 
 local function notify_warn(message)
   vim.notify(message, vim.log.levels.WARN)
+end
+
+local function safe_string(value, fallback)
+  if type(value) == "string" and value ~= "" then
+    return value
+  end
+  return fallback or ""
+end
+
+local function codediff_debug_failures_enabled()
+  local diff_view = ((config.get() or {}).diff_view or {})
+  local debug = type(diff_view.debug) == "table" and diff_view.debug or {}
+  return debug.codediff_failures == true
+end
+
+local function notify_codediff_debug(message)
+  if not codediff_debug_failures_enabled() then
+    return
+  end
+
+  local text = type(message) == "string" and vim.trim(message) or ""
+  if text == "" then
+    return
+  end
+
+  notify_warn("[gh-pr debug] " .. text)
+end
+
+local function using_virtual_diff_backend()
+  return diff_backend_session.virtual_fallback == true
+end
+
+local function virtual_only_feature_message(feature)
+  local label = type(feature) == "string" and vim.trim(feature) or "This action"
+  if label == "" then
+    label = "This action"
+  end
+  return string.format("%s is not available with codediff backend.", label)
+end
+
+local function require_virtual_diff_backend(feature)
+  if using_virtual_diff_backend() then
+    return true
+  end
+
+  notify_warn(virtual_only_feature_message(feature))
+  return false
+end
+
+local function supports_interactive_select()
+  return vim.ui ~= nil and type(vim.ui.select) == "function"
 end
 
 local function open_review_tree_from_plugin(opts)
@@ -170,15 +229,17 @@ end
 local function refresh_pr_sources_after_state_change(opts)
   opts = opts or {}
   local force = opts.force == true
+  local registry = require("gh-pr.neotree.registry")
 
-  local source_ok, source = pcall(require, "gh-pr.neotree.source")
-  if source_ok then
+  local source = registry.get("gh_pr")
+  if type(source) == "table" then
+    local source_focused = type(source.is_focused) == "function" and source.is_focused() == true
     if type(source.request_refresh) == "function" then
       pcall(source.request_refresh, nil, {
         force = force,
         notify_error = false,
         refresh_context = {
-          mode = "cache-only",
+          mode = source_focused and "ui-refresh" or "cache-only",
           reason = "state-change",
           notify = false,
         },
@@ -186,27 +247,20 @@ local function refresh_pr_sources_after_state_change(opts)
     end
   end
 
-  local review_ok, review_source = pcall(require, "gh-pr.neotree.review_source")
-  if review_ok then
-    if type(review_source.render_cached_states) == "function" then
-      pcall(review_source.render_cached_states)
-    end
+  local review_source = registry.get("gh_pr_review")
+  if type(review_source) == "table" then
+    local review_focused = type(review_source.is_focused) == "function" and review_source.is_focused() == true
     if type(review_source.request_refresh) == "function" then
       pcall(review_source.request_refresh, nil, {
         force = force,
         notify_error = false,
         refresh_context = {
-          mode = "ui-refresh",
+          mode = review_focused and "ui-refresh" or "cache-only",
           reason = "state-change",
           notify = false,
         },
       })
     end
-  end
-
-  local manager_ok, manager = pcall(require, "neo-tree.sources.manager")
-  if manager_ok then
-    pcall(manager.refresh, "gh_pr_review")
   end
 end
 
@@ -668,6 +722,150 @@ local function resolve_side_repository(details, side, fallback_full_name)
   return head_repo or base_repo or parse_repo_full_name(fallback_full_name)
 end
 
+local function backend_error_message(err, fallback)
+  if type(err) == "table" then
+    local message = type(err.message) == "string" and err.message or ""
+    if message ~= "" then
+      return message
+    end
+    local nested = type(err.error) == "string" and err.error or ""
+    if nested ~= "" then
+      return nested
+    end
+    return fallback
+  end
+
+  if type(err) == "string" and err ~= "" then
+    return err
+  end
+
+  return fallback
+end
+
+local function prompt_codediff_virtual_fallback_once(reason, open_virtual)
+  local message = type(reason) == "string" and reason ~= "" and reason
+    or "codediff backend is unavailable"
+
+  if diff_backend_session.virtual_fallback ~= nil then
+    return false
+  end
+
+  if not supports_interactive_select() then
+    diff_backend_session.virtual_fallback = false
+    notify_codediff_debug("fallback prompt unavailable in this context")
+    notify_error(message .. " (fallback prompt unavailable in this context)")
+    return false
+  end
+
+  if diff_backend_session.prompt_open then
+    notify_codediff_debug("fallback prompt already open; waiting existing decision")
+    notify_warn("codediff backend decision is already pending in another prompt.")
+    return true
+  end
+
+  diff_backend_session.prompt_open = true
+  notify_codediff_debug("opening fallback prompt for codediff failure")
+  local use_fallback_label = "Use virtual fallback this session"
+  local no_fallback_label = "Do not use fallback"
+  vim.ui.select({ use_fallback_label, no_fallback_label }, {
+    prompt = "codediff failed to open. Choose backend for this session:",
+  }, function(choice)
+    diff_backend_session.prompt_open = false
+
+    local use_fallback = choice == use_fallback_label
+    diff_backend_session.virtual_fallback = use_fallback
+    if use_fallback then
+      notify_codediff_debug("fallback prompt accepted; using virtual fallback (prompt)")
+      notify_warn("Using legacy virtual diff backend for this session.")
+      local ok_virtual, virtual_err = open_virtual()
+      if not ok_virtual and virtual_err ~= nil then
+        notify_codediff_debug(
+          "virtual fallback failed after prompt accept: "
+            .. backend_error_message(virtual_err, "virtual fallback failed")
+        )
+      end
+      if not ok_virtual and type(virtual_err) == "string" and virtual_err ~= "" then
+        notify_error(virtual_err)
+      end
+      return
+    end
+
+    if choice == nil then
+      notify_codediff_debug("fallback prompt cancelled")
+      notify_error("codediff backend failed and fallback selection was cancelled.")
+      return
+    end
+
+    notify_codediff_debug("fallback prompt rejected")
+    notify_error(message)
+  end)
+
+  return true
+end
+
+local function open_diff_with_forced_backend(opts)
+  opts = type(opts) == "table" and opts or {}
+  local open_primary = type(opts.open_primary) == "function" and opts.open_primary
+    or (type(opts.open_codediff) == "function" and opts.open_codediff or nil)
+    or function()
+      return nil, "Missing codediff opener"
+    end
+  local open_virtual = type(opts.open_virtual) == "function" and opts.open_virtual or function()
+    return nil, "Missing virtual fallback opener"
+  end
+
+  if using_virtual_diff_backend() then
+    return open_virtual()
+  end
+
+  local ok_primary, primary_err = open_primary()
+  if ok_primary then
+    return true, nil
+  end
+
+  local primary_message = backend_error_message(primary_err, "codediff backend failed")
+
+  if type(primary_err) == "table" and primary_err.requires_virtual == true then
+    notify_codediff_debug("codediff failed: " .. primary_message)
+    notify_codediff_debug("using virtual fallback (auto)")
+    local ok_virtual, virtual_err = open_virtual()
+    if not ok_virtual then
+      notify_codediff_debug(
+        "virtual fallback failed after auto-fallback: "
+          .. backend_error_message(virtual_err, "virtual fallback failed")
+      )
+    end
+    return ok_virtual, virtual_err
+  end
+
+  notify_codediff_debug("codediff failed: " .. primary_message)
+
+  if diff_backend_session.virtual_fallback == false then
+    notify_codediff_debug("fallback disabled for this session")
+    return nil, primary_message
+  end
+
+  local prompted = prompt_codediff_virtual_fallback_once(primary_message, open_virtual)
+  if prompted then
+    return false, "pending"
+  end
+
+  if using_virtual_diff_backend() then
+    notify_codediff_debug("using virtual fallback (session)")
+    local ok_virtual, virtual_err = open_virtual()
+    if not ok_virtual then
+      notify_codediff_debug(
+        "virtual fallback failed after session decision: "
+          .. backend_error_message(virtual_err, "virtual fallback failed")
+      )
+    end
+    return ok_virtual, virtual_err
+  end
+
+  notify_codediff_debug("codediff failure ended without fallback")
+  return nil, primary_message
+end
+
 local function resolve_image_buffer_context(bufnr)
   bufnr = type(bufnr) == "number" and bufnr or vim.api.nvim_get_current_buf()
   if not is_valid_buf(bufnr) then
@@ -852,13 +1050,10 @@ local function ensure_open_target(target, label)
   end
 
   local is_url = target:match("^https?://") ~= nil
-  local gh_err = nil
-  if is_url and type(pr_service.open_url_in_browser) == "function" then
-    local ok_gh, browser_err = pr_service.open_url_in_browser(target)
-    if ok_gh then
-      return true, nil
-    end
-    gh_err = browser_err
+  if is_url then
+    return url_open.open(target, {
+      notify_error = false,
+    })
   end
 
   local ui_err = nil
@@ -910,9 +1105,6 @@ local function ensure_open_target(target, label)
   end
 
   local errors = {}
-  if type(gh_err) == "string" and gh_err ~= "" then
-    errors[#errors + 1] = "gh browse failed: " .. gh_err
-  end
   if type(ui_err) == "string" and ui_err ~= "" then
     errors[#errors + 1] = "vim.ui.open failed: " .. ui_err
   end
@@ -1162,30 +1354,20 @@ local function open_overview_link_preview_window(opts)
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
   vim.api.nvim_set_option_value("modifiable", false, { buf = bufnr })
   vim.api.nvim_set_option_value("readonly", true, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = bufnr })
 
-  local max_width = math.max(20, vim.o.columns - 2)
-  local max_height = math.max(6, vim.o.lines - vim.o.cmdheight - 2)
-  local width = math.min(math.max(60, vim.o.columns - 4), max_width)
-  local height = math.min(math.max(10, vim.o.lines - vim.o.cmdheight - 4), max_height)
-  local row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1)
-  local col = math.max(0, math.floor((vim.o.columns - width) / 2))
-
-  local ok_win, winid = pcall(vim.api.nvim_open_win, bufnr, true, {
-    relative = "editor",
-    row = row,
-    col = col,
-    width = width,
-    height = height,
-    style = "minimal",
-    border = "rounded",
-    title = "PR Link Preview",
-    title_pos = "center",
-    noautocmd = true,
-  })
-  if not ok_win or not is_valid_win(winid) then
-    return false, "Unable to open preview window"
+  local ok_tab, tab_err = pcall(vim.cmd, "tabnew")
+  if not ok_tab then
+    return false, "Unable to open preview tab: " .. tostring(tab_err)
   end
 
+  local tabpage = vim.api.nvim_get_current_tabpage()
+  local winid = vim.api.nvim_get_current_win()
+  if not is_valid_win(winid) then
+    return false, "Unable to resolve preview window"
+  end
+
+  pcall(vim.api.nvim_win_set_buf, winid, bufnr)
   sanitize_modal_window(winid)
   vim.api.nvim_set_option_value("number", true, { win = winid })
   vim.api.nvim_set_option_value("relativenumber", false, { win = winid })
@@ -1193,21 +1375,26 @@ local function open_overview_link_preview_window(opts)
   vim.api.nvim_set_option_value("wrap", true, { win = winid })
   vim.api.nvim_set_option_value("linebreak", true, { win = winid })
   vim.api.nvim_set_option_value("cursorline", true, { win = winid })
+  vim.api.nvim_set_option_value("spell", false, { win = winid })
   if type(preview_filetype) == "string" and preview_filetype ~= "" and preview_filetype ~= "text" then
     pcall(vim.api.nvim_set_option_value, "syntax", preview_filetype, { win = winid })
   end
 
+  local function close_preview_tab()
+    if vim.api.nvim_get_current_tabpage() ~= tabpage and vim.api.nvim_tabpage_is_valid(tabpage) then
+      pcall(vim.api.nvim_set_current_tabpage, tabpage)
+    end
+    if vim.api.nvim_tabpage_is_valid(tabpage) then
+      pcall(vim.cmd, "tabclose")
+    elseif is_valid_buf(bufnr) then
+      pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+    end
+  end
+
   local key_opts = { buffer = bufnr, silent = true, nowait = true }
-  vim.keymap.set("n", "q", function()
-    if is_valid_win(winid) then
-      pcall(vim.api.nvim_win_close, winid, true)
-    end
-  end, vim.tbl_extend("force", key_opts, { desc = "Close PR link preview" }))
-  vim.keymap.set("n", "<Esc>", function()
-    if is_valid_win(winid) then
-      pcall(vim.api.nvim_win_close, winid, true)
-    end
-  end, vim.tbl_extend("force", key_opts, { desc = "Close PR link preview" }))
+  vim.keymap.set("n", "q", close_preview_tab, vim.tbl_extend("force", key_opts, { desc = "Close PR link preview" }))
+  vim.keymap.set("n", "<Esc>", close_preview_tab, vim.tbl_extend("force", key_opts, { desc = "Close PR link preview" }))
+  pcall(vim.api.nvim_win_set_cursor, winid, { 1, 0 })
 
   return true, nil
 end
@@ -1614,6 +1801,7 @@ local function write_readonly_buffer_lines(bufnr, lines, filetype)
   end
   pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = bufnr })
   pcall(vim.api.nvim_set_option_value, "readonly", true, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = bufnr })
   pcall(vim.fn.winrestview, view)
   return true, nil
 end
@@ -1956,6 +2144,7 @@ function M.open_image_fallback_menu()
   vim.api.nvim_buf_set_option(menu_buf, "filetype", "markdown")
   vim.api.nvim_buf_set_lines(menu_buf, 0, -1, false, lines)
   vim.api.nvim_buf_set_option(menu_buf, "modifiable", false)
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = menu_buf })
 
   vim.api.nvim_win_set_option(menu_win, "number", false)
   vim.api.nvim_win_set_option(menu_win, "relativenumber", false)
@@ -2299,12 +2488,20 @@ local function resolve_comment_target(target)
 end
 
 local function open_target_file(file, side, line)
+  local target_line = positive_integer(line, nil)
   if side == "base" then
-    M.open_original(file)
+    return M.open_original(file, {
+      target_side = "base",
+      target_original_line = target_line,
+      target_line = target_line,
+    })
   else
-    M.open_modified(file)
+    return M.open_modified(file, {
+      target_side = "head",
+      target_line = target_line,
+      target_original_line = target_line,
+    })
   end
-  jump_to_line(line)
 end
 
 function M.set_active_pr(pr, details)
@@ -2337,9 +2534,10 @@ function M.open_comment_location(target, opts)
   end
 
   ensure_navigation_window()
-  open_target_file(file, side, line)
+  local opened = open_target_file(file, side, line)
 
-  if open_thread_popup and popup_thread and type(popup_thread.comments) == "table" and not vim.tbl_isempty(popup_thread.comments) then
+  if opened ~= false and open_thread_popup and popup_thread and type(popup_thread.comments) == "table"
+      and not vim.tbl_isempty(popup_thread.comments) then
     local current_buf = vim.api.nvim_get_current_buf()
     local current_win = vim.api.nvim_get_current_win()
     local ok, popup_err = thread_popup.open(popup_thread, {
@@ -2379,10 +2577,11 @@ function M.preview_comment_location(target, opts)
     return notify_error("Unable to focus preview window: " .. tostring(switch_err))
   end
 
-  open_target_file(file, side, line)
+  local opened = open_target_file(file, side, line)
   local popup_focused = false
 
-  if open_thread_popup and popup_thread and type(popup_thread.comments) == "table" and not vim.tbl_isempty(popup_thread.comments) then
+  if opened ~= false and open_thread_popup and popup_thread and type(popup_thread.comments) == "table"
+      and not vim.tbl_isempty(popup_thread.comments) then
     local preview_buf = vim.api.nvim_get_current_buf()
     local ok, popup_err = thread_popup.open(popup_thread, {
       mode = opts.popup_mode == "open" and "open" or "preview",
@@ -2549,6 +2748,7 @@ local function overview_actions_context()
       open_original = M.open_original,
       open_overview = M.open_overview,
       open_overview_url = M.open_overview_url,
+      open_overview_thread_workspace = M.open_overview_thread_workspace,
       open_thread_comment_commit_diff = M.open_thread_comment_commit_diff,
       open_thread_comment_evolution_diff = M.open_thread_comment_evolution_diff,
       open_thread_fix_diff = M.open_thread_fix_diff,
@@ -2569,6 +2769,7 @@ local function overview_actions_context()
     positive_integer = positive_integer,
     pr_service = pr_service,
     resolve_active_pr = resolve_active_pr,
+    set_active_pr = M.set_active_pr,
   }
 end
 
@@ -2615,6 +2816,9 @@ local function overview_edit_picker_context()
     notify_error = notify_error,
     notify_warn = notify_warn,
     pr_service = pr_service,
+    open_multiline_editor = function(opts)
+      return comment_composer.open(opts)
+    end,
   }
 end
 
@@ -2680,15 +2884,15 @@ local function resolve_commit(commit)
 end
 
 local function open_commit_url(commit)
-  if type(commit) == "table"
-    and type(commit.url) == "string"
-    and commit.url ~= ""
-    and vim.ui
-    and type(vim.ui.open) == "function" then
-    vim.ui.open(commit.url)
-    return true
+  local url = type(commit) == "table" and type(commit.url) == "string" and commit.url or ""
+  if url == "" then
+    return false
   end
-  return false
+  local ok_open = url_open.open(url, {
+    notify_error = true,
+    context = "Unable to open commit URL",
+  })
+  return ok_open == true
 end
 
 local function fetch_commit_details_for_pr(pr, details, selected_commit)
@@ -2769,49 +2973,812 @@ local function build_commit_diff_details(details, commit_details)
   return diff_details
 end
 
-function M.open_commit_diff(commit)
+local function collect_alternate_paths(file, ...)
+  local seen = {}
+  local paths = {}
+
+  local function add(path)
+    local normalized = normalize_path(path)
+    if normalized == "" or seen[normalized] then
+      return
+    end
+    seen[normalized] = true
+    paths[#paths + 1] = normalized
+  end
+
+  if type(file) == "table" then
+    add(file.path)
+    add(file.filename)
+    add(file.previous_filename)
+    add(file.previousFilename)
+  end
+
+  for index = 1, select("#", ...) do
+    add(select(index, ...))
+  end
+
+  return paths
+end
+
+local function set_codediff_buffer_keymap(bufnr, mode, lhs, rhs, desc)
+  if not is_valid_buf(bufnr) then
+    return
+  end
+  if type(lhs) ~= "string" or lhs == "" then
+    return
+  end
+
+  pcall(vim.keymap.del, mode, lhs, { buffer = bufnr })
+  vim.keymap.set(mode, lhs, rhs, {
+    buffer = bufnr,
+    silent = true,
+    nowait = true,
+    desc = desc,
+  })
+end
+
+local function apply_codediff_buffer_keymaps(bufnr)
+  if not is_valid_buf(bufnr) then
+    return
+  end
+
+  local shortcuts = diff_view_shortcuts()
+
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.close_quick, function()
+    M.close_quick()
+  end, "GH PR: quick close")
+  set_codediff_buffer_keymap(
+    bufnr,
+    "n",
+    shortcuts.close_all_open_review,
+    function()
+      M.close_all_and_open_review()
+    end,
+    "GH PR: close views and open review"
+  )
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.help, function()
+    M.show_diff_shortcuts()
+  end, "GH PR: show diff shortcuts")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.next_file, function()
+    M.next_file()
+  end, "GH PR: next file")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.prev_file, function()
+    M.prev_file()
+  end, "GH PR: previous file")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.next_reviewed_file, function()
+    M.next_reviewed_file()
+  end, "GH PR: next reviewed file")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.prev_reviewed_file, function()
+    M.prev_reviewed_file()
+  end, "GH PR: previous reviewed file")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.next_change, function()
+    M.next_change()
+  end, "GH PR: next change")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.prev_change, function()
+    M.prev_change()
+  end, "GH PR: previous change")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.inline_comment, function()
+    M.add_inline_comment()
+  end, "GH PR: add inline comment")
+  set_codediff_buffer_keymap(bufnr, "x", shortcuts.inline_comment, function()
+    M.add_inline_comment_visual()
+  end, "GH PR: add inline comment (selection)")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.inline_suggestion, function()
+    M.add_inline_suggestion()
+  end, "GH PR: add inline suggestion")
+  set_codediff_buffer_keymap(bufnr, "x", shortcuts.inline_suggestion, function()
+    M.add_inline_suggestion_visual()
+  end, "GH PR: add inline suggestion (selection)")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.line_comments_popup, function()
+    line_comments.show_at_cursor(bufnr)
+  end, "GH PR: show line comments")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.toggle_comments_panel, function()
+    M.toggle_diff_comments_panel()
+  end, "GH PR: toggle comments panel")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.submit_pending_comment, function()
+    M.submit_pending_comment_review()
+  end, "GH PR: submit pending comment review")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.submit_pending_approve, function()
+    M.submit_pending_approve_review()
+  end, "GH PR: submit pending approve review")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.submit_pending_request_changes, function()
+    M.submit_pending_request_changes_review()
+  end, "GH PR: submit pending request changes review")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.discard_pending_review, function()
+    M.discard_pending_review()
+  end, "GH PR: discard pending review")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.toggle_review_tree, function()
+    M.toggle_review_tree()
+  end, "GH PR: toggle review tree")
+end
+
+local function apply_codediff_buffer_metadata(bufnr, pr, details, path, side, file_mode)
+  if not is_valid_buf(bufnr) then
+    return
+  end
+
+  local normalized_path = normalize_path(path)
+  local canonical_path = resolve_canonical_file_path(details, normalized_path)
+  local repository = normalize_repository(details) or ""
+
+  vim.b[bufnr].gh_pr_repo = repository ~= "" and repository or nil
+  vim.b[bufnr].gh_pr_number = tonumber(pr.number)
+  vim.b[bufnr].gh_pr_path = normalized_path
+  vim.b[bufnr].gh_pr_file_path = canonical_path ~= "" and canonical_path or nil
+  vim.b[bufnr].gh_pr_file_kind = side
+  vim.b[bufnr].gh_pr_file_mode = type(file_mode) == "string" and file_mode ~= "" and file_mode or nil
+  vim.b[bufnr].gh_pr_diff_backend = "codediff"
+  vim.b[bufnr].gh_pr_is_image = false
+  vim.b[bufnr].gh_pr_image_side = nil
+  vim.b[bufnr].gh_pr_image_status = nil
+  vim.b[bufnr].gh_pr_image_reason = nil
+  vim.b[bufnr].gh_pr_image_cache_path = nil
+  vim.b[bufnr].gh_pr_unified_line_map = nil
+  vim.b[bufnr].gh_pr_endline_map = nil
+  vim.b[bufnr].gh_pr_comment_side = side
+  pcall(vim.api.nvim_set_option_value, "spell", false, { buf = bufnr })
+
+  apply_codediff_buffer_keymaps(bufnr)
+end
+
+local function resolve_codediff_window(winid, bufnr)
+  local candidate = tonumber(winid)
+  if is_valid_win(candidate) then
+    return candidate
+  end
+
+  if is_valid_buf(bufnr) then
+    local buffer_win = vim.fn.bufwinid(bufnr)
+    if is_valid_win(buffer_win) then
+      return buffer_win
+    end
+  end
+
+  return nil
+end
+
+local function apply_codediff_window_number_options(winid)
+  if not is_valid_win(winid) then
+    return
+  end
+
+  pcall(vim.api.nvim_set_option_value, "number", true, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "relativenumber", true, { win = winid })
+end
+
+local function apply_codediff_open_result_context(pr, details, file, open_result, opts)
+  opts = type(opts) == "table" and opts or {}
+  open_result = type(open_result) == "table" and open_result or {}
+
+  if open_result.mode ~= "file" then
+    return
+  end
+
+  local file_mode = type(open_result.file_mode) == "string" and open_result.file_mode or ""
+  local base_path = normalize_path(open_result.base_path)
+  local head_path = normalize_path(open_result.head_path)
+  if base_path == "" and type(file) == "table" then
+    base_path = normalize_path(file.previous_filename or file.previousFilename or file.path or file.filename)
+  end
+  if head_path == "" and type(file) == "table" then
+    head_path = normalize_path(file.path or file.filename)
+  end
+
+  local alternates = collect_alternate_paths(file, base_path, head_path)
+  local comments_ctx = type(opts.comments_ctx) == "table" and opts.comments_ctx or nil
+  local base_buf = tonumber(open_result.base_buf)
+  local head_buf = tonumber(open_result.head_buf)
+
+  if is_valid_buf(base_buf) then
+    apply_codediff_buffer_metadata(base_buf, pr, details, base_path, "base", file_mode)
+    local base_win = resolve_codediff_window(open_result.base_win, base_buf)
+    if base_win then
+      apply_codediff_window_number_options(base_win)
+    end
+    if comments_ctx then
+      line_comments.attach_to_buffer(base_buf, {
+        index = comments_ctx.index,
+        side = "base",
+        file_path = base_path,
+        alternate_paths = alternates,
+        keymap = comments_ctx.keymap,
+        signs = comments_ctx.signs,
+        max_popup_width = comments_ctx.max_popup_width,
+        max_popup_height = comments_ctx.max_popup_height,
+      })
+    end
+  end
+
+  if is_valid_buf(head_buf) then
+    apply_codediff_buffer_metadata(head_buf, pr, details, head_path, "head", file_mode)
+    local head_win = resolve_codediff_window(open_result.head_win, head_buf)
+    if head_win then
+      apply_codediff_window_number_options(head_win)
+    end
+    if comments_ctx then
+      line_comments.attach_to_buffer(head_buf, {
+        index = comments_ctx.index,
+        side = "head",
+        file_path = head_path,
+        alternate_paths = alternates,
+        keymap = comments_ctx.keymap,
+        signs = comments_ctx.signs,
+        max_popup_width = comments_ctx.max_popup_width,
+        max_popup_height = comments_ctx.max_popup_height,
+      })
+    end
+  end
+end
+
+local function sync_diff_comments_panel(pr, details, comments_ctx)
+  local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
+  if ok_panel and type(panel.sync_for_diff) == "function" then
+    local origin_win = vim.api.nvim_get_current_win()
+    local origin_buf = vim.api.nvim_get_current_buf()
+    pcall(panel.sync_for_diff, {
+      pr = pr,
+      details = details,
+      comments_ctx = comments_ctx,
+      pr_number = pr.number,
+      origin_win = origin_win,
+      origin_buf = origin_buf,
+      file_path = normalize_path(vim.b[origin_buf].gh_pr_file_path or vim.b[origin_buf].gh_pr_path),
+      file_kind = vim.b[origin_buf].gh_pr_file_kind,
+    })
+  end
+end
+
+local function valid_tabpage(tabpage)
+  return type(tabpage) == "number" and tabpage > 0 and vim.api.nvim_tabpage_is_valid(tabpage)
+end
+
+local function normalized_thread_side(side)
+  local value = type(side) == "string" and side:lower() or "head"
+  if value == "base" or value == "left" then
+    return "base"
+  end
+  return "head"
+end
+
+local function preferred_thread_line(side, line, original_line)
+  if side == "base" then
+    return positive_integer(original_line, positive_integer(line, nil))
+  end
+  return positive_integer(line, positive_integer(original_line, nil))
+end
+
+local function overview_thread_date_format()
+  local overview = ((config.get() or {}).overview or {})
+  local date_format = type(overview.date_format) == "string" and overview.date_format or ""
+  if date_format == "" then
+    return "%Y-%m-%d %H:%M"
+  end
+  return date_format
+end
+
+local function format_overview_thread_timestamp(value, date_format)
+  local text = safe_string(value)
+  if text == "" then
+    return "-"
+  end
+
+  local seconds = vim.fn.strptime("%Y-%m-%dT%H:%M:%SZ", text)
+  if type(seconds) == "number" and seconds > 0 then
+    return vim.fn.strftime(date_format, seconds)
+  end
+
+  return text:gsub("T", " "):gsub("Z", "")
+end
+
+local function build_overview_thread_workspace_lines(payload)
+  payload = type(payload) == "table" and payload or {}
+  local path = safe_string(payload.path)
+  if path == "" then
+    path = "(unknown path)"
+  end
+
+  local side = normalized_thread_side(payload.side)
+  local head_line = positive_integer(payload.line, nil)
+  local base_line = positive_integer(payload.original_line, nil)
+  local line_text = "-"
+  if side == "base" and base_line then
+    line_text = tostring(base_line)
+  elseif side == "head" and head_line then
+    line_text = tostring(head_line)
+  elseif head_line or base_line then
+    line_text = tostring(head_line or base_line)
+  end
+
+  local status = "open"
+  if payload.is_resolved == true then
+    status = "resolved"
+  end
+  if payload.is_outdated == true then
+    status = status .. " + outdated"
+  end
+
+  local comments = type(payload.comments) == "table" and payload.comments or {}
+  local date_format = overview_thread_date_format()
+  local lines = {
+    "# Thread Workspace",
+    "",
+    string.format("- Path: `%s`", path),
+    string.format("- Focus: `%s:%s`", side, line_text),
+    string.format("- Status: `%s`", status),
+    string.format("- Comments: `%d`", #comments),
+    "",
+  }
+
+  if vim.tbl_isempty(comments) then
+    lines[#lines + 1] = "_No comments available for this thread._"
+    return lines
+  end
+
+  for index, comment in ipairs(comments) do
+    local author = safe_string(comment.author, "unknown")
+    local created_at = format_overview_thread_timestamp(comment.created_at, date_format)
+    local state = safe_string(comment.state)
+    local raw_comment_side = safe_string(comment.side, side)
+    if raw_comment_side == "" then
+      raw_comment_side = side
+    end
+    local comment_side = normalized_thread_side(raw_comment_side)
+    local comment_line = preferred_thread_line(comment_side, comment.line, comment.original_line)
+
+    lines[#lines + 1] = string.format("## %d. @%s", index, author)
+    lines[#lines + 1] = string.format("- Date: %s", created_at)
+    lines[#lines + 1] = string.format("- State: `%s`", state ~= "" and state or "COMMENTED")
+    if comment_line then
+      lines[#lines + 1] = string.format("- Location: `%s:%d`", comment_side, comment_line)
+    else
+      lines[#lines + 1] = string.format("- Location: `%s`", comment_side)
+    end
+
+    local url = safe_string(comment.url)
+    if url ~= "" then
+      lines[#lines + 1] = string.format("- URL: %s", url)
+    end
+
+    lines[#lines + 1] = ""
+
+    local body = type(comment.body) == "string" and comment.body:gsub("\r\n", "\n"):gsub("\r", "\n") or ""
+    local body_lines = vim.split(body, "\n", { plain = true })
+    if vim.tbl_isempty(body_lines) or (#body_lines == 1 and body_lines[1] == "") then
+      lines[#lines + 1] = "_(no body)_"
+    else
+      for _, body_line in ipairs(body_lines) do
+        lines[#lines + 1] = body_line
+      end
+    end
+
+    if index < #comments then
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = "---"
+      lines[#lines + 1] = ""
+    end
+  end
+
+  return lines
+end
+
+local function set_readonly_markdown_buffer(bufnr, lines, name)
+  if not is_valid_buf(bufnr) then
+    return
+  end
+
+  if type(name) == "string" and name ~= "" then
+    pcall(vim.api.nvim_buf_set_name, bufnr, name)
+  end
+
+  pcall(vim.api.nvim_set_option_value, "buftype", "nofile", { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "bufhidden", "wipe", { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "swapfile", false, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "filetype", "markdown", { buf = bufnr })
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  pcall(vim.api.nvim_set_option_value, "spell", false, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "readonly", true, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = bufnr })
+end
+
+local function apply_workspace_markdown_window_options(winid)
+  if not is_valid_win(winid) then
+    return
+  end
+
+  pcall(vim.api.nvim_set_option_value, "number", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "relativenumber", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "signcolumn", "no", { win = winid })
+  pcall(vim.api.nvim_set_option_value, "wrap", true, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "linebreak", true, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "breakindent", true, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "cursorline", true, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "spell", false, { win = winid })
+end
+
+local function workspace_close_tab(tabpage)
+  if not valid_tabpage(tabpage) then
+    return
+  end
+
+  local current = vim.api.nvim_get_current_tabpage()
+  if current ~= tabpage and valid_tabpage(tabpage) then
+    pcall(vim.api.nvim_set_current_tabpage, tabpage)
+  end
+
+  if valid_tabpage(tabpage) then
+    pcall(vim.cmd, "tabclose")
+  end
+end
+
+local function attach_workspace_close_keymaps(tabpage, bufnr)
+  if not is_valid_buf(bufnr) then
+    return
+  end
+
+  local opts = { buffer = bufnr, silent = true, nowait = true }
+  vim.keymap.set("n", "q", function()
+    workspace_close_tab(tabpage)
+  end, vim.tbl_extend("force", opts, { desc = "GH PR: close thread workspace" }))
+  vim.keymap.set("n", "<Esc>", function()
+    workspace_close_tab(tabpage)
+  end, vim.tbl_extend("force", opts, { desc = "GH PR: close thread workspace" }))
+end
+
+local function open_overview_thread_workspace_panel(tabpage, code_win, payload, pr_number)
+  if not valid_tabpage(tabpage) then
+    return nil, nil, "Unable to resolve workspace tab"
+  end
+
+  if not is_valid_win(code_win) then
+    local wins = vim.api.nvim_tabpage_list_wins(tabpage)
+    code_win = wins[1]
+  end
+  if not is_valid_win(code_win) then
+    return nil, nil, "Unable to resolve workspace code window"
+  end
+
+  local previous_tab = vim.api.nvim_get_current_tabpage()
+  if previous_tab ~= tabpage then
+    pcall(vim.api.nvim_set_current_tabpage, tabpage)
+  end
+  pcall(vim.api.nvim_set_current_win, code_win)
+  local ok_split, split_err = pcall(vim.cmd, "vsplit")
+  if not ok_split then
+    return nil, nil, "Unable to open workspace markdown panel: " .. tostring(split_err)
+  end
+
+  local markdown_win = vim.api.nvim_get_current_win()
+  if not is_valid_win(markdown_win) then
+    return nil, nil, "Unable to resolve workspace markdown window"
+  end
+
+  local thread_id = safe_string(payload.thread_id)
+  if thread_id == "" then
+    thread_id = tostring(os.time())
+  end
+  local markdown_buf = vim.api.nvim_create_buf(false, true)
+  local name = string.format("ghpr://overview/thread-workspace/%d/%s", tonumber(pr_number) or 0, thread_id)
+  local lines = build_overview_thread_workspace_lines(payload)
+  set_readonly_markdown_buffer(markdown_buf, lines, name)
+  pcall(vim.api.nvim_win_set_buf, markdown_win, markdown_buf)
+  apply_workspace_markdown_window_options(markdown_win)
+  pcall(vim.api.nvim_win_set_cursor, markdown_win, { 1, 0 })
+  pcall(vim.api.nvim_set_current_win, code_win)
+
+  return markdown_buf, markdown_win, nil
+end
+
+local function resolve_workspace_code_window(tabpage, open_result, focus_side)
+  local side = focus_side == "base" and "base" or "head"
+  local preferred_win = side == "base" and tonumber(open_result.base_win) or tonumber(open_result.head_win)
+  if is_valid_win(preferred_win) and vim.api.nvim_win_get_tabpage(preferred_win) == tabpage then
+    return preferred_win
+  end
+
+  local preferred_buf = side == "base" and tonumber(open_result.base_buf) or tonumber(open_result.head_buf)
+  if is_valid_buf(preferred_buf) then
+    local candidate = vim.fn.bufwinid(preferred_buf)
+    if is_valid_win(candidate) and vim.api.nvim_win_get_tabpage(candidate) == tabpage then
+      return candidate
+    end
+  end
+
+  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+    if is_valid_win(winid) then
+      return winid
+    end
+  end
+
+  return nil
+end
+
+function M.open_overview_thread_workspace(payload, opts)
+  payload = type(payload) == "table" and payload or {}
+  opts = type(opts) == "table" and opts or {}
+
+  local pr, details, err = resolve_active_pr(payload.pr_number)
+  if not pr then
+    notify_error(err)
+    return false
+  end
+
+  local path = normalize_path(payload.path)
+  if path == "" then
+    notify_error("Unable to open thread workspace: missing file path")
+    return false
+  end
+
+  local selected_file = resolve_file_in_details(details, path)
+  if not selected_file then
+    notify_error("Unable to open thread workspace: file is no longer available in this PR")
+    return false
+  end
+
+  state.set_active_file(selected_file)
+
+  local focus_side = normalized_thread_side(payload.side)
+  local target_line = preferred_thread_line(focus_side, payload.line, payload.original_line)
+  local target_original_line = preferred_thread_line("base", payload.line, payload.original_line)
+  local comments_ctx = build_line_comment_context(pr.number)
+  local selected_path = normalize_path(selected_file.path or selected_file.filename)
+
+  local function finalize_workspace(open_result, backend)
+    open_result = type(open_result) == "table" and open_result or {}
+    local tabpage = tonumber(open_result.tabpage)
+    if not valid_tabpage(tabpage) then
+      tabpage = vim.api.nvim_get_current_tabpage()
+    end
+    if not valid_tabpage(tabpage) then
+      return nil, "Unable to resolve thread workspace tab"
+    end
+
+    local code_win = resolve_workspace_code_window(tabpage, open_result, focus_side)
+    if not is_valid_win(code_win) then
+      return nil, "Unable to resolve thread workspace diff window"
+    end
+
+    if backend == "virtual" then
+      local win_buf = vim.api.nvim_win_get_buf(code_win)
+      if is_valid_buf(win_buf) and type(target_line) == "number" and target_line > 0 then
+        pcall(vim.api.nvim_set_current_win, code_win)
+        restore_cursor_line(code_win, target_line)
+      end
+    end
+
+    local markdown_buf, _, panel_err = open_overview_thread_workspace_panel(tabpage, code_win, payload, pr.number)
+    if not markdown_buf then
+      return nil, panel_err
+    end
+
+    local seen = {}
+    for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+      if is_valid_win(winid) then
+        pcall(vim.api.nvim_set_option_value, "spell", false, { win = winid })
+        local bufnr = vim.api.nvim_win_get_buf(winid)
+        if is_valid_buf(bufnr) and not seen[bufnr] then
+          seen[bufnr] = true
+          attach_workspace_close_keymaps(tabpage, bufnr)
+        end
+      end
+    end
+
+    if is_valid_win(code_win) then
+      pcall(vim.api.nvim_set_current_tabpage, tabpage)
+      pcall(vim.api.nvim_set_current_win, code_win)
+    end
+
+    return true, nil
+  end
+
+  local function open_with_codediff()
+    local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
+      details = details,
+      file = selected_file,
+      cache_scope = string.format(
+        "overview-thread|%d|%s|%s|%s",
+        pr.number,
+        safe_string(details.baseRefName),
+        safe_string(details.headRefName),
+        selected_path
+      ),
+      layout = "inline",
+      target_side = focus_side,
+      target_line = target_line,
+      target_original_line = target_original_line,
+    })
+    if not opened_result then
+      return nil, codediff_err
+    end
+
+    apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
+      comments_ctx = comments_ctx,
+    })
+    sync_diff_comments_panel(pr, details, comments_ctx)
+    return finalize_workspace(opened_result, "codediff")
+  end
+
+  local function open_with_virtual()
+    local diff_result, diff_err = virtual_files.open_diff(details, pr, selected_file, {
+      line_comments = comments_ctx,
+      view_mode = "unified",
+      ignore_whitespace = false,
+      render_whitespace = true,
+      render_endlines = false,
+      new_tab = true,
+    })
+    if diff_err then
+      return nil, diff_err
+    end
+
+    sync_diff_comments_panel(pr, details, comments_ctx)
+    local unified_or_single = type(diff_result) == "table"
+        and (tonumber(diff_result.unified_buf) or tonumber(diff_result.single_buf))
+      or nil
+    local open_result = {
+      mode = "file",
+      tabpage = vim.api.nvim_get_current_tabpage(),
+      head_buf = unified_or_single or (type(diff_result) == "table" and tonumber(diff_result.head_buf) or nil),
+      head_win = vim.api.nvim_get_current_win(),
+      base_buf = unified_or_single or (type(diff_result) == "table" and tonumber(diff_result.base_buf) or nil),
+      base_win = vim.api.nvim_get_current_win(),
+    }
+    return finalize_workspace(open_result, "virtual")
+  end
+
+  local opened, open_err = open_diff_with_forced_backend({
+    open_primary = open_with_codediff,
+    open_virtual = open_with_virtual,
+  })
+  if opened == false then
+    return false
+  end
+  if not opened then
+    notify_error(open_err)
+    return false
+  end
+
+  return true
+end
+
+function M.open_commit_diff(commit, opts)
+  opts = type(opts) == "table" and opts or {}
+  local origin_win = vim.api.nvim_get_current_win()
   local pr, details, err = resolve_active_pr()
   if not pr then
-    return notify_error(err)
+    notify_error(err)
+    return false
   end
 
   local selected_commit = resolve_commit(commit)
   if not selected_commit then
-    return notify_error("No commit selected")
+    notify_error("No commit selected")
+    return false
   end
 
   local commit_details, commit_err = fetch_commit_details_for_pr(pr, details, selected_commit)
   if not commit_details then
     if open_commit_url(selected_commit) then
-      return
+      return true
     end
-    return notify_error(commit_err)
+    notify_error(commit_err)
+    return false
   end
 
-  local _, open_err = virtual_files.open_commit_patch(details, pr, commit_details)
-  if open_err then
-    if open_commit_url(commit_details) then
-      return
-    end
-    return notify_error(open_err)
+  local commit_diff_details = build_commit_diff_details(details, commit_details)
+  if type(commit_diff_details.baseRefName) ~= "string" or commit_diff_details.baseRefName == "" then
+    notify_error("Unable to resolve base ref for selected commit diff")
+    return false
   end
+  if type(commit_diff_details.headRefName) ~= "string" or commit_diff_details.headRefName == "" then
+    notify_error("Unable to resolve head ref for selected commit diff")
+    return false
+  end
+
+  local function open_with_codediff()
+    local target_path = normalize_path(opts.path)
+    local target_file = nil
+    if target_path ~= "" then
+      for _, raw in ipairs(type(commit_details.files) == "table" and commit_details.files or {}) do
+        local candidate = normalize_commit_file_for_diff(raw)
+        if candidate then
+          for _, path_candidate in ipairs({
+            candidate.path,
+            candidate.filename,
+            candidate.previous_filename,
+            candidate.previousFilename,
+          }) do
+            if normalize_path(path_candidate) == target_path then
+              target_file = candidate
+              break
+            end
+          end
+        end
+        if target_file then
+          break
+        end
+      end
+
+      if not target_file then
+        return nil, "Unable to resolve selected path for commit diff"
+      end
+    end
+
+    local opened_result, codediff_err = codediff_integration.open_commit_diff({
+      details = commit_diff_details,
+      file = target_file,
+      files = target_file and nil or commit_details.files,
+      cache_scope = string.format(
+        "commit|%d|%s|%s",
+        pr.number,
+        safe_string(commit_diff_details.baseRefName),
+        safe_string(commit_diff_details.headRefName)
+      ),
+      target_side = opts.target_side,
+      target_line = opts.target_line,
+      target_original_line = opts.target_original_line,
+    })
+    if not opened_result then
+      return nil, codediff_err
+    end
+
+    if target_file then
+      apply_codediff_open_result_context(pr, commit_diff_details, target_file, opened_result, {})
+    end
+
+    return true, nil
+  end
+
+  local function open_with_virtual()
+    if is_valid_win(origin_win) then
+      pcall(vim.api.nvim_set_current_win, origin_win)
+    end
+    local _, open_err = virtual_files.open_commit_patch(details, pr, commit_details)
+    if open_err then
+      if open_commit_url(commit_details) then
+        return true, nil
+      end
+      return nil, open_err
+    end
+    return true, nil
+  end
+
+  local opened, open_err = open_diff_with_forced_backend({
+    open_primary = open_with_codediff,
+    open_virtual = open_with_virtual,
+  })
+  if opened == false then
+    return false
+  end
+  if not opened then
+    notify_error(open_err)
+    return false
+  end
+
+  return true
 end
 
 function M.open_commit_file_diff(commit, file, opts)
   opts = opts or {}
+  local origin_win = vim.api.nvim_get_current_win()
   local pr, details, err = resolve_active_pr()
   if not pr then
-    return notify_error(err)
+    notify_error(err)
+    return false
   end
 
   local selected_commit = resolve_commit(commit)
   if not selected_commit then
-    return notify_error("No commit selected")
+    notify_error("No commit selected")
+    return false
   end
 
   local selected_file = normalize_commit_file_for_diff(file)
   if not selected_file then
-    return notify_error("No commit file selected for diff")
+    notify_error("No commit file selected for diff")
+    return false
   end
 
   local commit_details = selected_commit
@@ -2819,94 +3786,132 @@ function M.open_commit_file_diff(commit, file, opts)
     local fetched_commit, fetch_err = fetch_commit_details_for_pr(pr, details, selected_commit)
     if not fetched_commit then
       if open_commit_url(selected_commit) then
-        return
+        return true
       end
-      return notify_error(fetch_err)
+      notify_error(fetch_err)
+      return false
     end
     commit_details = fetched_commit
   end
 
   if type(commit_details.parent_oid) ~= "string" or commit_details.parent_oid == "" then
-    return notify_error("Selected commit has no parent commit to diff against")
+    notify_error("Selected commit has no parent commit to diff against")
+    return false
   end
 
   local commit_diff_details = build_commit_diff_details(details, commit_details)
   if type(commit_diff_details.baseRefName) ~= "string" or commit_diff_details.baseRefName == "" then
-    return notify_error("Unable to resolve base ref for selected commit diff")
+    notify_error("Unable to resolve base ref for selected commit diff")
+    return false
   end
   if type(commit_diff_details.headRefName) ~= "string" or commit_diff_details.headRefName == "" then
-    return notify_error("Unable to resolve head ref for selected commit diff")
+    notify_error("Unable to resolve head ref for selected commit diff")
+    return false
   end
 
   state.set_active_file(selected_file)
-  local diff_view = current_diff_view_preferences({
-    mode = opts.view_mode,
-    ignore_whitespace = opts.ignore_whitespace,
-    render_whitespace = opts.render_whitespace,
-    render_endlines = opts.render_endlines,
-  })
-
-  local diff_result, diff_err = virtual_files.open_diff(commit_diff_details, pr, selected_file, {
-    line_comments = nil,
-    view_mode = diff_view.mode,
-    ignore_whitespace = diff_view.ignore_whitespace,
-    render_whitespace = diff_view.render_whitespace,
-    render_endlines = diff_view.render_endlines,
-    new_tab = opts.new_tab,
-  })
-  if diff_err then
-    return notify_error(diff_err)
-  end
-
-  if type(diff_result) == "table" and diff_result.file_mode == "added_single" then
-    notify_info("File is new in selected commit. Opened single MODIFIED buffer (diff layouts disabled).")
-  elseif type(diff_result) == "table" and diff_result.file_mode == "removed_single" then
-    notify_info("File was removed in selected commit. Opened single ORIGINAL buffer (diff layouts disabled).")
-  end
-
-  local target_side = type(opts.target_side) == "string" and opts.target_side:lower() or "head"
-  if target_side ~= "base" then
-    target_side = "head"
-  end
-  local target_line = target_side == "base"
-      and positive_integer(opts.target_original_line, positive_integer(opts.target_line, nil))
-    or positive_integer(opts.target_line, positive_integer(opts.target_original_line, nil))
-  if type(target_line) == "number" and target_line > 0 and type(diff_result) == "table" then
-    local target_buf = nil
-    if target_side == "base" then
-      target_buf = tonumber(diff_result.base_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
-    else
-      target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
-    end
-    if not target_buf then
-      target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.base_buf)
+  local function open_with_codediff()
+    local opened_result, codediff_err = codediff_integration.open_commit_diff({
+      details = commit_diff_details,
+      file = selected_file,
+      cache_scope = string.format(
+        "commit-file|%d|%s|%s|%s",
+        pr.number,
+        safe_string(commit_diff_details.baseRefName),
+        safe_string(commit_diff_details.headRefName),
+        safe_string(selected_file.path)
+      ),
+      target_side = opts.target_side,
+      target_line = opts.target_line,
+      target_original_line = opts.target_original_line,
+    })
+    if not opened_result then
+      return nil, codediff_err
     end
 
-    if type(target_buf) == "number" and target_buf > 0 and is_valid_buf(target_buf) then
-      local winid = vim.fn.bufwinid(target_buf)
-      if type(winid) == "number" and winid > 0 and is_valid_win(winid) then
-        pcall(vim.api.nvim_set_current_win, winid)
-        restore_cursor_line(winid, target_line)
+    apply_codediff_open_result_context(pr, commit_diff_details, selected_file, opened_result, {})
+    return true, nil
+  end
+
+  local function open_with_virtual()
+    if is_valid_win(origin_win) then
+      pcall(vim.api.nvim_set_current_win, origin_win)
+    end
+    local diff_view = current_diff_view_preferences({
+      mode = opts.view_mode,
+      ignore_whitespace = opts.ignore_whitespace,
+      render_whitespace = opts.render_whitespace,
+      render_endlines = opts.render_endlines,
+    })
+
+    local diff_result, diff_err = virtual_files.open_diff(commit_diff_details, pr, selected_file, {
+      line_comments = nil,
+      view_mode = diff_view.mode,
+      ignore_whitespace = diff_view.ignore_whitespace,
+      render_whitespace = diff_view.render_whitespace,
+      render_endlines = diff_view.render_endlines,
+      new_tab = opts.new_tab,
+    })
+    if diff_err then
+      return nil, diff_err
+    end
+
+    if type(diff_result) == "table" and diff_result.file_mode == "added_single" then
+      notify_info("File is new in selected commit. Opened single MODIFIED buffer (diff layouts disabled).")
+    elseif type(diff_result) == "table" and diff_result.file_mode == "removed_single" then
+      notify_info("File was removed in selected commit. Opened single ORIGINAL buffer (diff layouts disabled).")
+    end
+
+    local target_side = type(opts.target_side) == "string" and opts.target_side:lower() or "head"
+    if target_side ~= "base" then
+      target_side = "head"
+    end
+    local target_line = target_side == "base"
+        and positive_integer(opts.target_original_line, positive_integer(opts.target_line, nil))
+      or positive_integer(opts.target_line, positive_integer(opts.target_original_line, nil))
+    if type(target_line) == "number" and target_line > 0 and type(diff_result) == "table" then
+      local target_buf = nil
+      if target_side == "base" then
+        target_buf = tonumber(diff_result.base_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
+      else
+        target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
+      end
+      if not target_buf then
+        target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.base_buf)
+      end
+
+      if type(target_buf) == "number" and target_buf > 0 and is_valid_buf(target_buf) then
+        local winid = vim.fn.bufwinid(target_buf)
+        if type(winid) == "number" and winid > 0 and is_valid_win(winid) then
+          pcall(vim.api.nvim_set_current_win, winid)
+          restore_cursor_line(winid, target_line)
+        end
       end
     end
+
+    sync_diff_comments_panel(pr, details, nil)
+    return true, nil
   end
 
-  do
-    local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
-    if ok_panel and type(panel.sync_for_diff) == "function" then
-      pcall(panel.sync_for_diff, {
-        pr = pr,
-        details = details,
-        comments_ctx = nil,
-        pr_number = pr.number,
-      })
-    end
+  local opened, open_err = open_diff_with_forced_backend({
+    open_primary = open_with_codediff,
+    open_virtual = open_with_virtual,
+  })
+  if opened == false then
+    return false
   end
+  if not opened then
+    notify_error(open_err)
+    return false
+  end
+
+  return true
 end
 
 function M.open_thread_comment_evolution_diff(payload, opts)
   payload = type(payload) == "table" and payload or {}
   opts = type(opts) == "table" and opts or {}
+  local origin_win = vim.api.nvim_get_current_win()
 
   local function thread_comment_side_from_payload_local()
     if type(M._thread_fix_helpers) == "table" and type(M._thread_fix_helpers.normalize_target_side) == "function" then
@@ -3211,62 +4216,100 @@ function M.open_thread_comment_evolution_diff(payload, opts)
   end
 
   state.set_active_file(compare_file)
-  local diff_view = current_diff_view_preferences({
-    mode = opts.view_mode,
-    ignore_whitespace = opts.ignore_whitespace,
-    render_whitespace = opts.render_whitespace,
-    render_endlines = opts.render_endlines,
-  })
-
-  local diff_result, diff_err = virtual_files.open_diff(compare_details, pr, compare_file, {
-    line_comments = nil,
-    view_mode = diff_view.mode,
-    ignore_whitespace = diff_view.ignore_whitespace,
-    render_whitespace = diff_view.render_whitespace,
-    render_endlines = diff_view.render_endlines,
-    new_tab = opts.new_tab,
-  })
-  if diff_err then
-    return open_fallback(diff_err)
-  end
-
-  if type(diff_result) == "table" and diff_result.file_mode == "added_single" then
-    notify_info("File is new in compared commit range. Opened single MODIFIED buffer (diff layouts disabled).")
-  elseif type(diff_result) == "table" and diff_result.file_mode == "removed_single" then
-    notify_info("File was removed in compared commit range. Opened single ORIGINAL buffer (diff layouts disabled).")
-  end
-
   local focus_side = target_side == "base" and "base" or "head"
   local focus_line = focus_side == "base" and target_original_line or target_line
-  if type(focus_line) == "number" and focus_line > 0 and type(diff_result) == "table" then
-    local target_buf = nil
-    if focus_side == "base" then
-      target_buf = tonumber(diff_result.base_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
-    else
-      target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
+  local function open_with_codediff()
+    local opened_result, codediff_err = codediff_integration.open_compare_diff({
+      details = compare_details,
+      file = compare_file,
+      cache_scope = string.format(
+        "compare|%d|%s|%s|%s",
+        pr.number,
+        safe_string(compare_details.baseRefName),
+        safe_string(compare_details.headRefName),
+        safe_string(compare_file.path)
+      ),
+      target_side = focus_side,
+      target_line = focus_line,
+      target_original_line = focus_side == "base" and focus_line or target_original_line,
+    })
+    if not opened_result then
+      return nil, codediff_err
     end
-    if not target_buf then
-      target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.base_buf)
-    end
-    if type(target_buf) == "number" and target_buf > 0 and is_valid_buf(target_buf) then
-      local winid = vim.fn.bufwinid(target_buf)
-      if type(winid) == "number" and winid > 0 and is_valid_win(winid) then
-        pcall(vim.api.nvim_set_current_win, winid)
-        restore_cursor_line(winid, focus_line)
-      end
-    end
+
+    apply_codediff_open_result_context(pr, compare_details, compare_file, opened_result, {})
+    return true, nil
   end
 
-  do
-    local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
-    if ok_panel and type(panel.sync_for_diff) == "function" then
-      pcall(panel.sync_for_diff, {
-        pr = pr,
-        details = details,
-        comments_ctx = nil,
-        pr_number = pr.number,
-      })
+  local function open_with_virtual()
+    if is_valid_win(origin_win) then
+      pcall(vim.api.nvim_set_current_win, origin_win)
     end
+    local diff_view = current_diff_view_preferences({
+      mode = opts.view_mode,
+      ignore_whitespace = opts.ignore_whitespace,
+      render_whitespace = opts.render_whitespace,
+      render_endlines = opts.render_endlines,
+    })
+
+    local diff_result, diff_err = virtual_files.open_diff(compare_details, pr, compare_file, {
+      line_comments = nil,
+      view_mode = diff_view.mode,
+      ignore_whitespace = diff_view.ignore_whitespace,
+      render_whitespace = diff_view.render_whitespace,
+      render_endlines = diff_view.render_endlines,
+      new_tab = opts.new_tab,
+    })
+    if diff_err then
+      return nil, diff_err
+    end
+
+    if type(diff_result) == "table" and diff_result.file_mode == "added_single" then
+      notify_info("File is new in compared commit range. Opened single MODIFIED buffer (diff layouts disabled).")
+    elseif type(diff_result) == "table" and diff_result.file_mode == "removed_single" then
+      notify_info("File was removed in compared commit range. Opened single ORIGINAL buffer (diff layouts disabled).")
+    end
+
+    if type(focus_line) == "number" and focus_line > 0 and type(diff_result) == "table" then
+      local target_buf = nil
+      if focus_side == "base" then
+        target_buf = tonumber(diff_result.base_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
+      else
+        target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.single_buf) or tonumber(diff_result.unified_buf)
+      end
+      if not target_buf then
+        target_buf = tonumber(diff_result.head_buf) or tonumber(diff_result.base_buf)
+      end
+      if type(target_buf) == "number" and target_buf > 0 and is_valid_buf(target_buf) then
+        local winid = vim.fn.bufwinid(target_buf)
+        if type(winid) == "number" and winid > 0 and is_valid_win(winid) then
+          pcall(vim.api.nvim_set_current_win, winid)
+          restore_cursor_line(winid, focus_line)
+        end
+      end
+    end
+
+    sync_diff_comments_panel(pr, details, nil)
+    return true, nil
+  end
+
+  local opened, open_err = open_diff_with_forced_backend({
+    open_primary = open_with_codediff,
+    open_virtual = open_with_virtual,
+  })
+  if opened == false then
+    return {
+      ok = false,
+      pending = true,
+      reason = "Diff backend decision pending",
+    }
+  end
+  if not opened then
+    notify_error(open_err)
+    return {
+      ok = false,
+      reason = open_err,
+    }
   end
 
   return {
@@ -3719,103 +4762,256 @@ function M.open_thread_fix_diff(payload, opts)
 end
 
 function M.open_diff(file, opts)
-  opts = opts or {}
+  opts = type(opts) == "table" and opts or {}
+  local origin_win = vim.api.nvim_get_current_win()
   local pr, details, err = resolve_active_pr()
   if not pr then
-    return notify_error(err)
+    notify_error(err)
+    return false
   end
 
   local selected_file = resolve_file(file)
   if not selected_file then
-    return notify_error("No file selected for diff")
+    notify_error("No file selected for diff")
+    return false
   end
 
   state.set_active_file(selected_file)
+  local selected_path = normalize_path(selected_file.path or selected_file.filename)
   local comments_ctx = build_line_comment_context(pr.number)
-  local diff_view = current_diff_view_preferences({
-    mode = opts.view_mode,
-    ignore_whitespace = opts.ignore_whitespace,
-    render_whitespace = opts.render_whitespace,
-    render_endlines = opts.render_endlines,
-  })
 
-  local diff_result, diff_err = virtual_files.open_diff(details, pr, selected_file, {
-    line_comments = comments_ctx,
-    view_mode = diff_view.mode,
-    ignore_whitespace = diff_view.ignore_whitespace,
-    render_whitespace = diff_view.render_whitespace,
-    render_endlines = diff_view.render_endlines,
-    new_tab = opts.new_tab,
-  })
-  if diff_err then
-    return notify_error(diff_err)
-  end
-
-  if type(diff_result) == "table" and diff_result.file_mode == "added_single" then
-    notify_info("File is new in this PR. Opened single MODIFIED buffer (diff layouts disabled).")
-  elseif type(diff_result) == "table" and diff_result.file_mode == "removed_single" then
-    notify_info("File was removed in this PR. Opened single ORIGINAL buffer (diff layouts disabled).")
-  end
-
-  do
-    local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
-    if ok_panel and type(panel.sync_for_diff) == "function" then
-      pcall(panel.sync_for_diff, {
-        pr = pr,
-        details = details,
-        comments_ctx = comments_ctx,
-        pr_number = pr.number,
-      })
+  local function open_with_codediff()
+    local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
+      details = details,
+      file = selected_file,
+      cache_scope = string.format(
+        "pr-file|%d|%s|%s|%s",
+        pr.number,
+        safe_string(details.baseRefName),
+        safe_string(details.headRefName),
+        selected_path
+      ),
+      target_side = opts.target_side,
+      target_line = opts.target_line,
+      target_original_line = opts.target_original_line,
+    })
+    if not opened_result then
+      return nil, codediff_err
     end
+
+    apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
+      comments_ctx = comments_ctx,
+    })
+    sync_diff_comments_panel(pr, details, comments_ctx)
+    return true, nil
   end
+
+  local function open_with_virtual()
+    if is_valid_win(origin_win) then
+      pcall(vim.api.nvim_set_current_win, origin_win)
+    end
+    local diff_view = current_diff_view_preferences({
+      mode = opts.view_mode,
+      ignore_whitespace = opts.ignore_whitespace,
+      render_whitespace = opts.render_whitespace,
+      render_endlines = opts.render_endlines,
+    })
+
+    local diff_result, diff_err = virtual_files.open_diff(details, pr, selected_file, {
+      line_comments = comments_ctx,
+      view_mode = diff_view.mode,
+      ignore_whitespace = diff_view.ignore_whitespace,
+      render_whitespace = diff_view.render_whitespace,
+      render_endlines = diff_view.render_endlines,
+      new_tab = opts.new_tab,
+    })
+    if diff_err then
+      return nil, diff_err
+    end
+
+    if type(diff_result) == "table" and diff_result.file_mode == "added_single" then
+      notify_info("File is new in this PR. Opened single MODIFIED buffer (diff layouts disabled).")
+    elseif type(diff_result) == "table" and diff_result.file_mode == "removed_single" then
+      notify_info("File was removed in this PR. Opened single ORIGINAL buffer (diff layouts disabled).")
+    end
+
+    sync_diff_comments_panel(pr, details, comments_ctx)
+    return true, nil
+  end
+
+  local opened, open_err = open_diff_with_forced_backend({
+    open_primary = open_with_codediff,
+    open_virtual = open_with_virtual,
+  })
+  if opened == false then
+    return false
+  end
+  if not opened then
+    notify_error(open_err)
+    return false
+  end
+
+  return true
 end
 
-function M.open_original(file)
+function M.open_original(file, opts)
+  opts = type(opts) == "table" and opts or {}
+  local origin_win = vim.api.nvim_get_current_win()
   local pr, details, err = resolve_active_pr()
   if not pr then
-    return notify_error(err)
+    notify_error(err)
+    return false
   end
 
   local selected_file = resolve_file(file)
   if not selected_file then
-    return notify_error("No file selected")
+    notify_error("No file selected")
+    return false
   end
 
   state.set_active_file(selected_file)
+  local selected_path = normalize_path(selected_file.path or selected_file.filename)
+  local target_line = positive_integer(opts.target_original_line, positive_integer(opts.target_line, nil))
   local comments_ctx = build_line_comment_context(pr.number)
 
-  local _, open_err = virtual_files.open_original(details, pr, selected_file, {
-    line_comments = comments_ctx,
-  })
-  if open_err then
-    return notify_error(open_err)
+  local function open_with_codediff()
+    local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
+      details = details,
+      file = selected_file,
+      cache_scope = string.format(
+        "pr-original|%d|%s|%s|%s",
+        pr.number,
+        safe_string(details.baseRefName),
+        safe_string(details.headRefName),
+        selected_path
+      ),
+      target_side = "base",
+      target_original_line = target_line,
+      target_line = target_line,
+    })
+    if not opened_result then
+      return nil, codediff_err
+    end
+
+    apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
+      comments_ctx = comments_ctx,
+    })
+    sync_diff_comments_panel(pr, details, comments_ctx)
+    return true, nil
   end
+
+  local function open_with_virtual()
+    if is_valid_win(origin_win) then
+      pcall(vim.api.nvim_set_current_win, origin_win)
+    end
+    local _, open_err = virtual_files.open_original(details, pr, selected_file, {
+      line_comments = comments_ctx,
+    })
+    if open_err then
+      return nil, open_err
+    end
+    if type(target_line) == "number" then
+      jump_to_line(target_line)
+    end
+    return true, nil
+  end
+
+  local opened, open_err = open_diff_with_forced_backend({
+    open_primary = open_with_codediff,
+    open_virtual = open_with_virtual,
+  })
+  if opened == false then
+    return false
+  end
+  if not opened then
+    notify_error(open_err)
+    return false
+  end
+  return true
 end
 
-function M.open_modified(file)
+function M.open_modified(file, opts)
+  opts = type(opts) == "table" and opts or {}
+  local origin_win = vim.api.nvim_get_current_win()
   local pr, details, err = resolve_active_pr()
   if not pr then
-    return notify_error(err)
+    notify_error(err)
+    return false
   end
 
   local selected_file = resolve_file(file)
   if not selected_file then
-    return notify_error("No file selected")
+    notify_error("No file selected")
+    return false
   end
 
   state.set_active_file(selected_file)
+  local selected_path = normalize_path(selected_file.path or selected_file.filename)
+  local target_line = positive_integer(opts.target_line, positive_integer(opts.target_original_line, nil))
   local comments_ctx = build_line_comment_context(pr.number)
 
-  local _, open_err = virtual_files.open_modified(details, pr, selected_file, {
-    line_comments = comments_ctx,
-  })
-  if open_err then
-    return notify_error(open_err)
+  local function open_with_codediff()
+    local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
+      details = details,
+      file = selected_file,
+      cache_scope = string.format(
+        "pr-modified|%d|%s|%s|%s",
+        pr.number,
+        safe_string(details.baseRefName),
+        safe_string(details.headRefName),
+        selected_path
+      ),
+      target_side = "head",
+      target_line = target_line,
+      target_original_line = target_line,
+    })
+    if not opened_result then
+      return nil, codediff_err
+    end
+
+    apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
+      comments_ctx = comments_ctx,
+    })
+    sync_diff_comments_panel(pr, details, comments_ctx)
+    return true, nil
   end
+
+  local function open_with_virtual()
+    if is_valid_win(origin_win) then
+      pcall(vim.api.nvim_set_current_win, origin_win)
+    end
+    local _, open_err = virtual_files.open_modified(details, pr, selected_file, {
+      line_comments = comments_ctx,
+    })
+    if open_err then
+      return nil, open_err
+    end
+    if type(target_line) == "number" then
+      jump_to_line(target_line)
+    end
+    return true, nil
+  end
+
+  local opened, open_err = open_diff_with_forced_backend({
+    open_primary = open_with_codediff,
+    open_virtual = open_with_virtual,
+  })
+  if opened == false then
+    return false
+  end
+  if not opened then
+    notify_error(open_err)
+    return false
+  end
+  return true
 end
 
 local function reopen_current_diff_with_preferences_impl(opts)
   opts = opts or {}
+  if not using_virtual_diff_backend() then
+    return false, virtual_only_feature_message("Diff render/layout toggles")
+  end
+
   local bufnr = vim.api.nvim_get_current_buf()
   local kind = vim.b[bufnr].gh_pr_file_kind
   if kind ~= "base" and kind ~= "head" and kind ~= "unified" then
@@ -3894,6 +5090,10 @@ function M.reopen_current_diff_with_preferences(opts)
 end
 
 function M.refresh_current_diff_buffer()
+  if not using_virtual_diff_backend() then
+    return notify_warn(virtual_only_feature_message("Diff buffer refresh"))
+  end
+
   local bufnr = vim.api.nvim_get_current_buf()
   local kind = vim.b[bufnr].gh_pr_file_kind
   if kind ~= "base" and kind ~= "head" and kind ~= "unified" and kind ~= "patch" then
@@ -4369,15 +5569,28 @@ function M.toggle_diff_comments_panel()
     return notify_error(err)
   end
 
-  local comments_ctx = build_line_comment_context(pr.number)
   local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
-  if ok_panel and type(panel.toggle) == "function" then
-    pcall(panel.toggle, {
-      pr = pr,
-      details = details,
-      comments_ctx = comments_ctx,
-      pr_number = pr.number,
-    })
+  if not ok_panel then
+    return notify_error("Unable to load diff comments panel: " .. tostring(panel))
+  end
+  if type(panel.toggle) ~= "function" then
+    return notify_error("Diff comments panel toggle is unavailable")
+  end
+
+  local ok_toggle, toggled, toggle_err = pcall(panel.toggle, {
+    pr = pr,
+    details = details,
+    pr_number = pr.number,
+    origin_win = vim.api.nvim_get_current_win(),
+    origin_buf = vim.api.nvim_get_current_buf(),
+    file_path = normalize_path(vim.b.gh_pr_file_path or vim.b.gh_pr_path),
+    file_kind = vim.b.gh_pr_file_kind,
+  })
+  if not ok_toggle then
+    return notify_error("Unable to toggle diff comments panel: " .. tostring(toggled))
+  end
+  if toggled ~= true and type(toggle_err) == "string" and toggle_err ~= "" then
+    return notify_error(toggle_err)
   end
 end
 
@@ -4496,6 +5709,9 @@ function M.start_review(number)
 
     state.set_active_pr(pr, details)
     local opened, open_err = open_review_tree_from_plugin({ toggle = false })
+    review_prefetch.prefetch_review(pr, details, {
+      source = "start_review",
+    })
     if not opened and open_err then
       notify_warn("Review started but PR Review source could not be opened: " .. tostring(open_err))
       return
@@ -5382,6 +6598,10 @@ function M.prev_change()
 end
 
 function M.toggle_diff_whitespace()
+  if not require_virtual_diff_backend("Whitespace diff toggle") then
+    return
+  end
+
   local prefs = current_diff_view_preferences()
   prefs.ignore_whitespace = not prefs.ignore_whitespace
   prefs = persist_diff_view_preferences(prefs)
@@ -5396,6 +6616,10 @@ function M.toggle_diff_whitespace()
 end
 
 function M.toggle_diff_render_whitespace()
+  if not require_virtual_diff_backend("Whitespace rendering toggle") then
+    return
+  end
+
   local prefs = current_diff_view_preferences()
   prefs.render_whitespace = not prefs.render_whitespace
   prefs = persist_diff_view_preferences(prefs)
@@ -5411,6 +6635,10 @@ function M.toggle_diff_render_whitespace()
 end
 
 function M.toggle_diff_render_endlines()
+  if not require_virtual_diff_backend("Endline rendering toggle") then
+    return
+  end
+
   local prefs = current_diff_view_preferences()
   prefs.render_endlines = not prefs.render_endlines
   prefs = persist_diff_view_preferences(prefs)
@@ -5426,6 +6654,10 @@ function M.toggle_diff_render_endlines()
 end
 
 function M.cycle_diff_view_mode()
+  if not require_virtual_diff_backend("Diff layout toggle") then
+    return
+  end
+
   local order = { "vertical", "horizontal", "unified" }
   local prefs = current_diff_view_preferences()
   local index = 1
@@ -5450,6 +6682,10 @@ function M.cycle_diff_view_mode()
 end
 
 function M.set_diff_view_mode(mode)
+  if not require_virtual_diff_backend("Diff layout selection") then
+    return
+  end
+
   local prefs = current_diff_view_preferences({
     mode = mode,
   })
@@ -5485,6 +6721,9 @@ local function diff_shortcut_lines(bufnr)
   local kind = type(vim.b[bufnr].gh_pr_file_kind) == "string" and vim.b[bufnr].gh_pr_file_kind or "head"
   local file_mode = type(vim.b[bufnr].gh_pr_file_mode) == "string" and vim.b[bufnr].gh_pr_file_mode or ""
   local is_image = vim.b[bufnr].gh_pr_is_image == true
+  local backend = type(vim.b[bufnr].gh_pr_diff_backend) == "string"
+      and vim.b[bufnr].gh_pr_diff_backend
+    or (using_virtual_diff_backend() and "virtual" or "codediff")
   local prefs = current_diff_view_preferences()
   local shortcuts = diff_view_shortcuts()
   local image_opts = image_diff_options()
@@ -5499,7 +6738,9 @@ local function diff_shortcut_lines(bufnr)
     or "."
 
   local mode_label = prefs.mode
-  if file_mode == "added_single" then
+  if backend == "codediff" then
+    mode_label = "side-by-side"
+  elseif file_mode == "added_single" then
     mode_label = "single (added file)"
   elseif file_mode == "removed_single" then
     mode_label = "single (removed file)"
@@ -5524,33 +6765,43 @@ local function diff_shortcut_lines(bufnr)
     "gh-pr diff shortcuts",
     "",
     "Diff render state",
+    shortcut_line("backend", backend),
     shortcut_line("mode", mode_label),
-    shortcut_line("spaces", is_image and "n/a (image)" or (prefs.ignore_whitespace and "ignored" or "strict")),
-    shortcut_line("render", is_image and "n/a (image)" or (prefs.render_whitespace and "visible" or "hidden")),
-    shortcut_line("endline", is_image and "n/a (image)" or (prefs.render_endlines and "visible" or "hidden")),
-    shortcut_line("tab", is_image and "n/a" or whitespace_tab),
-    shortcut_line("space", is_image and "n/a" or whitespace_space),
-    "",
-    "General",
   }
+  if backend ~= "codediff" then
+    lines[#lines + 1] = shortcut_line("spaces", is_image and "n/a (image)" or (prefs.ignore_whitespace and "ignored" or "strict"))
+    lines[#lines + 1] = shortcut_line("render", is_image and "n/a (image)" or (prefs.render_whitespace and "visible" or "hidden"))
+    lines[#lines + 1] = shortcut_line("endline", is_image and "n/a (image)" or (prefs.render_endlines and "visible" or "hidden"))
+    lines[#lines + 1] = shortcut_line("tab", is_image and "n/a" or whitespace_tab)
+    lines[#lines + 1] = shortcut_line("space", is_image and "n/a" or whitespace_space)
+  else
+    lines[#lines + 1] = shortcut_line("render", "managed by codediff.nvim")
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "General"
+
   if is_image then
     lines[#lines + 1] = shortcut_line("-", "Line comments popup not available for image files")
   else
     add_shortcut(lines, shortcuts.line_comments_popup, kind == "unified" and "Not available in unified mode" or "Show line comments popup")
   end
   add_shortcut(lines, shortcuts.help, "Show this help")
-  add_shortcut(lines, shortcuts.refresh, "Refresh current diff from GitHub")
+  if backend ~= "codediff" then
+    add_shortcut(lines, shortcuts.refresh, "Refresh current diff from GitHub")
+  end
   add_shortcut(lines, shortcuts.close_quick, "Quick close (or close head in 2-way diff)")
   add_shortcut(lines, shortcuts.close_all_open_review, "Close view(s) and open PR Review")
   add_shortcut(lines, shortcuts.toggle_comments_panel, "Toggle diff comments panel")
 
-  if not is_image then
+  if backend ~= "codediff" and not is_image then
     add_shortcut(lines, shortcuts.toggle_render_whitespace, "Toggle leading/trailing space/tab symbols")
     add_shortcut(lines, shortcuts.toggle_render_endlines, "Toggle LF/CRLF endline markers")
   end
 
   if is_image then
     lines[#lines + 1] = shortcut_line("-", "Whitespace and diff layout toggles disabled for image files")
+  elseif backend == "codediff" then
+    lines[#lines + 1] = shortcut_line("-", "Layout/render toggles are not available in codediff backend")
   elseif file_mode ~= "added_single" and file_mode ~= "removed_single" then
     add_shortcut(lines, shortcuts.toggle_whitespace, "Toggle whitespace changes")
     add_shortcut(lines, shortcuts.cycle_mode, "Cycle diff mode")

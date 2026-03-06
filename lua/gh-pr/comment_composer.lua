@@ -27,6 +27,7 @@ local function sanitize_modal_window(winid)
   pcall(vim.api.nvim_set_option_value, "scrollbind", false, { win = winid })
   pcall(vim.api.nvim_set_option_value, "cursorbind", false, { win = winid })
   pcall(vim.api.nvim_set_option_value, "diff", false, { win = winid })
+  pcall(vim.api.nvim_set_option_value, "spell", false, { win = winid })
 end
 
 local function compute_size(opts)

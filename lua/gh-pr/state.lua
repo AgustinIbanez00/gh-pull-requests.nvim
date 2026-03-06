@@ -18,6 +18,9 @@ local state = {
     images = {
       fallback_default_action = "metadata",
     },
+    pr_review = {
+      files = {},
+    },
   },
 }
 
@@ -174,11 +177,29 @@ local function sanitize_image_prefs(input)
   return result
 end
 
+local function sanitize_pr_review_prefs(input)
+  local result = {
+    files = {},
+  }
+
+  if type(input) ~= "table" then
+    return result
+  end
+
+  local files = type(input.files) == "table" and input.files or {}
+  if type(files.flat) == "boolean" then
+    result.files.flat = files.flat
+  end
+
+  return result
+end
+
 function M.setup()
   load_persisted_state()
   state.prefs = state.prefs or {}
   state.prefs.diff_view = sanitize_diff_view_prefs(state.prefs.diff_view)
   state.prefs.images = sanitize_image_prefs(state.prefs.images)
+  state.prefs.pr_review = sanitize_pr_review_prefs(state.prefs.pr_review)
 end
 
 function M.set_active_pr(pr, details)
@@ -345,6 +366,36 @@ function M.update_image_pref(key, value)
   local current = M.get_image_prefs()
   current[key] = value
   return M.set_image_prefs(current)
+end
+
+function M.get_pr_review_files_prefs()
+  state.prefs = state.prefs or {}
+  state.prefs.pr_review = sanitize_pr_review_prefs(state.prefs.pr_review)
+  return vim.deepcopy(state.prefs.pr_review)
+end
+
+function M.get_pr_review_files_flat_pref()
+  local prefs = M.get_pr_review_files_prefs()
+  local flat = type(prefs.files) == "table" and prefs.files.flat or nil
+  if type(flat) == "boolean" then
+    return flat
+  end
+  return nil
+end
+
+function M.set_pr_review_files_flat_pref(flat)
+  state.prefs = state.prefs or {}
+  state.prefs.pr_review = state.prefs.pr_review or {}
+  state.prefs.pr_review.files = state.prefs.pr_review.files or {}
+
+  if type(flat) == "boolean" then
+    state.prefs.pr_review.files.flat = flat
+  else
+    state.prefs.pr_review.files.flat = nil
+  end
+
+  save_persisted_state()
+  return true
 end
 
 return M

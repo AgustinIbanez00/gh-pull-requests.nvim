@@ -29,6 +29,31 @@ local CHECK_SUCCESS_STATES = {
   NEUTRAL = true,
   SKIPPED = true,
 }
+local FILE_STATUS_DISPLAY = {
+  added = { text = "A", highlight = "GhPrFileStatusAdded" },
+  modified = { text = "M", highlight = "GhPrFileStatusModified" },
+  deleted = { text = "D", highlight = "GhPrFileStatusDeleted" },
+  renamed = { text = "R", highlight = "GhPrFileStatusRenamed" },
+  copied = { text = "C", highlight = "GhPrFileStatusCopied" },
+}
+local FILE_PARENT_PATH_MAX_CHARS = 26
+
+local function display_width(value)
+  if type(value) ~= "string" or value == "" then
+    return 0
+  end
+  return vim.fn.strdisplaywidth(value)
+end
+
+local function left_pad_display_width(value, width)
+  local text = type(value) == "string" and value or ""
+  local target = math.max(0, math.floor(tonumber(width) or 0))
+  local current = display_width(text)
+  if current >= target then
+    return text
+  end
+  return string.rep(" ", target - current) .. text
+end
 
 local function uppercase(value)
   if type(value) ~= "string" then
@@ -233,6 +258,127 @@ local function icon_for_node(node)
   return { text = "󰉋 ", highlight = highlights.DIRECTORY_ICON }
 end
 
+local function has_nerd_font()
+  local configured = vim.g.have_nerd_font
+  if type(configured) == "boolean" then
+    return configured
+  end
+
+  local guifont = type(vim.o.guifont) == "string" and vim.o.guifont:lower() or ""
+  if guifont == "" then
+    return false
+  end
+
+  return guifont:find("nerd", 1, true) ~= nil
+end
+
+local function icon_set()
+  if has_nerd_font() then
+    return {
+      viewed = "",
+      comment = "󰍩",
+    }
+  end
+
+  return {
+    viewed = "✓",
+    comment = "💬",
+  }
+end
+
+local function is_review_file_node(node)
+  local extra = type(node) == "table" and type(node.extra) == "table" and node.extra or nil
+  return extra ~= nil and extra.kind == "file" and extra.repo ~= nil and type(extra.pr) == "table" and node.path ~= nil
+end
+
+local function normalize_file_status(value)
+  local normalized = type(value) == "string" and value:lower() or ""
+  if normalized == "removed" then
+    return "deleted"
+  end
+  if normalized == "deleted" then
+    return "deleted"
+  end
+  if normalized == "added" then
+    return "added"
+  end
+  if normalized == "renamed" then
+    return "renamed"
+  end
+  if normalized == "copied" then
+    return "copied"
+  end
+  return "modified"
+end
+
+local function resolve_review_file_status(node)
+  local extra = node.extra
+  local status = normalize_file_status(extra.file_status)
+  if status ~= "modified" then
+    return status
+  end
+
+  local file = type(extra.file) == "table" and extra.file or {}
+  return normalize_file_status(file.status)
+end
+
+local function resolve_file_comment_count(node)
+  local extra = type(node) == "table" and type(node.extra) == "table" and node.extra or {}
+  local file_comment_count = tonumber(extra.file_comment_count)
+  if file_comment_count ~= nil then
+    return math.max(0, math.floor(file_comment_count))
+  end
+  return math.max(0, math.floor(tonumber(extra.open_thread_count) or 0))
+end
+
+local function compact_parent_path(path, max_chars)
+  if type(path) ~= "string" or path == "" then
+    return ""
+  end
+
+  local limit = tonumber(max_chars) or FILE_PARENT_PATH_MAX_CHARS
+  limit = math.max(8, math.floor(limit))
+  if #path <= limit then
+    return path
+  end
+
+  local suffix_limit = math.max(3, limit - 2)
+  local segments = vim.split(path, "/", { plain = true, trimempty = true })
+  local suffix = {}
+  local suffix_len = 0
+
+  for index = #segments, 1, -1 do
+    local segment = segments[index]
+    local next_len = suffix_len + #segment + (suffix_len > 0 and 1 or 0)
+    if next_len > suffix_limit then
+      break
+    end
+    table.insert(suffix, 1, segment)
+    suffix_len = next_len
+  end
+
+  if vim.tbl_isempty(suffix) then
+    local tail = path:sub(-(suffix_limit))
+    tail = tail:gsub("^/+", "")
+    return "…/" .. tail
+  end
+
+  return "…/" .. table.concat(suffix, "/")
+end
+
+local function should_show_file_parent_path(node)
+  if not is_review_file_node(node) then
+    return false
+  end
+
+  local extra = type(node.extra) == "table" and node.extra or {}
+  if extra.path_render_mode ~= "flat" then
+    return false
+  end
+
+  return type(extra.parent_path) == "string" and extra.parent_path ~= ""
+end
+
 M.kind_icon = function(_, node, _)
   return icon_for_node(node)
 end
@@ -373,7 +519,7 @@ M.pr_checks_badge = function(_, node, _)
 end
 
 M.viewed_badge = function(_, node, _)
-  if not (node.extra and node.extra.kind == "file" and node.extra.repo and node.extra.pr and node.path) then
+  if not is_review_file_node(node) then
     return { text = "", highlight = "GhPrViewedBadge" }
   end
 
@@ -386,6 +532,107 @@ M.viewed_badge = function(_, node, _)
   end
 
   return { text = "", highlight = "GhPrViewedBadge" }
+end
+
+M.file_status_letter = function(_, node, _)
+  if not is_review_file_node(node) then
+    return { text = "", highlight = "GhPrFileStatusModified" }
+  end
+
+  local status_key = resolve_review_file_status(node)
+  local status = FILE_STATUS_DISPLAY[status_key] or FILE_STATUS_DISPLAY.modified
+  return {
+    text = " " .. status.text,
+    highlight = status.highlight,
+  }
+end
+
+M.file_viewed_icon = function(_, node, _)
+  if not is_review_file_node(node) then
+    return { text = "", highlight = "GhPrFileViewedIndicator" }
+  end
+
+  local viewed = runtime_state.is_viewed(node.extra.repo, node.extra.pr.number, node.path)
+  if viewed ~= true then
+    return { text = "", highlight = "GhPrFileViewedIndicator" }
+  end
+
+  local icons = icon_set()
+  return {
+    text = " " .. icons.viewed,
+    highlight = "GhPrFileViewedIndicator",
+  }
+end
+
+M.file_comments_badge = function(_, node, _)
+  if not is_review_file_node(node) then
+    return { text = "", highlight = "GhPrFileCommentsBadge" }
+  end
+
+  local count = resolve_file_comment_count(node)
+  if count < 1 then
+    return { text = "", highlight = "GhPrFileCommentsBadge" }
+  end
+
+  local icons = icon_set()
+  return {
+    text = string.format(" %s x%d", icons.comment, count),
+    highlight = "GhPrFileCommentsBadge",
+  }
+end
+
+M.file_review_badges = function(_, node, _)
+  if not is_review_file_node(node) then
+    return { text = "", highlight = "GhPrFileCommentsBadge" }
+  end
+
+  local status_key = resolve_review_file_status(node)
+  local status = FILE_STATUS_DISPLAY[status_key] or FILE_STATUS_DISPLAY.modified
+
+  local icons = icon_set()
+  local viewed = runtime_state.is_viewed(node.extra.repo, node.extra.pr.number, node.path) == true
+  local file_comment_count = resolve_file_comment_count(node)
+
+  local status_slot = left_pad_display_width(status.text, 1)
+  local viewed_width = math.max(1, display_width(icons.viewed))
+  local viewed_slot = viewed and icons.viewed or ""
+  viewed_slot = left_pad_display_width(viewed_slot, viewed_width)
+
+  local badges = {
+    {
+      text = " " .. status_slot,
+      highlight = status.highlight,
+    },
+    {
+      text = " " .. viewed_slot,
+      highlight = "GhPrFileViewedIndicator",
+    },
+  }
+
+  if file_comment_count > 0 then
+    badges[#badges + 1] = {
+      text = string.format(" %s x%d", icons.comment, file_comment_count),
+      highlight = "GhPrFileCommentsBadge",
+    }
+  end
+
+  return badges
+end
+
+M.file_parent_path = function(_, node, _)
+  if not should_show_file_parent_path(node) then
+    return { text = "", highlight = "GhPrFilePathContext" }
+  end
+
+  local compact = compact_parent_path(node.extra.parent_path, FILE_PARENT_PATH_MAX_CHARS)
+  if compact == "" then
+    return { text = "", highlight = "GhPrFilePathContext" }
+  end
+
+  return {
+    text = " · " .. compact,
+    highlight = "GhPrFilePathContext",
+  }
 end
 
 M.folder_viewed_badge = function(_, node, _)

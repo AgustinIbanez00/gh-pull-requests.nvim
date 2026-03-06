@@ -123,47 +123,6 @@ function M.attach(session, role, handlers)
     end
   end, "GH PR Overview: load more")
 
-  map(bufnr, "et", function()
-    if type(handlers.edit) == "function" then
-      handlers.edit("edit_title")
-    end
-  end, "GH PR Overview: edit title")
-  map(bufnr, "eb", function()
-    if type(handlers.edit) == "function" then
-      handlers.edit("edit_body")
-    end
-  end, "GH PR Overview: edit description")
-  map(bufnr, "el", function()
-    if type(handlers.edit) == "function" then
-      handlers.edit("edit_labels")
-    end
-  end, "GH PR Overview: edit labels")
-  map(bufnr, "er", function()
-    if type(handlers.edit) == "function" then
-      handlers.edit("edit_reviewers")
-    end
-  end, "GH PR Overview: edit reviewers")
-  map(bufnr, "ea", function()
-    if type(handlers.edit) == "function" then
-      handlers.edit("edit_assignees")
-    end
-  end, "GH PR Overview: edit assignees")
-  map(bufnr, "em", function()
-    if type(handlers.edit) == "function" then
-      handlers.edit("edit_milestone")
-    end
-  end, "GH PR Overview: edit milestone")
-  map(bufnr, "es", function()
-    if type(handlers.edit) == "function" then
-      handlers.edit("change_state")
-    end
-  end, "GH PR Overview: change state")
-  map(bufnr, "ed", function()
-    if type(handlers.edit) == "function" then
-      handlers.edit("change_draft")
-    end
-  end, "GH PR Overview: toggle draft")
-
   map(bufnr, session.keymaps.cycle_next, function()
     cycle(1)
   end, "GH PR Overview: next pane")

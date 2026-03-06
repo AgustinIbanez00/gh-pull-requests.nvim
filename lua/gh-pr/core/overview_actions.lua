@@ -1,4 +1,5 @@
 local M = {}
+local url_open = require("gh-pr.url_open")
 
 local function valid_overview_sections()
   return {
@@ -32,6 +33,17 @@ local function current_overview_limits(ctx)
   local bufnr = vim.api.nvim_get_current_buf()
   local stored = vim.b[bufnr].gh_pr_overview_limits
   return normalize_overview_limits(type(stored) == "table" and stored or nil, ctx)
+end
+
+local function notify_error(ctx, message, silent)
+  if silent == true then
+    return
+  end
+  return ctx.notify_error(message)
+end
+
+local function runtime_module()
+  return require("gh-pr.ui.overview.runtime")
 end
 
 local function build_overview_callbacks(pr_number, ctx)
@@ -97,6 +109,9 @@ local function build_overview_callbacks(pr_number, ctx)
     preview_markdown_link = function(action)
       actions.overview_preview_markdown_link(action)
     end,
+    open_activity_thread_workspace = function(payload)
+      actions.open_overview_thread_workspace(payload)
+    end,
     toggle_review_tree = function()
       actions.toggle_review_tree()
     end,
@@ -147,22 +162,116 @@ function M.build_overview_model(number, opts, ctx)
   return pr, model, nil
 end
 
-local function open_overview_impl(number, opts, ctx)
-  opts = opts or {}
+local function build_overview_model_async(number, opts, ctx, callback)
+  opts = type(opts) == "table" and opts or {}
+  callback = callback or function() end
 
-  local pr, model, err = M.build_overview_model(number, opts, ctx)
-  if not pr then
-    return ctx.notify_error(err)
+  if type(ctx.pr_service.fetch_details_async) ~= "function" then
+    local pr, model, err = M.build_overview_model(number, opts, ctx)
+    callback(pr, model, err)
+    return
   end
 
+  local current_pr, _, resolve_err = ctx.resolve_active_pr(number, { refresh = false })
+  if not current_pr then
+    callback(nil, nil, resolve_err)
+    return
+  end
+
+  local limits = normalize_overview_limits(opts.overview_limits, ctx)
+  ctx.pr_service.fetch_details_async(current_pr.number, function(details, details_err)
+    if not details then
+      callback(nil, nil, details_err)
+      return
+    end
+
+    if type(ctx.set_active_pr) == "function" then
+      ctx.set_active_pr(details, details)
+    end
+
+    local pr = {
+      number = tonumber(details.number) or current_pr.number,
+      url = details.url,
+    }
+    local repository = ctx.normalize_repository(details) or ""
+    local threads = {}
+    local pr_change_events = {}
+    local thread_err = nil
+    local pr_change_err = nil
+    local pending = 2
+
+    local function complete()
+      pending = pending - 1
+      if pending > 0 then
+        return
+      end
+
+      local model = ctx.pr_service.build_overview_model(details, threads, limits, {
+        repository = repository,
+        thread_error = thread_err,
+        pr_change_events = pr_change_events,
+        pr_change_error = pr_change_err,
+      })
+      callback(pr, model, nil)
+    end
+
+    if type(ctx.pr_service.fetch_review_threads_async) == "function" then
+      ctx.pr_service.fetch_review_threads_async(pr.number, {
+        threads_first = limits.threads,
+        comments_first = math.min(100, limits.threads * 4),
+      }, function(result, err)
+        threads = type(result) == "table" and result or {}
+        thread_err = err
+        complete()
+      end)
+    else
+      local result, err = ctx.pr_service.fetch_review_threads(pr.number, {
+        threads_first = limits.threads,
+        comments_first = math.min(100, limits.threads * 4),
+      })
+      threads = type(result) == "table" and result or {}
+      thread_err = err
+      complete()
+    end
+
+    local fetch_pr_changes_async = ctx.pr_service.fetch_pr_change_events_async
+    local pr_changes_opts = {
+      repository = repository,
+      pr_url = type(details.url) == "string" and details.url or "",
+      max_items = math.min(500, math.max(100, limits.timeline * 4)),
+      max_pages = 5,
+    }
+
+    if type(fetch_pr_changes_async) == "function" then
+      fetch_pr_changes_async(pr.number, pr_changes_opts, function(events, err)
+        pr_change_events = type(events) == "table" and events or {}
+        pr_change_err = err
+        complete()
+      end)
+      return
+    end
+
+    local events, events_err = ctx.pr_service.fetch_pr_change_events(pr.number, pr_changes_opts)
+    pr_change_events = type(events) == "table" and events or {}
+    pr_change_err = events_err
+    complete()
+  end)
+end
+
+local function runtime_open_overview(model, pr_number, opts, ctx)
   local plugin_config = ctx.config.get() or {}
   local overview_config = plugin_config.overview or {}
   local panes_config = type(overview_config.panes) == "table" and overview_config.panes or {}
   local session_id = tonumber(opts.session_id) or nil
+  local window_opts = type(overview_config.window) == "table" and vim.deepcopy(overview_config.window) or {}
+  if type(opts.enter) == "boolean" then
+    window_opts.enter = opts.enter
+  end
 
-  require("gh-pr.ui.overview.runtime").open(model, {
+  return runtime_module().open(model, {
     session_id = session_id,
-    window = overview_config.window or {},
+    focus_role = type(opts.focus_role) == "string" and opts.focus_role or nil,
+    window = window_opts,
     layout = panes_config.layout or {},
     keymaps = panes_config.keymaps or {},
     activity = panes_config.activity or {},
@@ -171,8 +280,64 @@ local function open_overview_impl(number, opts, ctx)
     theme = overview_config.theme or {},
     markdown = overview_config.markdown or {},
     thread_snippet = overview_config.thread_snippet or {},
-    actions = build_overview_callbacks(pr.number, ctx),
+    thread_fix_diff = overview_config.thread_fix_diff or {},
+    actions = build_overview_callbacks(pr_number, ctx),
   })
+end
+
+local function start_async_silent_refresh(pr_number, session_id, opts, ctx)
+  local async_opts = vim.deepcopy(type(opts) == "table" and opts or {})
+  async_opts.refresh = true
+  async_opts.silent = true
+  async_opts.enter = false
+  async_opts.session_id = session_id
+  async_opts.refresh_mode = "sync"
+  async_opts.prefer_existing = false
+
+  build_overview_model_async(pr_number, async_opts, ctx, function(async_pr, async_model, async_err)
+    if not async_pr or not async_model then
+      notify_error(ctx, async_err, true)
+      return
+    end
+    runtime_open_overview(async_model, async_pr.number, async_opts, ctx)
+  end)
+end
+
+local function open_overview_impl(number, opts, ctx)
+  opts = type(opts) == "table" and opts or {}
+  local silent = opts.silent == true
+  local prefer_existing = opts.prefer_existing == true
+  local refresh_mode = type(opts.refresh_mode) == "string" and opts.refresh_mode or "sync"
+  local runtime = runtime_module()
+
+  local pr, _, resolve_err = ctx.resolve_active_pr(number, { refresh = false })
+  if not pr then
+    return notify_error(ctx, resolve_err, silent)
+  end
+
+  local existing_session_id = runtime.session_id_for_pr(pr.number)
+  if not opts.overview_limits and existing_session_id then
+    opts.overview_limits = runtime.overview_limits_for_session(existing_session_id)
+  end
+
+  if prefer_existing and existing_session_id then
+    runtime.focus_for_pr(pr.number, opts.focus_role or "summary")
+    if refresh_mode == "async_silent" then
+      start_async_silent_refresh(pr.number, existing_session_id, opts, ctx)
+    end
+    return existing_session_id
+  end
+
+  local model_pr, model, build_err = M.build_overview_model(pr.number, opts, ctx)
+  if not model_pr then
+    return notify_error(ctx, build_err, silent)
+  end
+
+  local opened_session_id = runtime_open_overview(model, model_pr.number, opts, ctx)
+  if refresh_mode == "async_silent" then
+    start_async_silent_refresh(model_pr.number, opened_session_id, opts, ctx)
+  end
+  return opened_session_id
 end
 
 function M.open_overview(number, opts, ctx)
@@ -199,39 +364,39 @@ function M.refresh_visible_overview_for_pr(number, ctx)
     return 0
   end
 
-  local current_tab = vim.api.nvim_get_current_tabpage()
-  local refreshed = 0
-  local refreshed_buffers = {}
+  local session_id = nil
+  local limits = nil
 
-  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(current_tab)) do
-    if ctx.is_valid_win(winid) then
-      local bufnr = vim.api.nvim_win_get_buf(winid)
-      local overview_ui = vim.b[bufnr].gh_pr_overview_ui
-      local is_overview = overview_ui == "panes" and overview_is_primary(bufnr)
-      if ctx.is_valid_buf(bufnr)
-        and not refreshed_buffers[bufnr]
-        and is_overview
-        and tonumber(vim.b[bufnr].gh_pr_number) == pr_number then
-        local limits = type(vim.b[bufnr].gh_pr_overview_limits) == "table" and vim.deepcopy(vim.b[bufnr].gh_pr_overview_limits)
-          or nil
-
-        local ok = pcall(vim.api.nvim_win_call, winid, function()
-          ctx.actions.open_overview(pr_number, {
-            refresh = true,
-            session_id = overview_session_id(bufnr),
-            overview_limits = limits,
-          })
-        end)
-
-        if ok then
-          refreshed = refreshed + 1
-          refreshed_buffers[bufnr] = true
+  for _, tabpage in ipairs(vim.api.nvim_list_tabpages()) do
+    for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+      if ctx.is_valid_win(winid) then
+        local bufnr = vim.api.nvim_win_get_buf(winid)
+        local overview_ui = vim.b[bufnr].gh_pr_overview_ui
+        local is_overview = overview_ui == "panes" and overview_is_primary(bufnr)
+        if ctx.is_valid_buf(bufnr) and is_overview and tonumber(vim.b[bufnr].gh_pr_number) == pr_number then
+          session_id = overview_session_id(bufnr)
+          limits = type(vim.b[bufnr].gh_pr_overview_limits) == "table"
+              and vim.deepcopy(vim.b[bufnr].gh_pr_overview_limits)
+            or nil
+          break
         end
       end
     end
+    if session_id then
+      break
+    end
   end
 
-  return refreshed
+  if not session_id then
+    return 0
+  end
+
+  start_async_silent_refresh(pr_number, session_id, {
+    session_id = session_id,
+    overview_limits = limits,
+    enter = false,
+  }, ctx)
+  return 1
 end
 
 function M.overview_more(section, count, ctx)
@@ -277,9 +442,18 @@ function M.open_overview_url(number, ctx)
 
   local ok, open_err = ctx.pr_service.open_in_browser(pr.number)
   if not ok then
-    if vim.ui and type(vim.ui.open) == "function" and type(pr.url) == "string" and pr.url ~= "" then
-      vim.ui.open(pr.url)
-      return
+    if type(pr.url) == "string" and pr.url ~= "" then
+      local opened, url_err = url_open.open(pr.url, {
+        notify_error = false,
+      })
+      if opened then
+        return
+      end
+      return ctx.notify_error(string.format(
+        "%s | URL open failed: %s",
+        tostring(open_err or "Unable to open PR URL"),
+        tostring(url_err or "unknown error")
+      ))
     end
     return ctx.notify_error(open_err)
   end

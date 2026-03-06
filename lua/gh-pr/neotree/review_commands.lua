@@ -1,12 +1,31 @@
-local actions = require("gh-pr.actions")
 local cc = require("neo-tree.sources.common.commands")
-local source = require("gh-pr.neotree.review_source")
-local runtime_state = require("gh-pr.state")
-local telescope = require("gh-pr.integrations.telescope")
-
 local renderer = require("neo-tree.ui.renderer")
 
 local M = {}
+
+local function get_actions()
+  return require("gh-pr.actions")
+end
+
+local function get_config()
+  return require("gh-pr.config")
+end
+
+local function get_source()
+  return require("gh-pr.neotree.review_source")
+end
+
+local function get_runtime_state()
+  return require("gh-pr.state")
+end
+
+local function get_telescope()
+  return require("gh-pr.integrations.telescope")
+end
+
+local function get_url_open()
+  return require("gh-pr.url_open")
+end
 
 local function current_node(state)
   if not state or not state.tree then
@@ -29,6 +48,7 @@ local function apply_context(node)
     return
   end
 
+  local actions = get_actions()
   if node.extra.pr then
     actions.set_active_pr(node.extra.pr, node.extra.details or node.extra.pr)
   end
@@ -38,13 +58,28 @@ local function apply_context(node)
   end
 end
 
+local function open_overview_from_source(node)
+  local pr_number = type(node) == "table"
+      and type(node.extra) == "table"
+      and type(node.extra.pr) == "table"
+      and node.extra.pr.number
+    or nil
+
+  get_actions().open_overview(pr_number, {
+    prefer_existing = true,
+    refresh_mode = "async_silent",
+    silent = true,
+    focus_role = "summary",
+  })
+end
+
 local function open_comment_target(node)
   local target = node.extra and node.extra.target
   if type(target) ~= "table" then
     return false
   end
 
-  actions.open_comment_location(target, {
+  get_actions().open_comment_location(target, {
     open_thread_popup = true,
     popup_mode = "open",
     focus_thread_popup = true,
@@ -58,7 +93,7 @@ local function open_timeline_item(node)
     return false
   end
 
-  actions.open_timeline_item(item, {
+  get_actions().open_timeline_item(item, {
     pr = node.extra and node.extra.pr or nil,
     details = node.extra and node.extra.details or nil,
     origin_bufnr = vim.api.nvim_get_current_buf(),
@@ -119,7 +154,6 @@ local function find_child_by_kind(state, parent, kind)
       return child
     end
   end
-
   return nil
 end
 
@@ -161,14 +195,6 @@ local function comments_section_node(state)
   return find_child_by_kind(state, root, "comments")
 end
 
-local function comments_by_file_node(state)
-  local comments = comments_section_node(state)
-  if not comments then
-    return nil
-  end
-  return find_comment_subsection(state, comments, ":comments:by-file")
-end
-
 local function comments_global_node(state)
   local comments = comments_section_node(state)
   if not comments then
@@ -206,6 +232,7 @@ local function collect_viewed_file_nodes(state)
     return {}
   end
 
+  local runtime_state = get_runtime_state()
   local ok, nodes = pcall(renderer.select_nodes, state.tree, function(candidate)
     if type(candidate) ~= "table" then
       return false
@@ -316,6 +343,7 @@ local function resolve_folder_toggle_target_viewed(entries, repo_name, pr_number
     return nil
   end
 
+  local runtime_state = get_runtime_state()
   for _, entry in ipairs(type(entries) == "table" and entries or {}) do
     if runtime_state.is_viewed(repo_name, pr_number, entry.path) ~= true then
       return true
@@ -413,10 +441,28 @@ local function collapse_ancestors_for_nodes(state, nodes, stop_id)
   return true
 end
 
+local function configured_review_files_flat_mode()
+  local options = get_config().get() or {}
+  local pr_review = type(options.pr_review) == "table" and options.pr_review or {}
+  local files = type(pr_review.files) == "table" and pr_review.files or {}
+  return files.flat == true
+end
+
+local function effective_review_files_flat_mode()
+  local runtime_state = get_runtime_state()
+  local persisted = type(runtime_state.get_pr_review_files_flat_pref) == "function"
+      and runtime_state.get_pr_review_files_flat_pref()
+    or nil
+  if type(persisted) == "boolean" then
+    return persisted
+  end
+  return configured_review_files_flat_mode()
+end
+
 M.noop = function() end
 
 M.refresh = function(state)
-  source.request_refresh(state, {
+  get_source().request_refresh(state, {
     force = true,
     refresh_context = {
       mode = "ui-refresh",
@@ -436,12 +482,12 @@ M.gh_pr_review_open = function(state)
   local kind = node_kind(node)
 
   if kind == "file" then
-    actions.open_diff(node.extra and node.extra.file or nil)
+    get_actions().open_diff(node.extra and node.extra.file or nil)
     return
   end
 
   if kind == "overview" then
-    actions.open_overview()
+    open_overview_from_source(node)
     return
   end
 
@@ -462,7 +508,7 @@ M.gh_pr_review_open = function(state)
   end
 
   if kind == "commit" and type(node.extra.commit) == "table" then
-    local loaded, load_err = source.ensure_commit_files(state, node)
+    local loaded, load_err = get_source().ensure_commit_files(state, node)
     if not loaded then
       vim.notify(load_err or "Unable to load commit files", vim.log.levels.ERROR)
       return
@@ -472,16 +518,15 @@ M.gh_pr_review_open = function(state)
   end
 
   if kind == "commit_file" and type(node.extra.commit) == "table" and type(node.extra.file) == "table" then
-    actions.open_commit_file_diff(node.extra.commit, node.extra.file)
+    get_actions().open_commit_file_diff(node.extra.commit, node.extra.file)
     return
   end
 
   if kind == "check" and type(node.extra.check_url) == "string" and node.extra.check_url ~= "" then
-    if vim.ui and type(vim.ui.open) == "function" then
-      vim.ui.open(node.extra.check_url)
-    else
-      vim.notify("Check URL: " .. node.extra.check_url, vim.log.levels.INFO)
-    end
+    get_url_open().open(node.extra.check_url, {
+      notify_error = true,
+      context = "Unable to open check URL",
+    })
     return
   end
 
@@ -501,9 +546,9 @@ M.open_diff = function(state)
   apply_context(node)
   local kind = node_kind(node)
   if kind == "file" then
-    actions.open_diff(node.extra and node.extra.file or nil)
+    get_actions().open_diff(node.extra and node.extra.file or nil)
   elseif kind == "commit_file" then
-    actions.open_commit_file_diff(node.extra and node.extra.commit or nil, node.extra and node.extra.file or nil)
+    get_actions().open_commit_file_diff(node.extra and node.extra.commit or nil, node.extra and node.extra.file or nil)
   end
 end
 
@@ -515,7 +560,7 @@ M.open_original = function(state)
 
   apply_context(node)
   if node_kind(node) == "file" then
-    actions.open_original(node.extra and node.extra.file or nil)
+    get_actions().open_original(node.extra and node.extra.file or nil)
   end
 end
 
@@ -527,7 +572,7 @@ M.open_modified = function(state)
 
   apply_context(node)
   if node_kind(node) == "file" then
-    actions.open_modified(node.extra and node.extra.file or nil)
+    get_actions().open_modified(node.extra and node.extra.file or nil)
   end
 end
 
@@ -540,7 +585,7 @@ M.toggle_viewed = function(state)
   apply_context(node)
   local kind = node_kind(node)
   if kind == "file" then
-    actions.mark_file_viewed(node.extra and node.extra.file or nil, nil)
+    get_actions().mark_file_viewed(node.extra and node.extra.file or nil, nil)
     return
   end
 
@@ -562,12 +607,12 @@ M.toggle_viewed = function(state)
         return
       end
 
-      actions.mark_files_viewed(descendants, mark_viewed)
+      get_actions().mark_files_viewed(descendants, mark_viewed)
     end)
     return
   end
 
-  actions.mark_files_viewed(descendants, mark_viewed)
+  get_actions().mark_files_viewed(descendants, mark_viewed)
 end
 
 M.comment_file_global = function(state)
@@ -578,7 +623,7 @@ M.comment_file_global = function(state)
 
   apply_context(node)
   if node_kind(node) == "file" then
-    actions.add_file_global_comment(node.extra and node.extra.file or nil)
+    get_actions().add_file_global_comment(node.extra and node.extra.file or nil)
   end
 end
 
@@ -587,7 +632,7 @@ M.comment_pr = function(state)
   if node then
     apply_context(node)
   end
-  actions.comment_pr()
+  get_actions().comment_pr()
 end
 
 M.edit_labels_multi = function(state)
@@ -595,7 +640,7 @@ M.edit_labels_multi = function(state)
   if node then
     apply_context(node)
   end
-  actions.overview_edit_stub("edit_labels", {})
+  get_actions().overview_edit_stub("edit_labels", {})
 end
 
 M.edit_assignees_multi = function(state)
@@ -603,7 +648,7 @@ M.edit_assignees_multi = function(state)
   if node then
     apply_context(node)
   end
-  actions.overview_edit_stub("edit_assignees", {})
+  get_actions().overview_edit_stub("edit_assignees", {})
 end
 
 M.edit_reviewers_multi = function(state)
@@ -611,7 +656,7 @@ M.edit_reviewers_multi = function(state)
   if node then
     apply_context(node)
   end
-  actions.overview_edit_stub("edit_reviewers", {})
+  get_actions().overview_edit_stub("edit_reviewers", {})
 end
 
 M.open_overview = function(state)
@@ -621,7 +666,7 @@ M.open_overview = function(state)
   end
 
   apply_context(node)
-  actions.open_overview()
+  open_overview_from_source(node)
 end
 
 M.open_pr_browser = function(state)
@@ -633,7 +678,7 @@ M.open_pr_browser = function(state)
 
   apply_context(node)
   local pr = node.extra and node.extra.pr or nil
-  actions.open_overview_url(pr and pr.number or nil)
+  get_actions().open_overview_url(pr and pr.number or nil)
 end
 
 M.open_telescope_actions = function(state)
@@ -642,7 +687,7 @@ M.open_telescope_actions = function(state)
     apply_context(node)
   end
 
-  telescope.open_review_actions(nil, {
+  get_telescope().open_review_actions(nil, {
     load_error = "Unable to load Telescope review actions",
   })
 end
@@ -655,11 +700,11 @@ M.start_review = function(state)
 
   apply_context(node)
   local pr = node.extra and node.extra.pr or nil
-  actions.start_review(pr and pr.number or nil)
+  get_actions().start_review(pr and pr.number or nil)
 end
 
 M.toggle_review_tree = function()
-  actions.toggle_review_tree()
+  get_actions().toggle_review_tree()
 end
 
 M.submit_pending_comment_review = function(state)
@@ -667,7 +712,7 @@ M.submit_pending_comment_review = function(state)
   if node then
     apply_context(node)
   end
-  actions.submit_pending_comment_review()
+  get_actions().submit_pending_comment_review()
 end
 
 M.submit_pending_approve_review = function(state)
@@ -675,7 +720,7 @@ M.submit_pending_approve_review = function(state)
   if node then
     apply_context(node)
   end
-  actions.submit_pending_approve_review()
+  get_actions().submit_pending_approve_review()
 end
 
 M.submit_pending_request_changes_review = function(state)
@@ -683,7 +728,7 @@ M.submit_pending_request_changes_review = function(state)
   if node then
     apply_context(node)
   end
-  actions.submit_pending_request_changes_review()
+  get_actions().submit_pending_request_changes_review()
 end
 
 M.discard_pending_review = function(state)
@@ -691,7 +736,7 @@ M.discard_pending_review = function(state)
   if node then
     apply_context(node)
   end
-  actions.discard_pending_review()
+  get_actions().discard_pending_review()
 end
 
 M.expand_all_review_nodes = function(state)
@@ -735,20 +780,24 @@ M.collapse_viewed_file_paths = function(state)
   collapse_ancestors_for_nodes(state, viewed_nodes, files_node_id)
 end
 
-M.expand_comments_by_file = function(state)
-  expand_subtree(state, comments_by_file_node(state))
-end
-
-M.collapse_comments_by_file = function(state)
-  collapse_subtree(state, comments_by_file_node(state))
-end
-
 M.expand_comments_global = function(state)
   expand_subtree(state, comments_global_node(state))
 end
 
 M.collapse_comments_global = function(state)
   collapse_subtree(state, comments_global_node(state))
+end
+
+M.toggle_files_flat_mode = function()
+  local next_mode = not effective_review_files_flat_mode()
+  local runtime_state = get_runtime_state()
+  if type(runtime_state.set_pr_review_files_flat_pref) == "function" then
+    runtime_state.set_pr_review_files_flat_pref(next_mode)
+  end
+
+  local label = next_mode and "list" or "tree"
+  vim.notify("PR Review Files mode: " .. label, vim.log.levels.INFO)
+  get_source().render_cached_states()
 end
 
 cc._add_common_commands(M)

@@ -1,5 +1,3 @@
-local config = require("gh-pr.config")
-local path_tree = require("gh-pr.path_tree")
 local pr_service = require("gh-pr.pr_service")
 
 local M = {}
@@ -291,21 +289,6 @@ function M.count_raw_thread_states(raw_threads)
   end)
 end
 
-local function count_thread_states_in_file_groups(files)
-  local counts = {}
-  local total = 0
-
-  for _, bucket in pairs(type(files) == "table" and files or {}) do
-    local bucket_counts, bucket_total = count_thread_states(type(bucket) == "table" and bucket.threads or {})
-    for state, value in pairs(bucket_counts) do
-      counts[state] = (tonumber(counts[state]) or 0) + (tonumber(value) or 0)
-    end
-    total = total + (tonumber(bucket_total) or 0)
-  end
-
-  return counts, total
-end
-
 local function timeline_item_for_thread_comment(thread, comment)
   return {
     kind = "thread_comment",
@@ -518,90 +501,17 @@ local function build_thread_nodes(pr, details, threads)
   return nodes
 end
 
-local function collect_comment_thread_groups(pr, details, threads)
-  local files = {}
+local function collect_orphan_threads(pr, details, threads)
   local orphan_threads = {}
 
   for index, raw_thread in ipairs(type(threads) == "table" and threads or {}) do
     local thread = normalize_thread_entry(raw_thread, index, pr, details)
-    if thread.path ~= "" then
-      files[thread.path] = files[thread.path] or { threads = {} }
-      files[thread.path].threads[#files[thread.path].threads + 1] = thread
-    else
+    if thread.path == "" then
       orphan_threads[#orphan_threads + 1] = thread
     end
   end
 
-  return files, orphan_threads
-end
-
-local function build_comment_file_tree_nodes(pr, details, files)
-  local file_paths = vim.tbl_keys(files)
-  if vim.tbl_isempty(file_paths) then
-    return {
-      {
-        id = string.format("ghpr-review:%d:comments:file-empty", pr.number),
-        name = "No file comments",
-        type = "message",
-        extra = {
-          kind = "message",
-          pr = pr,
-          details = details,
-        },
-      },
-    }, 0
-  end
-
-  local thread_count = 0
-  local entries = {}
-  for _, path in ipairs(file_paths) do
-    local bucket = files[path]
-    thread_count = thread_count + #(bucket.threads or {})
-    entries[#entries + 1] = {
-      path = path,
-      payload = bucket,
-    }
-  end
-
-  local render_options = config.get_path_render("gh_pr")
-  local nodes = path_tree.build_nodes(entries, {
-    mode = render_options.mode,
-    separator = render_options.separator,
-    create_directory_node = function(display_name, full_path)
-      return {
-        id = string.format("ghpr-review:%d:comments:dir:%s", pr.number, full_path),
-        name = display_name,
-        type = "directory",
-        extra = {
-          kind = "directory",
-          pr = pr,
-          details = details,
-        },
-        children = {},
-      }
-    end,
-    create_file_node = function(file_item)
-      local path = file_item.path
-      local file_name = path:match("[^/\\]+$") or path
-      local bucket = file_item.payload
-      return {
-        id = string.format("ghpr-review:%d:comments:file:%s", pr.number, sanitize_node_id_component(path)),
-        name = file_name,
-        type = "comment_file",
-        path = path,
-        extra = {
-          kind = "comment_file",
-          comment_path = path,
-          file_name = file_name,
-          pr = pr,
-          details = details,
-        },
-        children = build_thread_nodes(pr, details, bucket.threads or {}),
-      }
-    end,
-  })
-
-  return nodes, thread_count
+  return orphan_threads
 end
 
 local function build_review_event_nodes(pr, details, reviews)
@@ -712,12 +622,10 @@ function M.build_nodes(pr, details, options)
     thread_error = thread_error,
   })
 
-  local files, orphan_threads = collect_comment_thread_groups(pr, details, threads)
-  local by_file_nodes, by_file_thread_count = build_comment_file_tree_nodes(pr, details, files)
+  local orphan_threads = collect_orphan_threads(pr, details, threads)
   local review_nodes = build_review_event_nodes(pr, details, type(model.reviews) == "table" and model.reviews.items or {})
   local comment_nodes = build_global_comment_event_nodes(pr, details, type(model.comments) == "table" and model.comments.items or {})
   local orphan_nodes = build_thread_nodes(pr, details, orphan_threads)
-  local by_file_thread_states, _ = count_thread_states_in_file_groups(files)
   local orphan_thread_states, orphan_thread_total = count_thread_states(orphan_threads)
   local review_event_states, _ = count_review_event_states(review_nodes)
 
@@ -736,7 +644,7 @@ function M.build_nodes(pr, details, options)
   end
 
   local global_total = #review_nodes + #comment_nodes + #orphan_nodes
-  local has_content = by_file_thread_count > 0 or global_total > 0
+  local has_content = global_total > 0
 
   if not has_content then
     if not vim.tbl_isempty(sections) then
@@ -755,21 +663,6 @@ function M.build_nodes(pr, details, options)
       },
     }
   end
-
-  sections[#sections + 1] = {
-    id = string.format("ghpr-review:%d:comments:by-file", pr.number),
-    name = title_with_summary(
-      "By File",
-      summary_fraction_parts(by_file_thread_states, THREAD_SUMMARY_ORDER, by_file_thread_count)
-    ),
-    type = "directory",
-    extra = {
-      kind = "comments_section",
-      pr = pr,
-      details = details,
-    },
-    children = by_file_nodes,
-  }
 
   local global_children = {}
   local review_events_name = title_with_summary(

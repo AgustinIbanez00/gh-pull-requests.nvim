@@ -1,4 +1,5 @@
 local M = {}
+local url_open = require("gh-pr.url_open")
 
 local function normalize_line_endings(text)
   if type(text) ~= "string" then
@@ -67,16 +68,10 @@ function M.bool_or_default(value, default_value)
 end
 
 function M.open_url(url)
-  if type(url) ~= "string" or url == "" then
-    return
-  end
-
-  if vim.ui and type(vim.ui.open) == "function" then
-    vim.ui.open(url)
-    return
-  end
-
-  vim.notify("Unable to open URL. vim.ui.open is unavailable.", vim.log.levels.WARN)
+  return url_open.open(url, {
+    notify_error = true,
+    context = "Unable to open URL",
+  })
 end
 
 function M.clamp(value, minimum, maximum)

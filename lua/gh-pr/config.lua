@@ -11,6 +11,11 @@ local defaults = {
     separator = "/",
     show_status_prefix = true,
   },
+  pr_review = {
+    files = {
+      flat = false,
+    },
+  },
   hide_viewed_files = false,
   line_comments = {
     enabled = true,
@@ -33,6 +38,8 @@ local defaults = {
       enabled = true,
       prefix = "C",
       show_count = true,
+      show_authors = true,
+      max_authors = 2,
       position = "eol",
     },
     comments_tree = {
@@ -136,6 +143,7 @@ local defaults = {
         min_activity_height = 12,
       },
       activity = {
+        visual_style = "minimal",
         max_body_lines = 8,
         max_events = 120,
         show_code_context = true,
@@ -212,6 +220,9 @@ local defaults = {
     ignore_whitespace = false,
     render_whitespace = true,
     render_endlines = false,
+    debug = {
+      codediff_failures = false,
+    },
     whitespace = {
       tab = ">-",
       space = ".",
@@ -255,10 +266,75 @@ local defaults = {
       metadata_external_command = { "magick", "identify", "-format", "%w %h", "{file}" },
       max_bytes = 26214400,
     },
+    prefetch = {
+      enabled = true,
+      concurrency = 4,
+      text_extensions = {
+        "txt",
+        "md",
+        "markdown",
+        "json",
+        "jsonc",
+        "yaml",
+        "yml",
+        "toml",
+        "ini",
+        "cfg",
+        "conf",
+        "log",
+        "csv",
+        "tsv",
+        "lua",
+        "vim",
+        "js",
+        "jsx",
+        "ts",
+        "tsx",
+        "css",
+        "scss",
+        "sass",
+        "less",
+        "html",
+        "htm",
+        "xml",
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "ps1",
+        "psm1",
+        "psd1",
+        "bat",
+        "cmd",
+        "sql",
+        "c",
+        "h",
+        "cpp",
+        "hpp",
+        "cc",
+        "hh",
+        "cs",
+        "go",
+        "rs",
+        "py",
+        "rb",
+        "php",
+        "java",
+        "kt",
+        "kts",
+      },
+    },
   },
   ui = {
     use_neotree = true,
     telescope_fallback = true,
+    neotree_sources = {
+      pr = {
+        auto_register = true,
+        gate = "github_repo",
+        workspace = "cwd",
+      },
+    },
   },
   mappings = {
     global = {
@@ -698,6 +774,12 @@ local function sanitize_overview(overview)
   )
 
   result.panes.activity = type(result.panes.activity) == "table" and result.panes.activity or {}
+  if type(result.panes.activity.visual_style) == "string" then
+    result.panes.activity.visual_style = result.panes.activity.visual_style:lower()
+  end
+  if result.panes.activity.visual_style ~= "minimal" and result.panes.activity.visual_style ~= "classic" then
+    result.panes.activity.visual_style = defaults.overview.panes.activity.visual_style
+  end
   result.panes.activity.max_body_lines = sanitize_positive_integer(
     result.panes.activity.max_body_lines,
     defaults.overview.panes.activity.max_body_lines
@@ -921,6 +1003,19 @@ local function sanitize_path_render(path_render, opts)
   return result
 end
 
+local function sanitize_pr_review(pr_review)
+  if type(pr_review) ~= "table" then
+    return vim.deepcopy(defaults.pr_review)
+  end
+
+  local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.pr_review), pr_review)
+  result.files = type(result.files) == "table" and result.files or {}
+  if type(result.files.flat) ~= "boolean" then
+    result.files.flat = defaults.pr_review.files.flat
+  end
+  return result
+end
+
 local function sanitize_follow_current_file(follow_current_file)
   if type(follow_current_file) ~= "table" then
     return vim.deepcopy(defaults.follow_current_file)
@@ -969,6 +1064,29 @@ local function sanitize_mappings(mappings)
     if type(result.global.keys[key]) ~= "string" or result.global.keys[key] == "" then
       result.global.keys[key] = lhs
     end
+  end
+
+  return result
+end
+
+local function sanitize_neotree_sources(neotree_sources)
+  if type(neotree_sources) ~= "table" then
+    return vim.deepcopy(defaults.ui.neotree_sources)
+  end
+
+  local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.ui.neotree_sources), neotree_sources)
+  result.pr = type(result.pr) == "table" and result.pr or {}
+
+  if type(result.pr.auto_register) ~= "boolean" then
+    result.pr.auto_register = defaults.ui.neotree_sources.pr.auto_register
+  end
+
+  if result.pr.gate ~= "github_repo" and result.pr.gate ~= "git_repo" and result.pr.gate ~= "manual" then
+    result.pr.gate = defaults.ui.neotree_sources.pr.gate
+  end
+
+  if result.pr.workspace ~= "cwd" and result.pr.workspace ~= "buffer_repo" and result.pr.workspace ~= "neotree_root" then
+    result.pr.workspace = defaults.ui.neotree_sources.pr.workspace
   end
 
   return result
@@ -1041,6 +1159,11 @@ local function sanitize_line_comments(line_comments)
   if type(result.virtual_text.show_count) ~= "boolean" then
     result.virtual_text.show_count = defaults.line_comments.virtual_text.show_count
   end
+  if type(result.virtual_text.show_authors) ~= "boolean" then
+    result.virtual_text.show_authors = defaults.line_comments.virtual_text.show_authors
+  end
+  result.virtual_text.max_authors =
+    sanitize_positive_integer(result.virtual_text.max_authors, defaults.line_comments.virtual_text.max_authors)
   if result.virtual_text.position ~= "eol" and result.virtual_text.position ~= "inline" then
     result.virtual_text.position = defaults.line_comments.virtual_text.position
   end
@@ -1163,6 +1286,11 @@ local function sanitize_diff_view(diff_view)
     result.render_endlines = defaults.diff_view.render_endlines
   end
 
+  result.debug = type(result.debug) == "table" and result.debug or {}
+  if type(result.debug.codediff_failures) ~= "boolean" then
+    result.debug.codediff_failures = defaults.diff_view.debug.codediff_failures
+  end
+
   result.whitespace = type(result.whitespace) == "table" and result.whitespace or {}
   result.whitespace.tab = sanitize_listchars_token(result.whitespace.tab, defaults.diff_view.whitespace.tab)
   result.whitespace.space = sanitize_listchars_token(result.whitespace.space, defaults.diff_view.whitespace.space)
@@ -1204,11 +1332,18 @@ local function sanitize_diff_view(diff_view)
   if type(result.comments_panel.enabled) ~= "boolean" then
     result.comments_panel.enabled = defaults.diff_view.comments_panel.enabled
   end
-  if result.comments_panel.auto_open ~= "never"
-    and result.comments_panel.auto_open ~= "if_comments"
-    and result.comments_panel.auto_open ~= "always" then
-    result.comments_panel.auto_open = defaults.diff_view.comments_panel.auto_open
+  local comments_panel_auto_open = result.comments_panel.auto_open
+  if comments_panel_auto_open == true then
+    comments_panel_auto_open = "if_comments"
+  elseif comments_panel_auto_open == false then
+    comments_panel_auto_open = "never"
   end
+  if comments_panel_auto_open ~= "never"
+    and comments_panel_auto_open ~= "if_comments"
+    and comments_panel_auto_open ~= "always" then
+    comments_panel_auto_open = defaults.diff_view.comments_panel.auto_open
+  end
+  result.comments_panel.auto_open = comments_panel_auto_open
 
   local comments_panel_height_ratio = tonumber(result.comments_panel.height_ratio)
   if type(comments_panel_height_ratio) ~= "number" or comments_panel_height_ratio < 0.10 or comments_panel_height_ratio > 0.80 then
@@ -1360,6 +1495,19 @@ local function sanitize_diff_view(diff_view)
   end
   result.images.max_bytes = math.floor(max_bytes)
 
+  result.prefetch = type(result.prefetch) == "table" and result.prefetch or {}
+  if type(result.prefetch.enabled) ~= "boolean" then
+    result.prefetch.enabled = defaults.diff_view.prefetch.enabled
+  end
+  result.prefetch.concurrency = sanitize_positive_integer(
+    result.prefetch.concurrency,
+    defaults.diff_view.prefetch.concurrency
+  )
+  result.prefetch.text_extensions = sanitize_extension_list(
+    result.prefetch.text_extensions,
+    defaults.diff_view.prefetch.text_extensions
+  )
+
   return result
 end
 
@@ -1405,6 +1553,7 @@ function M.setup(opts)
   state.follow_current_file = sanitize_follow_current_file(state.follow_current_file)
   state.diff_view = sanitize_diff_view(state.diff_view)
   state.path_render = sanitize_path_render(state.path_render, opts)
+  state.pr_review = sanitize_pr_review(state.pr_review)
   state.mappings = sanitize_mappings(state.mappings)
 
   if type(state.ui) ~= "table" then
@@ -1418,6 +1567,8 @@ function M.setup(opts)
   if type(state.ui.telescope_fallback) ~= "boolean" then
     state.ui.telescope_fallback = defaults.ui.telescope_fallback
   end
+
+  state.ui.neotree_sources = sanitize_neotree_sources(state.ui.neotree_sources)
 end
 
 function M.get()

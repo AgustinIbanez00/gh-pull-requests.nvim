@@ -1,9 +1,18 @@
-local actions = require("gh-pr.actions")
 local cc = require("neo-tree.sources.common.commands")
-local source = require("gh-pr.neotree.source")
-local telescope = require("gh-pr.integrations.telescope")
 
 local M = {}
+
+local function get_actions()
+  return require("gh-pr.actions")
+end
+
+local function get_source()
+  return require("gh-pr.neotree.source")
+end
+
+local function get_telescope()
+  return require("gh-pr.integrations.telescope")
+end
 
 local function current_node(state)
   if not state or not state.tree then
@@ -18,6 +27,7 @@ local function apply_context(node)
     return
   end
 
+  local actions = get_actions()
   if node.extra.pr then
     actions.set_active_pr(node.extra.pr, node.extra.details or node.extra.pr)
   end
@@ -35,10 +45,25 @@ local function has_pr_context(node)
   return node and node.extra and node.extra.pr ~= nil
 end
 
+local function open_overview_from_source(node)
+  local pr_number = type(node) == "table"
+      and type(node.extra) == "table"
+      and type(node.extra.pr) == "table"
+      and node.extra.pr.number
+    or nil
+
+  get_actions().open_overview(pr_number, {
+    prefer_existing = true,
+    refresh_mode = "async_silent",
+    silent = true,
+    focus_role = "summary",
+  })
+end
+
 M.noop = function() end
 
 M.refresh = function(state)
-  source.request_refresh(state, { force = true })
+  get_source().request_refresh(state, { force = true })
 end
 
 M.gh_pr_open = function(state)
@@ -51,12 +76,12 @@ M.gh_pr_open = function(state)
 
   local kind = node_kind(node)
   if kind == "file" then
-    actions.open_diff(node.extra.file)
+    get_actions().open_diff(node.extra.file)
     return
   end
 
   if kind == "overview" then
-    actions.open_overview()
+    open_overview_from_source(node)
     return
   end
 
@@ -74,7 +99,7 @@ M.open_diff = function(state)
   end
 
   apply_context(node)
-  actions.open_diff(node.extra and node.extra.file or nil)
+  get_actions().open_diff(node.extra and node.extra.file or nil)
 end
 
 M.open_original = function(state)
@@ -84,7 +109,7 @@ M.open_original = function(state)
   end
 
   apply_context(node)
-  actions.open_original(node.extra and node.extra.file or nil)
+  get_actions().open_original(node.extra and node.extra.file or nil)
 end
 
 M.open_modified = function(state)
@@ -94,7 +119,7 @@ M.open_modified = function(state)
   end
 
   apply_context(node)
-  actions.open_modified(node.extra and node.extra.file or nil)
+  get_actions().open_modified(node.extra and node.extra.file or nil)
 end
 
 M.open_overview = function(state)
@@ -104,7 +129,7 @@ M.open_overview = function(state)
   end
 
   apply_context(node)
-  actions.open_overview()
+  open_overview_from_source(node)
 end
 
 M.open_pr_browser = function(state)
@@ -116,7 +141,7 @@ M.open_pr_browser = function(state)
 
   apply_context(node)
   local pr = node.extra and node.extra.pr or nil
-  actions.open_overview_url(pr and pr.number or nil)
+  get_actions().open_overview_url(pr and pr.number or nil)
 end
 
 M.open_comments_tree = function(state)
@@ -135,7 +160,7 @@ M.open_telescope_actions = function(state)
     apply_context(node)
   end
 
-  telescope.open_context_actions(nil, {
+  get_telescope().open_context_actions(nil, {
     load_error = "Unable to load Telescope fallback actions",
   })
 end
@@ -147,7 +172,7 @@ M.checkout_pr = function(state)
   end
 
   apply_context(node)
-  actions.checkout()
+  get_actions().checkout()
 end
 
 M.toggle_viewed = function(state)
@@ -157,7 +182,7 @@ M.toggle_viewed = function(state)
   end
 
   apply_context(node)
-  actions.mark_file_viewed(node.extra and node.extra.file or nil, nil)
+  get_actions().mark_file_viewed(node.extra and node.extra.file or nil, nil)
 end
 
 M.mark_viewed = function(state)
@@ -167,7 +192,7 @@ M.mark_viewed = function(state)
   end
 
   apply_context(node)
-  actions.mark_file_viewed(node.extra and node.extra.file or nil, true)
+  get_actions().mark_file_viewed(node.extra and node.extra.file or nil, true)
 end
 
 M.mark_unviewed = function(state)
@@ -177,7 +202,7 @@ M.mark_unviewed = function(state)
   end
 
   apply_context(node)
-  actions.mark_file_viewed(node.extra and node.extra.file or nil, false)
+  get_actions().mark_file_viewed(node.extra and node.extra.file or nil, false)
 end
 
 M.approve_review = function(state)
@@ -187,7 +212,7 @@ M.approve_review = function(state)
   end
 
   apply_context(node)
-  actions.review("approve")
+  get_actions().review("approve")
 end
 
 M.request_changes_review = function(state)
@@ -197,7 +222,7 @@ M.request_changes_review = function(state)
   end
 
   apply_context(node)
-  actions.review("request_changes")
+  get_actions().review("request_changes")
 end
 
 M.comment_review = function(state)
@@ -207,7 +232,7 @@ M.comment_review = function(state)
   end
 
   apply_context(node)
-  actions.review("comment")
+  get_actions().review("comment")
 end
 
 M.discard_pending_review = function(state)
@@ -216,7 +241,7 @@ M.discard_pending_review = function(state)
     apply_context(node)
   end
 
-  actions.discard_pending_review()
+  get_actions().discard_pending_review()
 end
 
 M.merge_pr = function(state)
@@ -226,7 +251,7 @@ M.merge_pr = function(state)
   end
 
   apply_context(node)
-  actions.merge()
+  get_actions().merge()
 end
 
 M.start_review = function(state)
@@ -237,7 +262,7 @@ M.start_review = function(state)
 
   apply_context(node)
   local pr = node.extra and node.extra.pr or nil
-  actions.start_review(pr and pr.number or nil)
+  get_actions().start_review(pr and pr.number or nil)
 end
 
 cc._add_common_commands(M)

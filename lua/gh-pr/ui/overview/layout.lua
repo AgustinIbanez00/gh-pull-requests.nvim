@@ -64,84 +64,89 @@ function M.sanitize_layout_opts(input)
   }
 end
 
-local function compute_geometry(window_opts, layout_opts)
-  local width, height = utils.resolve_float_size(window_opts)
-  local editor_width = math.max(1, vim.o.columns)
-  local editor_height = math.max(1, vim.o.lines - vim.o.cmdheight - 2)
+local function tabpage_valid(tabpage)
+  return type(tabpage) == "number" and tabpage > 0 and vim.api.nvim_tabpage_is_valid(tabpage)
+end
 
-  local row = math.max(0, math.floor((editor_height - height) / 2))
-  local col = math.max(0, math.floor((editor_width - width) / 2))
-  local gap = layout_opts.gap
+local function set_window_buffer(winid, bufnr)
+  if not utils.valid_win(winid) or not utils.valid_buf(bufnr) then
+    return
+  end
+  vim.api.nvim_win_set_buf(winid, bufnr)
+end
 
-  local sidebar_width = math.floor(width * layout_opts.sidebar_width_ratio)
-  local max_sidebar_width = math.max(layout_opts.min_sidebar_width, width - layout_opts.min_left_width - gap)
-  sidebar_width = utils.clamp(sidebar_width, layout_opts.min_sidebar_width, max_sidebar_width)
+local function safe_set_width(winid, width)
+  if not utils.valid_win(winid) then
+    return
+  end
+  local value = math.max(1, math.floor(tonumber(width) or 1))
+  pcall(vim.api.nvim_win_set_width, winid, value)
+end
 
-  local left_width = width - sidebar_width - gap
+local function safe_set_height(winid, height)
+  if not utils.valid_win(winid) then
+    return
+  end
+  local value = math.max(1, math.floor(tonumber(height) or 1))
+  pcall(vim.api.nvim_win_set_height, winid, value)
+end
+
+local function apply_dimensions(windows, layout_opts)
+  if not M.windows_valid(windows) then
+    return
+  end
+
+  local summary_width = vim.api.nvim_win_get_width(windows.summary)
+  local meta_width = vim.api.nvim_win_get_width(windows.meta)
+  local total_width = math.max(1, summary_width + meta_width)
+
+  local preferred_sidebar_width = math.floor(total_width * layout_opts.sidebar_width_ratio)
+  local max_sidebar_width = math.max(layout_opts.min_sidebar_width, total_width - layout_opts.min_left_width)
+  local sidebar_width = utils.clamp(preferred_sidebar_width, layout_opts.min_sidebar_width, max_sidebar_width)
+  local left_width = total_width - sidebar_width
+
   if left_width < layout_opts.min_left_width then
     left_width = layout_opts.min_left_width
-    sidebar_width = width - left_width - gap
+    sidebar_width = math.max(layout_opts.min_sidebar_width, total_width - left_width)
   end
   if sidebar_width < layout_opts.min_sidebar_width then
     sidebar_width = layout_opts.min_sidebar_width
-    left_width = width - sidebar_width - gap
+    left_width = math.max(layout_opts.min_left_width, total_width - sidebar_width)
   end
 
-  local summary_height = math.floor(height * layout_opts.summary_height_ratio)
-  local max_summary_height = math.max(layout_opts.min_summary_height, height - layout_opts.min_activity_height - gap)
-  summary_height = utils.clamp(summary_height, layout_opts.min_summary_height, max_summary_height)
-  local activity_height = height - summary_height - gap
+  safe_set_width(windows.meta, sidebar_width)
+  safe_set_width(windows.summary, left_width)
+  safe_set_width(windows.activity, left_width)
 
-  return {
-    summary = {
-      row = row,
-      col = col,
-      width = left_width,
-      height = summary_height,
-    },
-    activity = {
-      row = row + summary_height + gap,
-      col = col,
-      width = left_width,
-      height = activity_height,
-    },
-    meta = {
-      row = row,
-      col = col + left_width + gap,
-      width = sidebar_width,
-      height = height,
-    },
-  }
+  local summary_height = vim.api.nvim_win_get_height(windows.summary)
+  local activity_height = vim.api.nvim_win_get_height(windows.activity)
+  local total_left_height = math.max(1, summary_height + activity_height)
+
+  local preferred_summary_height = math.floor(total_left_height * layout_opts.summary_height_ratio)
+  local max_summary_height = math.max(layout_opts.min_summary_height, total_left_height - layout_opts.min_activity_height)
+  summary_height = utils.clamp(preferred_summary_height, layout_opts.min_summary_height, max_summary_height)
+  activity_height = total_left_height - summary_height
+
+  if activity_height < layout_opts.min_activity_height then
+    activity_height = layout_opts.min_activity_height
+    summary_height = math.max(layout_opts.min_summary_height, total_left_height - activity_height)
+  end
+  if summary_height < layout_opts.min_summary_height then
+    summary_height = layout_opts.min_summary_height
+    activity_height = math.max(layout_opts.min_activity_height, total_left_height - summary_height)
+  end
+
+  safe_set_height(windows.summary, summary_height)
+  safe_set_height(windows.activity, activity_height)
 end
 
-local function open_float(bufnr, geometry, title, window_opts, enter)
-  local config = {
-    relative = "editor",
-    style = "minimal",
-    border = window_opts.border == "none" and "none" or window_opts.border,
-    row = geometry.row,
-    col = geometry.col,
-    width = geometry.width,
-    height = geometry.height,
-    title = title,
-    title_pos = "left",
-    noautocmd = true,
-    zindex = 80,
-  }
-
-  local ok, winid = pcall(vim.api.nvim_open_win, bufnr, enter, config)
-  if not ok then
-    config.title = nil
-    config.title_pos = nil
-    local fallback_ok, fallback_winid = pcall(vim.api.nvim_open_win, bufnr, enter, config)
-    if not fallback_ok then
-      error("Unable to open overview float window: " .. tostring(fallback_winid))
-    end
-    winid = fallback_winid
+local function restore_previous_location(tabpage, winid)
+  if tabpage_valid(tabpage) then
+    pcall(vim.api.nvim_set_current_tabpage, tabpage)
   end
-
-  utils.ensure_window_options(winid)
-  return winid
+  if utils.valid_win(winid) then
+    pcall(vim.api.nvim_set_current_win, winid)
+  end
 end
 
 function M.windows_valid(windows)
@@ -151,15 +156,45 @@ function M.windows_valid(windows)
   return utils.valid_win(windows.summary) and utils.valid_win(windows.activity) and utils.valid_win(windows.meta)
 end
 
-function M.open_windows(buffers, window_opts, layout_opts, focus_role)
-  local geometry = compute_geometry(window_opts, layout_opts)
+function M.open_windows(buffers, _window_opts, layout_opts, focus_role)
+  -- `_window_opts` is kept for backward-compatible config shape; panes now use normal windows in a tabpage.
+
+  local previous_tab = vim.api.nvim_get_current_tabpage()
+  local previous_win = vim.api.nvim_get_current_win()
+
+  vim.cmd("tabnew")
+  local overview_tab = vim.api.nvim_get_current_tabpage()
+  local summary_win = vim.api.nvim_get_current_win()
+  set_window_buffer(summary_win, buffers.summary)
+
+  vim.cmd("vsplit")
+  local meta_win = vim.api.nvim_get_current_win()
+  set_window_buffer(meta_win, buffers.meta)
+
+  vim.api.nvim_set_current_win(summary_win)
+  vim.cmd("belowright split")
+  local activity_win = vim.api.nvim_get_current_win()
+  set_window_buffer(activity_win, buffers.activity)
+
   local windows = {
-    summary = open_float(buffers.summary, geometry.summary, " Summary ", window_opts, focus_role == "summary"),
-    activity = open_float(buffers.activity, geometry.activity, " Activity ", window_opts, focus_role == "activity"),
-    meta = open_float(buffers.meta, geometry.meta, " Collaboration ", window_opts, focus_role == "meta"),
+    summary = summary_win,
+    activity = activity_win,
+    meta = meta_win,
   }
 
-  return windows
+  apply_dimensions(windows, layout_opts)
+
+  for _, role in ipairs({ "summary", "activity", "meta" }) do
+    utils.ensure_window_options(windows[role])
+  end
+
+  if type(focus_role) == "string" and windows[focus_role] then
+    vim.api.nvim_set_current_win(windows[focus_role])
+  else
+    restore_previous_location(previous_tab, previous_win)
+  end
+
+  return windows, overview_tab
 end
 
 return M

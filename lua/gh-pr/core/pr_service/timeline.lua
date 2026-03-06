@@ -88,6 +88,7 @@ function M.normalize_pr_change_events(events, ctx)
   for _, event in ipairs(type(events) == "table" and events or {}) do
     local change_summary = ctx.normalize_string(event.change_summary, "")
     local change_details = ctx.normalize_string(event.change_details, "")
+    local change_label_color = ctx.normalize_string(event.change_label_color, "")
     local body = ctx.normalize_string(event.body, "")
     if body == "" then
       if change_summary ~= "" and change_details ~= "" then
@@ -105,6 +106,7 @@ function M.normalize_pr_change_events(events, ctx)
       change_type = ctx.normalize_string(event.change_type, "updated"),
       change_summary = change_summary ~= "" and change_summary or "(pull request updated)",
       change_details = change_details,
+      change_label_color = change_label_color,
       author = ctx.normalize_string(event.author, "unknown"),
       body = body,
       created_at = ctx.normalize_string(event.created_at, ""),
@@ -182,6 +184,7 @@ function M.build_timeline_items(comments, reviews, threads, commits, pr_change_e
       change_type = ctx.normalize_string(event.change_type, "updated"),
       change_summary = ctx.normalize_string(event.change_summary, ""),
       change_details = ctx.normalize_string(event.change_details, ""),
+      change_label_color = ctx.normalize_string(event.change_label_color, ""),
       author = ctx.normalize_string(event.author, "unknown"),
       body = ctx.normalize_string(event.body, ""),
       created_at = ctx.normalize_string(event.created_at, ""),
@@ -323,12 +326,12 @@ query($owner:String!, $name:String!, $number:Int!, $first:Int!, $after:String) {
           ... on LabeledEvent {
             createdAt
             actor { login }
-            label { name }
+            label { name color }
           }
           ... on UnlabeledEvent {
             createdAt
             actor { login }
-            label { name }
+            label { name color }
           }
           ... on MilestonedEvent {
             createdAt
@@ -402,6 +405,7 @@ local function normalize_pr_change_node(node, fallback_url, ctx)
   local change_type = ""
   local change_summary = ""
   local change_details = ""
+  local change_label_color = ""
 
   if typename == "ClosedEvent" then
     change_type = "closed"
@@ -488,10 +492,12 @@ local function normalize_pr_change_node(node, fallback_url, ctx)
     change_type = "labeled"
     change_summary = "Added label"
     change_details = ctx.normalize_string(type(node.label) == "table" and node.label.name, "(unknown label)")
+    change_label_color = ctx.normalize_string(type(node.label) == "table" and node.label.color, "")
   elseif typename == "UnlabeledEvent" then
     change_type = "unlabeled"
     change_summary = "Removed label"
     change_details = ctx.normalize_string(type(node.label) == "table" and node.label.name, "(unknown label)")
+    change_label_color = ctx.normalize_string(type(node.label) == "table" and node.label.color, "")
   elseif typename == "MilestonedEvent" then
     change_type = "milestoned"
     change_summary = "Added milestone"
@@ -514,6 +520,7 @@ local function normalize_pr_change_node(node, fallback_url, ctx)
     change_type = change_type,
     change_summary = change_summary,
     change_details = change_details,
+    change_label_color = change_label_color,
     author = author,
     body = body,
     created_at = created_at,
@@ -546,6 +553,102 @@ local function parse_pr_change_events_response(response, fallback_url, ctx)
   end
 
   return events, has_next_page, end_cursor, nil
+end
+
+function M.finalize_pr_change_events(collected, max_items, ctx)
+  local items = {}
+  for _, item in ipairs(type(collected) == "table" and collected or {}) do
+    items[#items + 1] = item
+  end
+
+  table.sort(items, function(left, right)
+    return timeline_sort_key(left, ctx) < timeline_sort_key(right, ctx)
+  end)
+
+  if #items > max_items then
+    local trimmed = {}
+    local start_index = #items - max_items + 1
+    for index = start_index, #items do
+      trimmed[#trimmed + 1] = items[index]
+    end
+    items = trimmed
+  end
+
+  return items
+end
+
+function M.fetch_pr_change_events_async(number, opts, callback, ctx)
+  opts = type(opts) == "table" and opts or {}
+  callback = callback or function() end
+
+  if type(ctx.run_graphql_async) ~= "function" then
+    local events, err = M.fetch_pr_change_events(number, opts, ctx)
+    callback(events, err)
+    return
+  end
+
+  local repository = ctx.normalize_repository_from_input(opts.repository)
+  if not repository then
+    local resolved, repo_err = ctx.resolve_repository()
+    if not resolved then
+      callback(nil, repo_err)
+      return
+    end
+    repository = resolved
+  end
+
+  local first = ctx.clamp_positive(opts.first or opts.limit, 100, 100)
+  local max_items = ctx.clamp_positive(opts.max_items, first)
+  local max_pages = ctx.clamp_positive(opts.max_pages, 3, 10)
+  local fallback_url = ctx.normalize_string(opts.pr_url, "")
+  local after = nil
+  local collected = {}
+  local page = 1
+
+  local function fetch_next_page()
+    if page > max_pages then
+      callback(M.finalize_pr_change_events(collected, max_items, ctx), nil)
+      return
+    end
+
+    local variables = {
+      { flag = "-f", key = "owner", value = repository.owner },
+      { flag = "-f", key = "name", value = repository.name },
+      { flag = "-F", key = "number", value = tonumber(number) or number },
+      { flag = "-F", key = "first", value = first },
+    }
+    if after ~= "" then
+      variables[#variables + 1] = { flag = "-f", key = "after", value = after }
+    end
+
+    ctx.run_graphql_async(pr_change_events_query, variables, function(response, err)
+      if not response then
+        callback(nil, err)
+        return
+      end
+
+      local page_items, has_next_page, end_cursor, parse_err = parse_pr_change_events_response(response, fallback_url, ctx)
+      if not page_items then
+        callback(nil, parse_err)
+        return
+      end
+
+      for _, item in ipairs(page_items) do
+        collected[#collected + 1] = item
+      end
+
+      if #collected >= max_items or not has_next_page or end_cursor == "" then
+        callback(M.finalize_pr_change_events(collected, max_items, ctx), nil)
+        return
+      end
+
+      after = end_cursor
+      page = page + 1
+      fetch_next_page()
+    end)
+  end
+
+  fetch_next_page()
 end
 
 function M.fetch_pr_change_events(number, opts, ctx)
@@ -602,20 +705,7 @@ function M.fetch_pr_change_events(number, opts, ctx)
     after = end_cursor
   end
 
-  table.sort(collected, function(left, right)
-    return timeline_sort_key(left, ctx) < timeline_sort_key(right, ctx)
-  end)
-
-  if #collected > max_items then
-    local trimmed = {}
-    local start_index = #collected - max_items + 1
-    for index = start_index, #collected do
-      trimmed[#trimmed + 1] = collected[index]
-    end
-    collected = trimmed
-  end
-
-  return collected, nil
+  return M.finalize_pr_change_events(collected, max_items, ctx), nil
 end
 
 return M

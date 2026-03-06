@@ -20,13 +20,17 @@ end
 
 function M.sanitize_activity_opts(input)
   local source = type(input) == "table" and input or {}
+  local visual_style = utils.safe_string(source.visual_style, "minimal"):lower()
+  if visual_style ~= "minimal" and visual_style ~= "classic" then
+    visual_style = "minimal"
+  end
   return {
+    visual_style = visual_style,
     max_body_lines = sanitize_positive_integer(source.max_body_lines, 8, 2, 80),
     max_events = sanitize_positive_integer(source.max_events, 120, 20, 500),
     show_code_context = source.show_code_context ~= false,
   }
 end
-
 local function new_payload()
   return {
     lines = {},
@@ -62,6 +66,23 @@ local function add_span(payload, line, start_col, end_col, group)
     end_col = tonumber(end_col) or -1,
     group = group,
   }
+end
+
+local function add_action_line(payload, text, highlight, action, hint)
+  local line = utils.safe_string(text, "")
+  local hint_text = utils.safe_string(hint, "")
+  local hint_start = nil
+
+  if type(action) == "table" and hint_text ~= "" then
+    line = string.format("%s  %s", line, hint_text)
+    hint_start = #line - #hint_text
+  end
+
+  local row = add_line(payload, line, highlight, action)
+  if type(hint_start) == "number" and hint_start >= 0 then
+    add_span(payload, row, hint_start, hint_start + #hint_text, "GhPrOverviewMuted")
+  end
+  return row
 end
 
 local function normalize_show_flags(session)
@@ -342,6 +363,143 @@ local function trim_diff_hunk(thread, diff_hunk, context_before, context_after)
   return result
 end
 
+local function resolve_thread_snippet_language(path)
+  local resolved = ""
+  local normalized_path = utils.safe_string(path, "")
+
+  if normalized_path ~= "" and vim.filetype and type(vim.filetype.match) == "function" then
+    local ok, detected = pcall(vim.filetype.match, { filename = normalized_path })
+    if ok and type(detected) == "string" then
+      resolved = detected
+    end
+  end
+
+  if resolved == "" and normalized_path ~= "" then
+    local ext = normalized_path:match("%.([%w_+-]+)$")
+    if type(ext) == "string" and ext ~= "" then
+      resolved = ext:lower()
+    end
+  end
+
+  if resolved ~= ""
+    and vim.treesitter
+    and vim.treesitter.language
+    and type(vim.treesitter.language.get_lang) == "function" then
+    local ok, mapped = pcall(vim.treesitter.language.get_lang, resolved)
+    if ok and type(mapped) == "string" and mapped ~= "" then
+      resolved = mapped
+    end
+  end
+
+  local normalized = resolved:lower()
+  local markdown_fence = {
+    cs = "csharp",
+    c_sharp = "csharp",
+    sh = "bash",
+    zsh = "bash",
+    ps1 = "powershell",
+    psm1 = "powershell",
+    javascriptreact = "jsx",
+    typescriptreact = "tsx",
+  }
+
+  if markdown_fence[normalized] then
+    return markdown_fence[normalized]
+  end
+  if normalized == "" then
+    return "diff"
+  end
+  return normalized
+end
+
+local function raw_diff_line_to_code(line)
+  if type(line) ~= "string" then
+    return nil
+  end
+  if line:sub(1, 2) == "@@" then
+    return nil
+  end
+  if line:sub(1, 3) == "---" or line:sub(1, 3) == "+++" then
+    return nil
+  end
+  if line:sub(1, 1) == "\\" then
+    return nil
+  end
+  if line:sub(1, 4) == "... " then
+    return nil
+  end
+  local marker = line:sub(1, 1)
+  if marker == "+" or marker == "-" or marker == " " then
+    return line:sub(2)
+  end
+  return line
+end
+
+local function snippet_code_lines(source_lines, side)
+  local prioritized = {}
+  local fallback = {}
+  local normalized_side_value = side == "base" and "base" or "head"
+
+  for _, line in ipairs(source_lines) do
+    if type(line) == "string" then
+      local marker = line:sub(1, 1)
+      local include = false
+      if normalized_side_value == "head" then
+        include = (marker == "+" and line:sub(1, 3) ~= "+++") or marker == " "
+      else
+        include = (marker == "-" and line:sub(1, 3) ~= "---") or marker == " "
+      end
+
+      if include then
+        local code = raw_diff_line_to_code(line)
+        if type(code) == "string" then
+          prioritized[#prioritized + 1] = code
+        end
+      end
+
+      local fallback_code = raw_diff_line_to_code(line)
+      if type(fallback_code) == "string" then
+        fallback[#fallback + 1] = fallback_code
+      end
+    end
+  end
+
+  if not vim.tbl_isempty(prioritized) then
+    return prioritized
+  end
+  return fallback
+end
+
+local function render_thread_code_context(payload, session, thread, indent)
+  local before = tonumber(session.thread_snippet and session.thread_snippet.context_before) or 5
+  local after = tonumber(session.thread_snippet and session.thread_snippet.context_after) or 5
+  local diff_hunk = utils.safe_string(thread.diff_hunk, "")
+  local snippet = trim_diff_hunk(thread, diff_hunk, before, after)
+  if vim.tbl_isempty(snippet) then
+    return
+  end
+
+  local side = utils.safe_string(thread.side, "head"):lower()
+  if side == "left" or side == "base" then
+    side = "base"
+  else
+    side = "head"
+  end
+  local language = resolve_thread_snippet_language(thread.path)
+  local code_lines = snippet_code_lines(snippet, side)
+  if vim.tbl_isempty(code_lines) then
+    language = "diff"
+    code_lines = snippet
+  end
+
+  add_line(payload, indent .. string.format("code context (%s, %s)", language, side), "GhPrOverviewMuted")
+  add_line(payload, indent .. "```" .. language)
+  for _, line in ipairs(code_lines) do
+    add_line(payload, indent .. line)
+  end
+  add_line(payload, indent .. "```")
+end
+
 local function thread_default_expanded(thread)
   return not (thread.is_resolved == true or thread.is_outdated == true)
 end
@@ -441,8 +599,13 @@ local function open_location_action(thread, event)
   }
 end
 
-local function thread_comment_evolution_diff_action(session, thread, comment)
+local function thread_comment_fix_diff_action(session, thread, comment)
   if type(comment) ~= "table" then
+    return nil
+  end
+
+  local config = type(session.thread_fix_diff) == "table" and session.thread_fix_diff or {}
+  if config.enabled == false then
     return nil
   end
 
@@ -463,12 +626,99 @@ local function thread_comment_evolution_diff_action(session, thread, comment)
   }
 
   return {
+    kind = "thread_fix_diff",
+    payload = payload,
+    fallback_url = utils.safe_string(comment.url, ""),
+  }
+end
+
+local function thread_comment_evolution_diff_action(session, thread, comment)
+  if type(comment) ~= "table" then
+    return nil
+  end
+
+  local comment_commit_oid = utils.safe_string(comment.commit_oid, "")
+  local comment_original_commit_oid = utils.safe_string(comment.original_commit_oid, "")
+  if comment_commit_oid == "" and comment_original_commit_oid == "" then
+    return nil
+  end
+
+  local location_action = open_location_action(thread, comment)
+  if type(location_action) ~= "table" or type(location_action.target) ~= "table" then
+    return nil
+  end
+
+  local payload = {
+    pr_number = tonumber(session.model and session.model.number) or 0,
+    path = location_action.target.path,
+    side = location_action.target.side,
+    line = location_action.target.line,
+    original_line = location_action.target.original_line,
+    comment_commit_oid = comment_commit_oid,
+    comment_original_commit_oid = comment_original_commit_oid,
+    fallback_target = location_action.target,
+  }
+
+  return {
     kind = "thread_comment_evolution_diff",
     payload = payload,
     fallback_url = utils.safe_string(comment.url, ""),
   }
 end
 
+local function thread_comment_menu_action(session, thread, comment)
+  if type(comment) ~= "table" then
+    return nil
+  end
+
+  local options = {}
+  local location_action = open_location_action(thread, comment)
+  local fix_action = thread_comment_fix_diff_action(session, thread, comment)
+  local evolution_action = thread_comment_evolution_diff_action(session, thread, comment)
+
+  if type(location_action) == "table" then
+    options[#options + 1] = {
+      label = "Open commented location",
+      action = location_action,
+    }
+  end
+
+  if type(fix_action) == "table" then
+    options[#options + 1] = {
+      label = "View fix diff (latest commit)",
+      action = fix_action,
+    }
+  end
+
+  if type(evolution_action) == "table" then
+    options[#options + 1] = {
+      label = "View evolution diff",
+      action = evolution_action,
+    }
+  end
+
+  local url = utils.safe_string(comment.url, "")
+  if url ~= "" then
+    options[#options + 1] = {
+      label = "Open comment in browser",
+      action = {
+        kind = "url",
+        url = url,
+      },
+    }
+  end
+
+  if vim.tbl_isempty(options) then
+    return location_action
+  end
+
+  local author = utils.safe_string(comment.author, "unknown")
+  return {
+    kind = "thread_comment_menu",
+    title = string.format("Thread comment actions (@%s)", author),
+    options = options,
+  }
+end
 local function event_action(event)
   if event.kind == "commit" then
     local commit = type(event.commit) == "table" and event.commit or {
@@ -511,13 +761,44 @@ local function event_action(event)
   return nil
 end
 
-local function activity_event_title(event, date_format)
+local function activity_visual_style(session)
+  local activity = type(session.activity) == "table" and session.activity or {}
+  local style = utils.safe_string(activity.visual_style, "minimal"):lower()
+  if style ~= "classic" then
+    return "minimal"
+  end
+  return style
+end
+
+local function activity_kind_label(kind)
+  if kind == "review" then
+    return "review"
+  end
+  if kind == "commit" then
+    return "commit"
+  end
+  if kind == "pr_change" then
+    return "change"
+  end
+  return "comment"
+end
+
+local function activity_icon_prefix(event)
+  local icon = styles.timeline_icon(event)
+  if type(icon) ~= "string" or icon == "" then
+    return ""
+  end
+  return icon .. " "
+end
+
+local function activity_event_title_classic(event, date_format)
   local kind = utils.safe_string(event.kind, "comment")
   local author = utils.safe_string(event.author, "unknown")
   local when = utils.format_time(event.created_at, date_format)
+  local icon = activity_icon_prefix(event)
   if kind == "review" then
     local state = utils.safe_string(event.state, "COMMENTED")
-    return string.format("### Review `%s` | @%s | %s", state, author, when)
+    return string.format("### %sReview `%s` | @%s | %s", icon, state, author, when)
   end
   if kind == "commit" then
     local oid = utils.safe_string(event.oid_short, "")
@@ -527,13 +808,74 @@ local function activity_event_title(event, date_format)
     if oid == "" then
       oid = "--------"
     end
-    return string.format("### Commit `%s` | @%s | %s", oid, author, when)
+    return string.format("### %sCommit `%s` | @%s | %s", icon, oid, author, when)
   end
   if kind == "pr_change" then
     local summary = utils.safe_string(event.change_summary, "PR updated")
-    return string.format("### %s | @%s | %s", summary, author, when)
+    return string.format("### %s%s | @%s | %s", icon, summary, author, when)
   end
-  return string.format("### Comment | @%s | %s", author, when)
+  return string.format("### %sComment | @%s | %s", icon, author, when)
+end
+
+local function activity_event_title_minimal(event, date_format)
+  local kind = utils.safe_string(event.kind, "comment")
+  local author = utils.safe_string(event.author, "unknown")
+  local when = utils.format_time(event.created_at, date_format)
+  local icon = activity_icon_prefix(event)
+
+  if kind == "review" then
+    local state = utils.safe_string(event.state, "COMMENTED")
+    return string.format("- %sreview %s  @%s  %s", icon, state, author, when)
+  end
+
+  if kind == "commit" then
+    local oid = utils.safe_string(event.oid_short, "")
+    if oid == "" then
+      oid = utils.safe_string(event.oid, ""):sub(1, 8)
+    end
+    if oid == "" then
+      oid = "--------"
+    end
+    return string.format("- %scommit %s  @%s  %s", icon, oid, author, when)
+  end
+
+  if kind == "pr_change" then
+    local summary = utils.safe_string(event.change_summary, "PR updated")
+    return string.format("- %s%s  @%s  %s", icon, summary, author, when)
+  end
+
+  return string.format("- %s%s  @%s  %s", icon, activity_kind_label(kind), author, when)
+end
+
+local function activity_event_title(session, event, date_format)
+  if activity_visual_style(session) == "classic" then
+    return activity_event_title_classic(event, date_format)
+  end
+  return activity_event_title_minimal(event, date_format)
+end
+
+local function is_label_pr_change_event(event)
+  if type(event) ~= "table" or utils.safe_string(event.kind, "") ~= "pr_change" then
+    return false
+  end
+  local change_type = utils.safe_string(event.change_type, ""):lower()
+  return change_type == "labeled" or change_type == "unlabeled"
+end
+
+local function render_pr_change_label_badge(payload, session, event, indent)
+  local prefix = utils.safe_string(indent, "")
+  local label_name = utils.safe_string(event.change_details, "")
+  if label_name == "" then
+    label_name = "(unknown label)"
+  end
+
+  local text = string.format("%s- `%s`", prefix, label_name)
+  local line = add_line(payload, text)
+  local highlight = "GhPrOverviewBadge"
+  if type(session.theme) == "table" and session.theme.labels ~= false then
+    highlight = styles.ensure_label_highlight(utils.safe_string(event.change_label_color, ""))
+  end
+  add_span(payload, line, #prefix + 2, #text - 1, highlight)
 end
 
 local function append_limited_body(payload, body, max_lines, indent)
@@ -556,44 +898,236 @@ local function append_limited_body(payload, body, max_lines, indent)
   end
 end
 
+local function count_char(text, expected)
+  if type(text) ~= "string" or type(expected) ~= "string" or #expected ~= 1 then
+    return 0
+  end
+  local count = 0
+  for index = 1, #text do
+    if text:sub(index, index) == expected then
+      count = count + 1
+    end
+  end
+  return count
+end
+
+local function trim_url_suffix(url)
+  local value = utils.safe_string(url, "")
+  if value == "" then
+    return ""
+  end
+
+  value = value:gsub("[%.,;:!%?]+$", "")
+  while value:sub(-1) == ")" and count_char(value, ")") > count_char(value, "(") do
+    value = value:sub(1, -2)
+  end
+  while value:sub(-1) == "]" and count_char(value, "]") > count_char(value, "[") do
+    value = value:sub(1, -2)
+  end
+  return value
+end
+
+local function extract_description_links(line)
+  local content = utils.safe_string(line, "")
+  local links = {}
+  local markdown_ranges = {}
+  local seen = {}
+
+  local function push_link(item)
+    local key = string.format("%s|%s|%d", item.url, item.label, item.start_col)
+    if seen[key] then
+      return
+    end
+    seen[key] = true
+    links[#links + 1] = item
+  end
+
+  local index = 1
+  while index <= #content do
+    local start_pos, end_pos, label, url = content:find("%[([^%]]+)%]%((https?://[^)%s]+)%)", index)
+    if not start_pos then
+      break
+    end
+
+    local normalized_url = trim_url_suffix(url)
+    if normalized_url ~= "" then
+      local normalized_label = utils.safe_string(label, "")
+      if normalized_label == "" then
+        normalized_label = normalized_url
+      end
+      push_link({
+        label = normalized_label,
+        url = normalized_url,
+        start_col = start_pos - 1,
+        end_col = end_pos,
+      })
+      markdown_ranges[#markdown_ranges + 1] = {
+        start_pos = start_pos,
+        end_pos = end_pos,
+      }
+    end
+
+    index = end_pos + 1
+  end
+
+  index = 1
+  while index <= #content do
+    local start_pos, end_pos, raw_url = content:find("https?://[%w%-%._~:/%?#%[%]@!$&'()*+,;%%=]+", index)
+    if not start_pos then
+      break
+    end
+
+    local inside_markdown = false
+    for _, range in ipairs(markdown_ranges) do
+      if start_pos >= range.start_pos and start_pos <= range.end_pos then
+        inside_markdown = true
+        break
+      end
+    end
+
+    if not inside_markdown then
+      local normalized_url = trim_url_suffix(raw_url)
+      if normalized_url ~= "" then
+        push_link({
+          label = normalized_url,
+          url = normalized_url,
+          start_col = start_pos - 1,
+          end_col = (start_pos - 1) + #normalized_url,
+        })
+      end
+    end
+
+    index = end_pos + 1
+  end
+
+  table.sort(links, function(left, right)
+    local left_col = tonumber(left.start_col) or 0
+    local right_col = tonumber(right.start_col) or 0
+    return left_col < right_col
+  end)
+
+  return links
+end
+
+local function description_link_label(item)
+  local label = utils.safe_string(item.label, "")
+  local url = utils.safe_string(item.url, "")
+  if label == "" then
+    return url
+  end
+  if label == url then
+    return label
+  end
+  return string.format("%s -> %s", label, url)
+end
+
+local function description_line_action(line)
+  local links = extract_description_links(line)
+  if vim.tbl_isempty(links) then
+    return nil, {}
+  end
+
+  if #links == 1 then
+    local only = links[1]
+    return {
+      kind = "preview_markdown_link",
+      label = only.label,
+      url = only.url,
+    }, links
+  end
+
+  local options = {}
+  for _, item in ipairs(links) do
+    options[#options + 1] = {
+      label = description_link_label(item),
+      action = {
+        kind = "preview_markdown_link",
+        label = item.label,
+        url = item.url,
+      },
+    }
+  end
+
+  return {
+    kind = "action_menu",
+    title = "Description links",
+    options = options,
+  }, links
+end
+
 local function render_summary(session)
   local payload = new_payload()
   local model = session.model or {}
   local summary = model.summary or {}
   local title = utils.safe_string(model.title, "(untitled)")
   local author = utils.safe_string(summary.author, "unknown")
-  local keymaps = type(session.keymaps) == "table" and session.keymaps or {}
 
   add_line(payload, string.format("# PR #%d", tonumber(model.number) or 0), "GhPrOverviewHeading")
-  add_line(payload, title, "GhPrOverviewTitle")
-  add_line(
+  add_action_line(
     payload,
-    string.format(
-      "Commands: `%s/%s` panes | `%s` summary | `%s` activity | `%s` collab | `<CR>` open | `%s` help",
-      utils.safe_string(keymaps.cycle_next, "<Tab>"),
-      utils.safe_string(keymaps.cycle_prev, "<S-Tab>"),
-      utils.safe_string(keymaps.focus_summary, "g1"),
-      utils.safe_string(keymaps.focus_activity, "g2"),
-      utils.safe_string(keymaps.focus_meta, "g3"),
-      utils.safe_string(keymaps.help, "?")
-    ),
-    "GhPrOverviewMuted"
+    title,
+    "GhPrOverviewTitle",
+    { kind = "edit_stub", edit_kind = "edit_title", payload = { current = model.title } },
+    "· <CR> edit"
   )
   add_line(payload, "")
 
   local state_text = styles.state_text(summary)
+  local state_target = nil
+  local merged_at = utils.safe_string(summary.merged_at, "")
+  local normalized_state = utils.safe_string(summary.state, ""):lower()
+  if merged_at == "" then
+    if normalized_state == "open" then
+      state_target = "closed"
+    elseif normalized_state == "closed" then
+      state_target = "open"
+    end
+  end
+
   local state_line = string.format(
     "State: `%s` | Review: `%s` | Author: @%s",
     state_text,
     utils.safe_string(summary.review_decision, "REVIEW_REQUIRED"),
     author
   )
-  local state_row = add_line(payload, state_line)
+  local state_action = nil
+  if type(state_target) == "string" then
+    state_action = {
+      kind = "edit_stub",
+      edit_kind = "change_state",
+      payload = {
+        current = utils.safe_string(summary.state, ""),
+        target = state_target,
+      },
+    }
+  end
+  local state_row = add_action_line(payload, state_line, nil, state_action, "· <CR> toggle")
   local state_token = "`" .. state_text .. "`"
   local start_col = state_line:find(state_token, 1, true)
   if start_col then
     add_span(payload, state_row, start_col - 1, start_col - 1 + #state_token, styles.state_highlight(summary, session.theme))
   end
+
+  local draft_value = summary.is_draft == true and "draft" or "ready"
+  local draft_target = draft_value == "draft" and "ready" or "draft"
+  local draft_action = nil
+  if normalized_state == "open" then
+    draft_action = {
+      kind = "edit_stub",
+      edit_kind = "change_draft",
+      payload = {
+        current = draft_value,
+        target = draft_target,
+      },
+    }
+  end
+  add_action_line(
+    payload,
+    string.format("Draft: `%s`", draft_value),
+    nil,
+    draft_action,
+    "· <CR> toggle"
+  )
 
   add_line(
     payload,
@@ -623,32 +1157,30 @@ local function render_summary(session)
   )
   add_line(payload, "")
 
-  add_line(payload, "## Quick Actions", "GhPrOverviewHeading")
-  add_line(payload, "- Approve review (`a`)")
-  add_line(payload, "- Request changes (`d`)")
-  add_line(payload, "- Comment review (`c`)")
-  add_line(payload, "- Merge (`m`) | Checkout (`k`)")
-  add_line(payload, "- Open PR in browser (`b`)", nil, { kind = "open_url" })
-  add_line(payload, "- Open comments tree (`C`)", nil, { kind = "open_comments_tree" })
-  add_line(payload, "- Refresh (`R`)", nil, { kind = "refresh" })
-  add_line(payload, "")
-
-  add_line(payload, "## Description", "GhPrOverviewHeading")
+  add_action_line(
+    payload,
+    "## Description",
+    "GhPrOverviewHeading",
+    { kind = "edit_stub", edit_kind = "edit_body", payload = { current = model.description } },
+    "· <CR> edit"
+  )
   local description_lines = utils.split_lines(utils.safe_string(model.description, ""))
   if vim.tbl_isempty(description_lines) then
     add_line(payload, "(no pull request description)", "GhPrOverviewMuted")
   else
     for _, line in ipairs(description_lines) do
-      add_line(payload, line)
+      local action, links = description_line_action(line)
+      local row = add_line(payload, line, nil, action)
+      for _, item in ipairs(links) do
+        add_span(payload, row, item.start_col, item.end_col, "GhPrOverviewMarkdownLink")
+      end
     end
   end
 
   return payload
 end
 
-local function render_activity_thread(session, payload, thread)
-  local expanded = thread_expanded(session, thread)
-  local prefix = expanded and "### [open]" or "### [closed]"
+local function thread_status_suffix(thread)
   local flags = {}
   if thread.is_resolved then
     flags[#flags + 1] = "resolved"
@@ -656,73 +1188,136 @@ local function render_activity_thread(session, payload, thread)
   if thread.is_outdated then
     flags[#flags + 1] = "outdated"
   end
+  if vim.tbl_isempty(flags) then
+    return ""
+  end
+  return " [" .. table.concat(flags, ", ") .. "]"
+end
 
+local function thread_location_text(thread)
   local location = utils.safe_string(thread.path, "(unknown path)")
   if tonumber(thread.line) and thread.line > 0 then
     location = string.format("%s:%d", location, thread.line)
   end
-  if not vim.tbl_isempty(flags) then
-    location = location .. " [" .. table.concat(flags, ", ") .. "]"
-  end
-
-  add_line(payload, string.format("%s Thread | %s", prefix, location), "GhPrOverviewTimelineThread", {
-    kind = "toggle_activity_thread",
-    thread_id = thread.id,
-    expanded = expanded,
-    default_expanded = thread_default_expanded(thread),
-  })
-
-  if not expanded then
-    add_line(payload, "")
-    return
-  end
-
-  local open_action = open_location_action(thread)
-  if open_action then
-    add_line(payload, "- Open commented location", nil, open_action)
-  end
-
-  local before = tonumber(session.thread_snippet and session.thread_snippet.context_before) or 5
-  local after = tonumber(session.thread_snippet and session.thread_snippet.context_after) or 5
-  if session.activity.show_code_context ~= false then
-    local snippet = trim_diff_hunk(thread, utils.safe_string(thread.diff_hunk, ""), before, after)
-    if not vim.tbl_isempty(snippet) then
-      add_line(payload, "")
-      add_line(payload, "```diff")
-      for _, line in ipairs(snippet) do
-        add_line(payload, line)
-      end
-      add_line(payload, "```")
-    end
-  end
-
-  add_line(payload, "")
-  for index, comment in ipairs(thread.comments) do
-    local level = index == 1 and 1 or 2
-    local indent = level == 1 and "  " or "    "
-    local marker = level == 1 and "-" or "->"
-    local author = utils.safe_string(comment.author, "unknown")
-    local when = utils.format_time(comment.created_at, session.date_format)
-    local action = open_location_action(thread, comment)
-    if not action then
-      action = event_action(comment)
-    end
-    local evolution_action = thread_comment_evolution_diff_action(session, thread, comment)
-    add_line(payload, string.format("%s%s @%s | %s", indent, marker, author, when), nil, action)
-    append_limited_body(payload, comment.body, session.activity.max_body_lines, indent .. "  ")
-    if type(evolution_action) == "table" then
-      add_line(payload, string.format("%s  ↪ View evolution diff", indent), "GhPrOverviewActionKey", evolution_action)
-    end
-    add_line(payload, "")
-  end
+  return location
 end
 
-local function render_activity_event(session, payload, event)
-  local title = activity_event_title(event, session.date_format)
-  local highlight = styles.timeline_highlight(event, session.theme)
-  add_line(payload, title, highlight, event_action(event))
+local function thread_comment_meta(comment, date_format)
+  local when = utils.format_time(comment.created_at, date_format)
+  local state = utils.safe_string(comment.state, "")
+  if state ~= "" then
+    return string.format("%s [%s]", when, state)
+  end
+  return when
+end
 
-  if event.kind == "commit" then
+local function build_thread_workspace_payload(session, thread)
+  local function normalize_side(value)
+    local side = utils.safe_string(value, "head"):lower()
+    if side == "left" or side == "base" then
+      return "base"
+    end
+    return "head"
+  end
+
+  local function pick_line(first, second)
+    local line = tonumber(first)
+    if type(line) == "number" and line > 0 then
+      return line
+    end
+    line = tonumber(second)
+    if type(line) == "number" and line > 0 then
+      return line
+    end
+    return nil
+  end
+
+  local comments = {}
+  for index, comment in ipairs(type(thread.comments) == "table" and thread.comments or {}) do
+    if type(comment) == "table" then
+      comments[#comments + 1] = {
+        id = utils.safe_string(comment.id, tostring(index)),
+        author = utils.safe_string(comment.author, "unknown"),
+        created_at = utils.safe_string(comment.created_at, ""),
+        body = utils.safe_string(comment.body, ""),
+        state = utils.safe_string(comment.state, ""),
+        url = utils.safe_string(comment.url, ""),
+        side = normalize_side(comment.side),
+        line = pick_line(comment.line, thread.line),
+        original_line = pick_line(comment.original_line, thread.original_line),
+      }
+    end
+  end
+
+  return {
+    thread_id = utils.safe_string(thread.id, ""),
+    pr_number = tonumber(session.model and session.model.number) or 0,
+    path = utils.safe_string(thread.path, ""),
+    side = normalize_side(thread.side),
+    line = pick_line(thread.line, thread.original_line),
+    original_line = pick_line(thread.original_line, thread.line),
+    is_resolved = thread.is_resolved == true,
+    is_outdated = thread.is_outdated == true,
+    comments = comments,
+  }
+end
+
+local function render_activity_thread_classic(session, payload, thread)
+  local prefix = "### Thread"
+  local location = thread_location_text(thread) .. thread_status_suffix(thread)
+  local comments_count = #(type(thread.comments) == "table" and thread.comments or {})
+  local thread_action = {
+    kind = "open_activity_thread_workspace",
+    payload = build_thread_workspace_payload(session, thread),
+  }
+
+  add_action_line(
+    payload,
+    string.format("%s | %s | %d comments", prefix, location, comments_count),
+    "GhPrOverviewTimelineThread",
+    thread_action,
+    "· <CR> open"
+  )
+  add_line(payload, "")
+end
+
+local function render_activity_thread_minimal(session, payload, thread)
+  local indicator = ">"
+  local location = thread_location_text(thread)
+  local suffix = thread_status_suffix(thread)
+  local comments_count = #(type(thread.comments) == "table" and thread.comments or {})
+  local thread_action = {
+    kind = "open_activity_thread_workspace",
+    payload = build_thread_workspace_payload(session, thread),
+  }
+
+  add_action_line(
+    payload,
+    string.format("%s thread %s%s (%d)", indicator, location, suffix, comments_count),
+    "GhPrOverviewTimelineThread",
+    thread_action,
+    "· <CR> open"
+  )
+
+  add_line(payload, "")
+end
+
+local function render_activity_thread(session, payload, thread)
+  if activity_visual_style(session) == "classic" then
+    render_activity_thread_classic(session, payload, thread)
+    return
+  end
+  render_activity_thread_minimal(session, payload, thread)
+end
+local function render_activity_event_classic(session, payload, event)
+  local title = activity_event_title(session, event, session.date_format)
+  local highlight = styles.timeline_highlight(event, session.theme)
+  local action = event_action(event)
+  add_action_line(payload, title, highlight, action, "· <CR> open")
+
+  if is_label_pr_change_event(event) then
+    render_pr_change_label_badge(payload, session, event, "")
+  elseif event.kind == "commit" then
     local headline = utils.safe_string(type(event.commit) == "table" and event.commit.headline or event.headline, "")
     if headline ~= "" then
       add_line(payload, headline)
@@ -739,13 +1334,53 @@ local function render_activity_event(session, payload, event)
   add_line(payload, "")
 end
 
+local function render_activity_event_minimal(session, payload, event)
+  local title = activity_event_title(session, event, session.date_format)
+  local highlight = styles.timeline_highlight(event, session.theme)
+  local action = event_action(event)
+  add_action_line(payload, title, highlight, action, "· <CR> open")
+
+  if is_label_pr_change_event(event) then
+    render_pr_change_label_badge(payload, session, event, "  ")
+  elseif event.kind == "commit" then
+    local headline = utils.safe_string(type(event.commit) == "table" and event.commit.headline or event.headline, "")
+    if headline ~= "" then
+      add_line(payload, "  " .. headline)
+    end
+    local body = utils.safe_string(type(event.commit) == "table" and event.commit.body or "", "")
+    if body ~= "" then
+      append_limited_body(payload, body, session.activity.max_body_lines, "  ")
+    end
+  else
+    local body = utils.safe_string(event.body, "")
+    if body ~= "" then
+      append_limited_body(payload, body, session.activity.max_body_lines, "  ")
+    end
+  end
+
+  add_line(payload, "")
+end
+
+local function render_activity_event(session, payload, event)
+  if activity_visual_style(session) == "classic" then
+    render_activity_event_classic(session, payload, event)
+    return
+  end
+  render_activity_event_minimal(session, payload, event)
+end
 local function render_activity(session)
   local payload = new_payload()
   local entries = build_activity_entries(session)
   local visible_total = visible_timeline_total(session)
   local shown = #entries
+  local style = activity_visual_style(session)
+
   add_line(payload, "# Activity", "GhPrOverviewHeading")
-  add_line(payload, string.format("Showing %d of %d events", shown, visible_total), "GhPrOverviewMuted")
+  if style == "classic" then
+    add_line(payload, string.format("Showing %d of %d events", shown, visible_total), "GhPrOverviewMuted")
+  else
+    add_line(payload, string.format("Events: %d/%d", shown, visible_total), "GhPrOverviewMuted")
+  end
   add_line(payload, "")
 
   if vim.tbl_isempty(entries) then
@@ -763,15 +1398,15 @@ local function render_activity(session)
 
   local shown_events = #filtered_timeline_events(session)
   if visible_total > shown_events then
-    add_line(payload, "Load more activity (`gr`)", "GhPrOverviewActionText", {
+    local load_more_label = style == "classic" and "Load more activity" or "Load more"
+    add_action_line(payload, load_more_label, "GhPrOverviewActionText", {
       kind = "more_section",
       section = "timeline",
-    })
+    }, "· <CR> load")
   end
 
   return payload
 end
-
 local function render_meta(session)
   local payload = new_payload()
   local model = session.model or {}
@@ -799,7 +1434,13 @@ local function render_meta(session)
   add_line(payload, string.format("Mergeable: `%s`", utils.safe_string(summary.mergeable, "unknown")))
   add_line(payload, "")
 
-  add_line(payload, "## Reviewers (`er`)", "GhPrOverviewHeading")
+  add_action_line(
+    payload,
+    "## Reviewers",
+    "GhPrOverviewHeading",
+    { kind = "edit_stub", edit_kind = "edit_reviewers", payload = {} },
+    "· <CR> edit"
+  )
   local reviewers = type(people.review_requests) == "table" and people.review_requests or {}
   if vim.tbl_isempty(reviewers) then
     add_line(payload, "- (none)", "GhPrOverviewMuted")
@@ -810,7 +1451,13 @@ local function render_meta(session)
   end
   add_line(payload, "")
 
-  add_line(payload, "## Assignees (`ea`)", "GhPrOverviewHeading")
+  add_action_line(
+    payload,
+    "## Assignees",
+    "GhPrOverviewHeading",
+    { kind = "edit_stub", edit_kind = "edit_assignees", payload = {} },
+    "· <CR> edit"
+  )
   local assignees = type(people.assignees) == "table" and people.assignees or {}
   if vim.tbl_isempty(assignees) then
     add_line(payload, "- (none)", "GhPrOverviewMuted")
@@ -821,7 +1468,13 @@ local function render_meta(session)
   end
   add_line(payload, "")
 
-  add_line(payload, "## Labels (`el`)", "GhPrOverviewHeading")
+  add_action_line(
+    payload,
+    "## Labels",
+    "GhPrOverviewHeading",
+    { kind = "edit_stub", edit_kind = "edit_labels", payload = {} },
+    "· <CR> edit"
+  )
   local labels = type(model.labels) == "table" and type(model.labels.items) == "table" and model.labels.items or {}
   if vim.tbl_isempty(labels) then
     add_line(payload, "- (none)", "GhPrOverviewMuted")
@@ -836,48 +1489,19 @@ local function render_meta(session)
   end
   add_line(payload, "")
 
-  add_line(payload, "## Milestone (`em`)", "GhPrOverviewHeading")
   local milestone = utils.safe_string(summary.milestone, "")
+  add_action_line(
+    payload,
+    "## Milestone",
+    "GhPrOverviewHeading",
+    { kind = "edit_stub", edit_kind = "edit_milestone", payload = { current = milestone } },
+    "· <CR> edit"
+  )
   if milestone == "" then
     add_line(payload, "- (none)", "GhPrOverviewMuted")
   else
     add_line(payload, "- " .. milestone, "GhPrOverviewBadge")
   end
-  add_line(payload, "")
-
-  add_line(payload, "## Edits", "GhPrOverviewHeading")
-  add_line(payload, "- Edit title (`et`)", nil, { kind = "edit_stub", edit_kind = "edit_title", payload = { current = model.title } })
-  add_line(
-    payload,
-    "- Edit description (`eb`)",
-    nil,
-    { kind = "edit_stub", edit_kind = "edit_body", payload = { current = model.description } }
-  )
-  add_line(payload, "- Edit labels (`el`)", nil, { kind = "edit_stub", edit_kind = "edit_labels", payload = {} })
-  add_line(payload, "- Edit reviewers (`er`)", nil, { kind = "edit_stub", edit_kind = "edit_reviewers", payload = {} })
-  add_line(payload, "- Edit assignees (`ea`)", nil, { kind = "edit_stub", edit_kind = "edit_assignees", payload = {} })
-  add_line(
-    payload,
-    "- Edit milestone (`em`)",
-    nil,
-    { kind = "edit_stub", edit_kind = "edit_milestone", payload = { current = milestone } }
-  )
-  add_line(
-    payload,
-    "- Change state (`es`)",
-    nil,
-    { kind = "edit_stub", edit_kind = "change_state", payload = { current = utils.safe_string(summary.state, "") } }
-  )
-  add_line(
-    payload,
-    "- Toggle draft (`ed`)",
-    nil,
-    {
-      kind = "edit_stub",
-      edit_kind = "change_draft",
-      payload = { current = summary.is_draft == true and "draft" or "ready" },
-    }
-  )
   add_line(payload, "")
 
   add_line(payload, "## Commits", "GhPrOverviewHeading")
@@ -913,3 +1537,4 @@ function M.render(session)
 end
 
 return M
+

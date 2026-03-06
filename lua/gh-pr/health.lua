@@ -153,6 +153,22 @@ local function check_lua_dependency(health, module_name, required, description)
   return false
 end
 
+local function check_codediff_dependency(health)
+  local has_command = vim.fn.exists(":CodeDiff") == 2
+  local has_module = pcall(require, "codediff")
+
+  if has_command or has_module then
+    health.ok("codediff.nvim is available (`:CodeDiff`)")
+    return true
+  end
+
+  health.warn("codediff.nvim is unavailable", {
+    "Install `esmuellert/codediff.nvim` for the primary gh-pr diff backend.",
+    "Without codediff, gh-pr asks once per session whether to use the legacy virtual fallback backend.",
+  })
+  return false
+end
+
 local function check_config(health, deps)
   local ok_config, config_or_err = pcall(require, "gh-pr.config")
   if not ok_config then
@@ -231,6 +247,7 @@ function M.check()
   health.start("gh-pr: dependencies")
   local gh = check_gh_cli(health)
   local render_markdown = check_lua_dependency(health, "render-markdown", true, "render-markdown.nvim")
+  check_codediff_dependency(health)
   local neotree = check_lua_dependency(health, "neo-tree", false, "neo-tree.nvim")
   local telescope = check_lua_dependency(health, "telescope", false, "telescope.nvim")
 

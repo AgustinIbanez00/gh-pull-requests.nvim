@@ -19,12 +19,37 @@ local CHECK_HIGHLIGHT = {
   default = "GhPrOverviewCheckNeutral",
 }
 
-local TIMELINE_HIGHLIGHT = {
+local TIMELINE_HIGHLIGHT_BY_KEY = {
   comment = "GhPrOverviewTimelineComment",
-  review = "GhPrOverviewTimelineReview",
+  review_commented = "GhPrOverviewTimelineReview",
+  review_approved = "GhPrOverviewReviewApproved",
+  review_changes_requested = "GhPrOverviewReviewChanges",
   thread_comment = "GhPrOverviewTimelineThread",
   commit = "GhPrOverviewTimelineCommit",
   pr_change = "GhPrOverviewTimelinePrChange",
+  pr_review_requested = "GhPrOverviewReviewPending",
+}
+
+local TIMELINE_ICON_NERD = {
+  comment = "󰙯",
+  review_commented = "󰍩",
+  review_approved = "󰄬",
+  review_changes_requested = "󰅖",
+  thread_comment = "󰘥",
+  commit = "󰜘",
+  pr_change = "󰑓",
+  pr_review_requested = "󰒃",
+}
+
+local TIMELINE_ICON_UNICODE = {
+  comment = "💬",
+  review_commented = "💬",
+  review_approved = "✅",
+  review_changes_requested = "❌",
+  thread_comment = "💬",
+  commit = "⎇",
+  pr_change = "↻",
+  pr_review_requested = "👀",
 }
 
 local function normalize_hex_color(value)
@@ -166,9 +191,61 @@ end
 
 function M.timeline_highlight(event, theme)
   if not theme.timeline_kinds then
-    return "Identifier"
+    return "GhPrOverviewMuted"
   end
-  return TIMELINE_HIGHLIGHT[utils.safe_string(event.kind, "")] or "Identifier"
+  local key = M.timeline_kind_key(event)
+  return TIMELINE_HIGHLIGHT_BY_KEY[key] or "GhPrOverviewMuted"
+end
+
+function M.timeline_kind_key(event)
+  event = type(event) == "table" and event or {}
+  local kind = utils.safe_string(event.kind, "")
+
+  if kind == "review" then
+    local state = utils.safe_string(event.state, "COMMENTED"):upper()
+    if state == "APPROVED" then
+      return "review_approved"
+    end
+    if state == "CHANGES_REQUESTED" then
+      return "review_changes_requested"
+    end
+    return "review_commented"
+  end
+
+  if kind == "pr_change" then
+    local change_type = utils.safe_string(event.change_type, ""):lower()
+    if change_type == "review_requested" then
+      return "pr_review_requested"
+    end
+    return "pr_change"
+  end
+
+  if kind == "commit" then
+    return "commit"
+  end
+  if kind == "thread_comment" then
+    return "thread_comment"
+  end
+  if kind == "comment" then
+    return "comment"
+  end
+  return "comment"
+end
+
+local function has_nerd_font()
+  local configured = vim.g.have_nerd_font
+  if configured ~= nil then
+    return configured == true or configured == 1
+  end
+
+  local guifont = utils.safe_string(vim.o.guifont, ""):lower()
+  return guifont:find("nerd", 1, true) ~= nil
+end
+
+function M.timeline_icon(event)
+  local key = M.timeline_kind_key(event)
+  local icons = has_nerd_font() and TIMELINE_ICON_NERD or TIMELINE_ICON_UNICODE
+  return icons[key] or icons.comment
 end
 
 return M

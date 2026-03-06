@@ -8,6 +8,7 @@ local comments_source = require("gh-pr.neotree.comments_source")
 local config = require("gh-pr.config")
 local follow = require("gh-pr.neotree.follow")
 local highlights = require("gh-pr.highlights")
+local review_prefetch = require("gh-pr.core.review_prefetch")
 local review_checks_section = require("gh-pr.neotree.review_sections.checks")
 local review_comments_section = require("gh-pr.neotree.review_sections.comments")
 local review_files_section = require("gh-pr.neotree.review_sections.files")
@@ -44,7 +45,15 @@ local DEFAULT_RENDERERS = {
   file = {
     { "indent", with_expanders = false },
     { "kind_icon" },
-    { "container", width = "100%", content = { { "name", zindex = 10 }, { "viewed_badge", zindex = 11 } } },
+    {
+      "container",
+      width = "100%",
+      content = {
+        { "name", zindex = 10 },
+        { "file_parent_path", zindex = 10 },
+        { "file_review_badges", zindex = 20, align = "right" },
+      },
+    },
   },
   comment_file = {
     { "indent", with_expanders = true },
@@ -65,6 +74,97 @@ local runtime_cache = {
 
 local REFRESH_MODE_UI = "ui-refresh"
 local REFRESH_MODE_CACHE_ONLY = "cache-only"
+local SOURCE_NAME = "gh_pr_review"
+
+local function valid_window(winid)
+  return type(winid) == "number" and winid > 0 and vim.api.nvim_win_is_valid(winid)
+end
+
+local function valid_buffer(bufnr)
+  return type(bufnr) == "number" and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr)
+end
+
+local function source_buffer(bufnr)
+  if not valid_buffer(bufnr) then
+    return false
+  end
+
+  local ok, filetype = pcall(vim.api.nvim_get_option_value, "filetype", { buf = bufnr })
+  if not ok then
+    filetype = vim.bo[bufnr].filetype
+  end
+  if filetype ~= "neo-tree" then
+    return false
+  end
+
+  return vim.b[bufnr].neo_tree_source == SOURCE_NAME
+end
+
+local function live_state_window_buffer(state)
+  if type(state) ~= "table" then
+    return nil, nil
+  end
+
+  local winid = tonumber(state.winid)
+  if not valid_window(winid) then
+    return nil, nil
+  end
+
+  local win_buf = vim.api.nvim_win_get_buf(winid)
+  if not valid_buffer(win_buf) then
+    return nil, nil
+  end
+
+  return winid, win_buf
+end
+
+local function state_is_live(state)
+  local _, bufnr = live_state_window_buffer(state)
+  if not bufnr then
+    return false
+  end
+  return source_buffer(bufnr)
+end
+
+local function state_can_render(state, opts)
+  opts = opts or {}
+  if type(state) ~= "table" then
+    return false
+  end
+
+  if state_is_live(state) then
+    return true
+  end
+
+  if opts.allow_unattached ~= true then
+    return false
+  end
+
+  return state.disposed ~= true
+end
+
+local function resolve_current_live_state()
+  local winid = vim.api.nvim_get_current_win()
+  if not valid_window(winid) then
+    return false, nil
+  end
+
+  local bufnr = vim.api.nvim_win_get_buf(winid)
+  if not source_buffer(bufnr) then
+    return false, nil
+  end
+
+  local state = nil
+  local manager_ok, manager = pcall(require, "neo-tree.sources.manager")
+  if manager_ok and type(manager.get_state_for_window) == "function" then
+    local ok, resolved_state = pcall(manager.get_state_for_window, winid)
+    if ok and state_is_live(resolved_state) then
+      state = resolved_state
+    end
+  end
+
+  return true, state
+end
 
 local function now_seconds()
   return os.time()
@@ -974,8 +1074,8 @@ local function build_nodes(session, repo_context)
   return nodes
 end
 
-local function render_state(state, session, repo_context)
-  if type(state) ~= "table" then
+local function render_state(state, session, repo_context, opts)
+  if not state_can_render(state, opts) then
     return false
   end
 
@@ -1002,7 +1102,7 @@ local function render_repo_states(repo_key)
   }
 
   for state_key, state in pairs(session.states) do
-    if type(state) ~= "table" or state.gh_pr_review_repo_key ~= repo_key then
+    if type(state) ~= "table" or state.gh_pr_review_repo_key ~= repo_key or not state_is_live(state) then
       session.states[state_key] = nil
       goto continue
     end
@@ -1128,7 +1228,7 @@ local start_background_refresh
 local function finish_refresh(repo_context, payload)
   payload = type(payload) == "table" and payload or {}
   local refresh_context = normalize_refresh_context(payload.refresh_context)
-  local ui_refresh = should_update_ui(refresh_context)
+  local ui_refresh = should_update_ui(refresh_context) and select(1, resolve_current_live_state())
   local session = ensure_repo_session(repo_context)
   session.inflight = false
   session.loading = false
@@ -1165,6 +1265,13 @@ local function finish_refresh(repo_context, payload)
   comments_source.invalidate_cache()
   persist_session(repo_context, session)
 
+  local review_pr, _ = active_review_for_repo(repo_context)
+  if type(review_pr) == "table" and tonumber(review_pr.number) == tonumber(session.pr_number) then
+    review_prefetch.prefetch_review(review_pr, session.details, {
+      source = "review_refresh",
+    })
+  end
+
   if ui_refresh then
     render_repo_states(repo_context.key)
     follow_current_file_if_visible({ reason = "refresh" })
@@ -1189,7 +1296,6 @@ local function finish_refresh(repo_context, payload)
     end
   end
 
-  local review_pr, _ = active_review_for_repo(repo_context)
   if type(review_pr) == "table" and tonumber(review_pr.number) ~= tonumber(session.pr_number) then
     queue_pending_refresh(session, {
       force = true,
@@ -1206,7 +1312,7 @@ end
 start_background_refresh = function(repo_context, opts)
   opts = opts or {}
   opts.refresh_context = normalize_refresh_context(opts.refresh_context)
-  local ui_refresh = should_update_ui(opts.refresh_context)
+  local ui_refresh = should_update_ui(opts.refresh_context) and select(1, resolve_current_live_state())
   local session = ensure_repo_session(repo_context)
   local review_pr, _ = active_review_for_repo(repo_context)
   local review_number = type(review_pr) == "table" and tonumber(review_pr.number) or nil
@@ -1403,7 +1509,9 @@ M.navigate = function(state, path)
   session.stale = session_is_stale(session)
 
   start_background_refresh(repo_context, { force = false })
-  render_state(state, session, repo_context)
+  render_state(state, session, repo_context, {
+    allow_unattached = true,
+  })
   follow_current_file_if_visible({ reason = "navigate" })
 end
 
@@ -1439,31 +1547,7 @@ function M.render_cached_states()
 end
 
 local function resolve_current_focused_state()
-  local winid = vim.api.nvim_get_current_win()
-  if not winid or not vim.api.nvim_win_is_valid(winid) then
-    return false, nil
-  end
-
-  local bufnr = vim.api.nvim_win_get_buf(winid)
-  local filetype = vim.api.nvim_get_option_value("filetype", { buf = bufnr })
-  if filetype ~= "neo-tree" then
-    return false, nil
-  end
-
-  if vim.b[bufnr].neo_tree_source ~= "gh_pr_review" then
-    return false, nil
-  end
-
-  local state = nil
-  local manager_ok, manager = pcall(require, "neo-tree.sources.manager")
-  if manager_ok and type(manager.get_state_for_window) == "function" then
-    local ok, resolved_state = pcall(manager.get_state_for_window, winid)
-    if ok then
-      state = resolved_state
-    end
-  end
-
-  return true, state
+  return resolve_current_live_state()
 end
 
 function M.is_focused()
@@ -1534,10 +1618,9 @@ M.setup = function(source_config, _)
     ["za"] = "collapse_all_review_nodes",
     ["zF"] = "expand_files_nodes",
     ["zf"] = "collapse_files_nodes",
+    ["zt"] = "toggle_files_flat_mode",
     ["zV"] = "expand_viewed_file_paths",
     ["zv"] = "collapse_viewed_file_paths",
-    ["zC"] = "expand_comments_by_file",
-    ["zc"] = "collapse_comments_by_file",
     ["zG"] = "expand_comments_global",
     ["zg"] = "collapse_comments_global",
     ["x"] = "toggle_review_tree",
@@ -1554,6 +1637,8 @@ M.setup = function(source_config, _)
 
   source_config.window.mappings = vim.tbl_deep_extend("force", source_config.window.mappings, default_mappings)
 end
+
+require("gh-pr.neotree.registry").register("gh_pr_review", M)
 
 return M
 

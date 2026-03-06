@@ -1,5 +1,27 @@
 local M = {}
 
+local function navigate_codediff_hunk(step)
+  if type(vim.b.gh_pr_diff_backend) ~= "string" or vim.b.gh_pr_diff_backend ~= "codediff" then
+    return false
+  end
+
+  local ok_codediff, codediff = pcall(require, "codediff")
+  if not ok_codediff then
+    return false
+  end
+
+  if step > 0 and type(codediff.next_hunk) == "function" then
+    local ok, moved = pcall(codediff.next_hunk)
+    return ok and moved == true
+  end
+  if step < 0 and type(codediff.prev_hunk) == "function" then
+    local ok, moved = pcall(codediff.prev_hunk)
+    return ok and moved == true
+  end
+
+  return false
+end
+
 local function file_path(file)
   if type(file) ~= "table" then
     return nil
@@ -139,6 +161,10 @@ function M.prev_reviewed_file(ctx)
 end
 
 local function goto_unified_change(step)
+  if navigate_codediff_hunk(step) then
+    return
+  end
+
   if vim.wo.diff then
     vim.cmd(step > 0 and "normal! ]c" or "normal! [c")
     return
