@@ -38,7 +38,7 @@ Quick links: [Installation](#installation) · [Quick Start](#quick-start) · [Co
 
 ### 🧠 Review Workspace
 
-- Dedicated review workspace source (`gh_pr_review`) with sections: Overview, Labels, Files, Reviewers, Commits, Checks, Comments.
+- Dedicated review workspace source (`gh_pr_review`) with sections: Overview, Labels, Files, Reviewers, Commits, Checks, Security, Comments, Drafts.
 - Start review flow from PR nodes (`r`) with optional GitHub pending-review creation.
 - Review actions: approve, request changes, comment, merge (`merge/squash/rebase`).
 
@@ -54,11 +54,11 @@ Quick links: [Installation](#installation) · [Quick Start](#quick-start) · [Co
 - `codediff.nvim` backend for PR file diffs, commit diffs and thread/comment location navigation.
 - No-fetch strategy for file diffs: content is downloaded from GitHub and opened through temporary files.
 - Session prompt fallback to legacy virtual backend when `codediff` is missing/fails.
-- Optional image preview and metadata fallback actions in legacy virtual backend.
+- Unified non-text preview for images and generic binary assets in review flows.
 
 ### ⚙️ Reliability + State
 
-- Viewed/unviewed state persisted in `stdpath("state")`.
+- Viewed/unviewed state synced from GitHub when available, with local fallback persisted in `stdpath("state")`.
 - Cache persisted per source/repo key.
 - Headless smoke + helptags validation script (`scripts/validate.ps1`).
 
@@ -386,9 +386,10 @@ Validation prerequisites:
       comments_panel = {
         enabled = true,
         auto_open = "if_comments", -- current diff file only; "if_comments" | "never" | "always" (also accepts true => "if_comments", false => "never")
-        height_ratio = 0.28,
-        min_height = 8,
-        max_height = 18,
+        position = "bottom", -- "bottom" | "right" for the temporary Neo-tree diff comments source
+        height_ratio = 0.28, -- bottom Neo-tree diff comments pane height (also used by the legacy fallback panel)
+        min_height = 8, -- bottom Neo-tree diff comments pane minimum height
+        max_height = 18, -- bottom Neo-tree diff comments pane maximum height
         follow_cursor = true,
         show_resolved = true,
         show_outdated = true,
@@ -409,6 +410,11 @@ Validation prerequisites:
         metadata_resolution_strategy = "hybrid", -- "internal" | "external" | "hybrid"
         metadata_external_command = { "magick", "identify", "-format", "%w %h", "{file}" },
         max_bytes = 25 * 1024 * 1024,
+      },
+      non_text = {
+        enabled = true,
+        auto_preview = true, -- image and generic asset files bypass codediff fallback prompts
+        show_metadata = true, -- render metadata/action cards for non-text preview buffers
       },
       prefetch = {
         enabled = true,
@@ -544,9 +550,9 @@ Compatibility aliases kept for user-facing behavior:
 | `:GhPrStartReview [number]` | Start review flow for selected PR | Enter review workspace quickly and warm textual diffs in background |
 | `:GhPrReviewTree` | Toggle PR Review source | Jump between list and review tree |
 | `:GhPrOverview` | Open active PR overview panes | Inspect summary/activity/collaboration |
-| `:GhPrOpenDiff` | Open selected file diff in codediff (primary backend) | Review code changes |
+| `:GhPrOpenDiff` | Open selected file diff or non-text preview | Review code and assets |
 | `:GhPrOpenCommitPatch` | Open selected commit diff in codediff | Inspect commit-level changes |
-| `:GhPrToggleReviewed` | Toggle local viewed state | Track reviewed files |
+| `:GhPrToggleReviewed` | Toggle viewed state | Track reviewed files |
 | `:GhPrRefresh` | Refresh data | Sync UI with latest PR state |
 | `:GhPRReviewRefresh` / `:GhPrReviewRefresh` | Force background refresh of active PR Review | Refresh stale review tree |
 | `:GhPrMerge [merge|squash|rebase]` | Merge active PR | Complete review flow |
@@ -571,11 +577,11 @@ Compatibility aliases kept for user-facing behavior:
 - `:GhPrOverviewV2Refresh` alias of `:GhPrOverviewRefresh` (kept for compatibility).
 - `:GhPrOverviewMore <checks|commits|comments|reviews|threads> [count]` load more section items.
 - `:GhPrCheckout [number]` checkout PR branch.
-- `:GhPrOpenDiff` open selected file diff in codediff (primary backend).
-- `:GhPrOpenOriginal` open selected file and focus base side in codediff when possible.
-- `:GhPrOpenModified` open selected file and focus head side in codediff when possible.
+- `:GhPrOpenDiff` open selected file in codediff for text, or dedicated gh-pr preview for non-text.
+- `:GhPrOpenOriginal` open selected file and focus base side in codediff when possible, or dedicated base-side preview for non-text.
+- `:GhPrOpenModified` open selected file and focus head side in codediff when possible, or dedicated head-side preview for non-text.
 - `:GhPrOpenCommitPatch` open selected commit diff in codediff.
-- `:GhPrToggleReviewed` toggle local viewed state.
+- `:GhPrToggleReviewed` toggle viewed state (GitHub when available, local fallback otherwise).
 - `:GhPrNextChange` jump to next diff hunk.
 - `:GhPrPrevChange` jump to previous diff hunk.
 - `:GhPrApprove` prompt review message and confirm before submit.
@@ -660,7 +666,7 @@ require("gh-pr").setup({
 | `<CR>` on metadata rows | Edit title / description / state / draft / labels / reviewers / assignees / milestone |
 | `<CR>` on `## Description` | Edit description in multiline composer |
 | `<CR>` on description link line | Preview attachment or confirm-open link (multiple links => selector) |
-| `<CR>` on thread header | Open dedicated thread workspace (diff + markdown thread panel) |
+| `<CR>` on thread header | Open thread evolution diff (comment commit -> latest file) |
 | `gr` | Load more activity |
 | `D` / `O` / `M` | Open diff / original / modified |
 
@@ -697,6 +703,17 @@ require("gh-pr").setup({
 - `ra`/`rc`/`rr`/`rd` in `gh_pr_review` submit/discard pending review.
 - `a` in `gh_pr_review` edits assignees, `l` edits labels, `u` edits reviewers.
 - `c` in `gh_pr_review` publishes a regular PR comment (`gh pr comment`).
+- `/` in `gh_pr_review` filters `Files` by path substring for the current session.
+- `z/` clears the current `Files` path filter.
+- `zs` selects a `Files` status filter (`all/modified/added/deleted/renamed/copied`).
+- `ze` filters `Files` by extension.
+- `zn` toggles `Files` no-extension filter.
+- `z.` toggles `Files` dotfiles-only filter.
+- `zu` toggles `Files` unviewed-only filter.
+- `zw` toggles `Files` viewed-only filter.
+- `zh` toggles `Files` hide-viewed for the current session.
+- `zd` toggles `Files` hide-deleted for the current session.
+- `zr` resets all session file filters.
 - `gh_pr` and `gh_pr_review` do not bind `<space>` by default (keeps `<leader>` available when `mapleader = " "`).
 - `gh_pr` and `gh_pr_review` prioritize PR-specific mappings over generic Neo-tree filesystem mappings.
 - Opening `Overview` from Neo-tree reuses/focuses existing overview session for that PR and triggers silent background refresh.
@@ -721,9 +738,8 @@ Inside the overview buffer:
 - state row uses direct toggle (`open`/`closed`) with confirmation
 - draft row uses direct toggle (`ready`/`draft`) with confirmation
 - `<CR>` on `Commits` opens commit diff details in codediff (or legacy virtual fallback if selected for this session)
-- `<CR>` on `Summary > Activity` thread headers opens a dedicated thread workspace tab
+- `<CR>` on `Summary > Activity` thread headers opens evolution diff for that thread file (comment commit -> latest file)
 - `gp` preview markdown link under cursor in PR description
-- Thread workspace opens with codediff unified (`inline`) on the left and readonly markdown thread history on the right
 - `gr` load more for current section tab (`Summary` loads more Activity)
 - `D` open diff for selected row (file or commit)
 - `O` open original file for selected file row
@@ -745,7 +761,7 @@ Inside the overview buffer:
 - `Summary > Activity` includes commit upload events and PR change events (labels/review requests/assignees/milestones/title/base-ref/draft/ready/close/reopen/merge/force-push).
 - Commit events in `Summary > Activity` can be opened with `<CR>` to view commit diff.
 - `Summary > Activity` thread rows are rendered header-only for low-noise navigation.
-- `<CR>` on a thread header opens a dedicated workspace tab with full thread metadata/comments and code context.
+- `<CR>` on a thread header opens compare diff from the thread comment commit to the latest file version in the PR.
 - If inline patch resolution fails, `overview.thread_fix_diff.fallback_to_buffer = true` falls back to legacy diff buffers.
 - `,x` toggle PR Review source while staying in review flow.
 - gh-pr UI windows (overview panes, popups and composer) force `nospell` without affecting regular file buffers.
@@ -757,7 +773,7 @@ Inside overview panes (`:GhPrOverview`, alias `:GhPrOverviewV2`):
 - `<CR>` on metadata rows handles PR edits contextually (title/description/state/draft/labels/reviewers/assignees/milestone).
 - `<CR>` on `## Description` heading opens multiline composer (preloaded text, `<C-s>` submit, `q`/`<Esc>` cancel).
 - `<CR>` on description link lines previews GitHub attachments or confirms browser-open for non-attachment links (multiple links => selector).
-- `<CR>` on `Activity` thread headers opens dedicated thread workspace tab (codediff unified + markdown thread panel).
+- `<CR>` on `Activity` thread headers opens compare diff from the thread comment commit to the latest file version.
 - `gr` loads more activity events.
 - `?` opens floating shortcuts help.
 - `<Tab>` / `<S-Tab>` cycle panes.
@@ -769,15 +785,18 @@ Diff backend behavior:
 - gh-pr uses `codediff.nvim` as the primary backend for `Files`, `Commits`, overview diff actions, and comment/thread location opens.
 - For PR/commit file diffs, gh-pr downloads base/head content from GitHub and opens codediff without git fetch.
 - Starting or refreshing an active PR review warms textual PR file pairs in the background under the codediff temp cache, so later diff opens reuse local temp files.
-- Diffs opened by gh-pr in codediff are forced to side-by-side layout, except Overview thread workspace (`<CR>` on thread header) which uses inline/unified layout.
+- Diffs opened by gh-pr in codediff are forced to side-by-side layout.
 - codediff windows opened by gh-pr force `number = true` and `relativenumber = true`.
 - codediff temp buffers opened by gh-pr are forced readonly/non-modifiable (`nomodified`, `noswapfile`) to avoid save prompts on exit.
 - gh-pr read-only URI buffers (`ghpr://...`, including virtual fallback diffs/overview preview surfaces) are kept `nomodified` via write guards + runtime safety-net to avoid accidental save prompts on exit.
-- Binary/image/non-renderable content automatically falls back to the virtual backend path.
+- Text files open in codediff; image and generic binary/non-renderable files bypass codediff fallback prompts and open dedicated gh-pr non-text preview buffers.
 - If codediff is unavailable or fails, gh-pr prompts once per session to decide whether to use legacy virtual fallback backend.
 - If fallback is rejected, diff open actions return explicit errors.
 - Inline comments/suggestions and diff comments panel are available in codediff file diffs (`head` side for inline actions).
-- The diff comments panel is scoped to the currently open diff file, renders immediately, and loads comment entries lazily in the background.
+- When Neo-tree is available, `<localleader>dc` opens a temporary bottom comments tree scoped to the current diff file (`thread -> comment`) and isolated from the other Neo-tree sources; set `diff_view.comments_panel.position = "right"` if you prefer a side pane. Otherwise gh-pr falls back to the legacy bottom panel.
+- The diff comments UI renders lazily after codediff opens and only loads comments for the current file in the background.
+- In codediff buffers, pressing `<CR>` on a commented line opens the existing line comments popup for that line.
+- Inside line/thread comment popups, `r` opens a reply composer, `R` opens a quoted reply composer, `x` resolves/unresolves the selected thread, `e` edits your selected comment, `D` deletes it, and `+` / `-` add or remove reactions on published comments. Draft comments in the current pending review support edit/delete but not reactions yet. Replies are added to the current pending review.
 - `<localleader>dc` reports explicit errors when diff comments panel cannot be opened/refreshed.
 - Line comment virtual text can show compact comment authors (`💬 @user1, @user2 +N`) in both codediff and virtual fallback buffers.
 - Multiline review comments now mark the full line range (`startLine -> line`) in diff indicators.
@@ -802,11 +821,13 @@ Inside legacy virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpe
 - visual `<localleader>is` add inline suggestion comment for selected line range (`v`/`V`)
 - for `ADDED` files, `GhPrOpenDiff` opens a single MODIFIED buffer (no split/unified diff layout)
 - virtual file content normalizes CRLF/LF/CR line endings, preventing `^M` artifacts
-- for image files (`png/jpg/jpeg/gif/webp/bmp/svg`), previews are rendered in virtual buffers when supported by `snacks.image`
-- for image files in `unified` mode, plugin forces split view (vertical/horizontal) instead of unified text diff
-- for image files, line-comments popup and inline/suggestion/hunk shortcuts (`<localleader>dk`, `<localleader>ic`, `<localleader>is`, `<localleader>dn`, `<localleader>dp`) are disabled
-- for image files, `<localleader>io` runs the configured default fallback action and `<localleader>im` opens fallback actions menu
-- if image render backend is unavailable/unsupported, gh-pr opens the image fallback menu (configurable), can open local cached files, open GitHub compare URL, and can render metadata diff text (resolution/size/sha)
+- non-text preview covers image files (`png/jpg/jpeg/gif/webp/bmp/svg`) and generic binary assets such as archives/media/documents
+- image files render rich previews in virtual buffers when supported by `snacks.image`
+- generic binary assets open readonly metadata/action cards with base/head sections when applicable
+- for image files in `unified` mode, gh-pr forces split view (vertical/horizontal) instead of unified text diff
+- in non-text preview buffers, line-comments popup, inline/suggestion actions, check annotation overlays, and diff comments tree auto-open are disabled
+- in non-text preview buffers, `<localleader>io` runs the configured default preview action, `<localleader>im` opens the preview actions menu, and `<CR>` runs the action under cursor in metadata cards
+- if image rendering is unavailable/unsupported, gh-pr stays in the same non-text preview flow and shows metadata/actions instead of dropping to codediff fallback prompts
 - in `ADDED` single-buffer mode, `<localleader>ic` is allowed on any line/range
 - inline comments are pre-validated before opening the composer:
   - `MODIFIED`/head must be inside PR diff hunks
@@ -825,7 +846,7 @@ Inside legacy virtual file buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpe
 - `<localleader>rd` discard pending review
 - `<localleader>rx` toggle PR Review source
 
-Image diff rendering options (`diff_view.images`):
+Image rendering options (`diff_view.images`):
 - `enabled` (`true`)
 - `backend` (`"snacks"`)
 - `formats` (`{ "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg" }`)
@@ -841,16 +862,31 @@ Image diff rendering options (`diff_view.images`):
 - `metadata_external_command` (`{ "magick", "identify", "-format", "%w %h", "{file}" }`)
 - `max_bytes` (`26214400`)
 
+Non-text preview options (`diff_view.non_text`):
+- `enabled` (`true`)
+- `auto_preview` (`true`; image and generic binary files bypass codediff fallback prompts)
+- `show_metadata` (`true`; render metadata/action cards for non-text preview buffers)
+
 Inside `gh_pr_review` Neo-tree source:
 - Root node shows active PR (`PR #N - title`) for current repository.
-- Sections: `Overview`, `Labels`, `Files`, `Reviewers`, `Commits`, `Checks`, `Comments`.
+- Sections: `Overview`, `Labels`, `Files`, `Reviewers`, `Commits`, `Checks`, `Security`, `Comments`, `Drafts`.
+- `Drafts` groups pending-review comments as `file -> thread -> draft comment` and opens the diff location for those draft items.
 - `<CR>` actions:
   - `Overview` opens overview buffer
   - `Files` opens diffs
   - `Commits` expands selected commit and lists changed files
   - `Commit file` opens diff scoped to selected commit (`parent[1] -> commit`)
-  - `Checks` opens check URL
-  - `Comments` keeps `Global` section (reviews, general comments, and orphan threads without file path)
+  - `Checks` lazy-loads annotations under `check -> file -> annotation`; pressing `<CR>` again toggles the subtree
+  - `Check annotation` opens the PR diff on the modified side at the annotation line and paints that check's annotations over codediff
+  - `Open check details` child keeps direct browser access to the check URL
+  - `Security > Code scanning` lazy-loads `file -> alert`; pressing `<CR>` on an alert opens the modified-side diff at that line and paints loaded security findings for that file over codediff
+  - `Security > Dependency review` lazy-loads `manifest -> dependency -> vulnerability`; pressing `<CR>` on a dependency without vulnerabilities opens the manifest diff, while vulnerability leaves open the advisory URL
+- `Comments` keeps `Global` section (reviews, general comments, and orphan threads without file path)
+- `Security` is fully lazy and split from `Checks`:
+  - `Code scanning` loads classic GitHub code-scanning alerts for the PR only on demand
+  - `Dependency review` loads dependency graph compare findings for the PR only on demand
+  - unavailable/permission-limited repositories render `Unavailable: ...` instead of breaking the review tree
+- `b` on security alert nodes opens the alert URL; `b` on dependency vulnerability nodes opens the advisory URL.
 - `Global` includes review events, general PR comments, and orphan threads
 - Thread nodes/items open file/line and thread popup when location exists
 - Review/general comment nodes open timeline popup
@@ -863,9 +899,10 @@ Inside `gh_pr_review` Neo-tree source:
   - `filename.ext · path/to/parent`
   - long paths are compacted from the left (`…/Carpeta2/Carpeta3`).
 - In `Files`, `zt` toggles a flat list mode (`no tree`) and persists globally.
+- In `Files`, `/`, `z/`, `zs`, `ze`, `zn`, `z.`, `zu`, `zw`, `zh`, `zd`, and `zr` manage session-only path/status/extension/viewed/deleted filters.
 - In `Files`, directory nodes show a yellow prefix `X/Y VIEWED` when at least one descendant file is viewed
   (counts are recursive and include subfolders).
-- `v` on files toggles viewed state and refreshes PR state immediately.
+- `v` on files toggles viewed state on GitHub when available and falls back to local state otherwise.
 - Marking viewed/unviewed from `gh_pr_review` does not force-focus `gh_pr` panel.
 - `R` forces a refresh from GitHub for the active review PR.
 - `:GhPrOpenCommitPatch` opens selected commit diff in codediff (or virtual patch in session fallback backend).
@@ -886,6 +923,17 @@ Inside `gh_pr_review` Neo-tree source:
 - `zt` toggle `Files` list/tree mode (persisted globally).
 - `zV` expand paths that contain viewed files.
 - `zv` collapse paths that contain viewed files.
+- `/` filter `Files` by path substring.
+- `z/` clear `Files` path filter.
+- `zs` select `Files` status filter.
+- `ze` filter `Files` by extension.
+- `zn` toggle `Files` no-extension filter.
+- `z.` toggle `Files` dotfiles-only filter.
+- `zu` toggle `Files` unviewed-only filter.
+- `zw` toggle `Files` viewed-only filter.
+- `zh` toggle `Files` hide-viewed filter.
+- `zd` toggle `Files` hide-deleted filter.
+- `zr` reset all session file filters.
 - `zG` expand `Comments > Global` (including subgroups).
 - `zg` collapse `Comments > Global` (including subgroups).
 
