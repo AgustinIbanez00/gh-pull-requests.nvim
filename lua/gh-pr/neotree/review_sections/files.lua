@@ -13,9 +13,113 @@ local FILE_STATUS_MAP = {
   copied = "copied",
 }
 
+local VALID_FILTER_STATUS = {
+  all = true,
+  added = true,
+  modified = true,
+  deleted = true,
+  renamed = true,
+  copied = true,
+}
+
 local function normalize_file_status(status)
   local normalized = type(status) == "string" and status:lower() or ""
   return FILE_STATUS_MAP[normalized] or "modified"
+end
+
+local function sanitize_file_filters(input)
+  local filters = type(input) == "table" and input or {}
+  local path_query = type(filters.path_query) == "string" and vim.trim(filters.path_query):lower() or ""
+  local status = type(filters.status) == "string" and filters.status:lower() or "all"
+  if not VALID_FILTER_STATUS[status] then
+    status = "all"
+  end
+
+  local result = {
+    path_query = path_query,
+    status = status,
+    extension = type(filters.extension) == "string" and vim.trim(filters.extension):lower():gsub("^%.+", "") or "",
+    no_extension = filters.no_extension == true,
+    dotfiles = filters.dotfiles == true,
+    viewed_state = (type(filters.viewed_state) == "string" and filters.viewed_state:lower() or "all"),
+    hide_deleted = filters.hide_deleted == true,
+  }
+  if result.viewed_state ~= "viewed" and result.viewed_state ~= "unviewed" then
+    result.viewed_state = "all"
+  end
+
+  if type(filters.hide_viewed) == "boolean" then
+    result.hide_viewed = filters.hide_viewed
+  else
+    result.hide_viewed = nil
+  end
+
+  return result
+end
+
+local function filters_active(filters, configured_hide_viewed)
+  filters = sanitize_file_filters(filters)
+  local effective_hide_viewed = type(filters.hide_viewed) == "boolean" and filters.hide_viewed or configured_hide_viewed
+  return filters.path_query ~= ""
+    or filters.status ~= "all"
+    or filters.extension ~= ""
+    or filters.no_extension == true
+    or filters.dotfiles == true
+    or filters.viewed_state ~= "all"
+    or filters.hide_deleted == true
+    or effective_hide_viewed ~= configured_hide_viewed
+end
+
+local function path_extension(path)
+  local filename = type(path) == "string" and (path:match("[^/\\]+$") or path) or ""
+  local extension = filename:match("%.([^.]+)$")
+  return type(extension) == "string" and extension:lower() or ""
+end
+
+local function is_dotfile(path)
+  local filename = type(path) == "string" and (path:match("[^/\\]+$") or path) or ""
+  return filename:sub(1, 1) == "." and filename ~= "." and filename ~= ".."
+end
+
+local function file_matches_filters(path, status, viewed, filters, hide_viewed)
+  if hide_viewed and viewed == true then
+    return false
+  end
+
+  if filters.hide_deleted == true and status == "deleted" then
+    return false
+  end
+
+  if filters.status ~= "all" and status ~= filters.status then
+    return false
+  end
+
+  if filters.viewed_state == "viewed" and viewed ~= true then
+    return false
+  end
+  if filters.viewed_state == "unviewed" and viewed == true then
+    return false
+  end
+
+  local extension = path_extension(path)
+  if filters.extension ~= "" and extension ~= filters.extension then
+    return false
+  end
+  if filters.no_extension == true and extension ~= "" then
+    return false
+  end
+  if filters.dotfiles == true and not is_dotfile(path) then
+    return false
+  end
+
+  if filters.path_query ~= "" then
+    local candidate = type(path) == "string" and path:gsub("\\", "/"):gsub("/+", "/"):gsub("^/", ""):gsub("/$", ""):lower() or ""
+    if not candidate:find(filters.path_query, 1, true) then
+      return false
+    end
+  end
+
+  return true
 end
 
 local function file_display_name(path)
@@ -110,7 +214,7 @@ local function resolve_comment_path(raw_comment, fallback_path)
   return type(fallback_path) == "string" and fallback_path or ""
 end
 
-local function build_file_comment_counts(raw_threads)
+local function build_file_comment_counts(raw_threads, pending_comments)
   local counts = {}
   local seen_comment_ids_by_path = {}
 
@@ -129,6 +233,23 @@ local function build_file_comment_counts(raw_threads)
           path_seen_ids[comment_id] = true
           counts[normalized_path] = (tonumber(counts[normalized_path]) or 0) + 1
         end
+      end
+    end
+  end
+
+  for index, raw_comment in ipairs(type(pending_comments) == "table" and pending_comments or {}) do
+    local normalized_path = normalize_tree_path(type(raw_comment) == "table"
+        and (raw_comment.path or raw_comment.thread_path)
+      or nil)
+    if normalized_path ~= "" then
+      seen_comment_ids_by_path[normalized_path] = seen_comment_ids_by_path[normalized_path] or {}
+      local path_seen_ids = seen_comment_ids_by_path[normalized_path]
+      local comment_id = type(raw_comment) == "table" and type(raw_comment.id) == "string" and raw_comment.id ~= ""
+          and raw_comment.id
+        or string.format("pending:%d:%s", index, normalized_path)
+      if not path_seen_ids[comment_id] then
+        path_seen_ids[comment_id] = true
+        counts[normalized_path] = (tonumber(counts[normalized_path]) or 0) + 1
       end
     end
   end
@@ -154,14 +275,19 @@ local function effective_review_files_mode(default_mode)
   return default_mode
 end
 
-function M.build_nodes(pr, details, repo_full_name)
+function M.build_nodes(pr, details, repo_full_name, opts)
   local render_options = config.get_path_render("gh_pr")
   local resolved_mode = effective_review_files_mode(render_options.mode)
-  local hide_viewed = (config.get() or {}).hide_viewed_files == true
+  local configured_hide_viewed = (config.get() or {}).hide_viewed_files == true
+  local filters = sanitize_file_filters(type(opts) == "table" and opts.filters or nil)
+  local hide_viewed = type(filters.hide_viewed) == "boolean" and filters.hide_viewed or configured_hide_viewed
   local entries = {}
   local seen_paths = {}
   local directory_counts = {}
-  local file_comment_counts = build_file_comment_counts(type(details) == "table" and details.review_threads or nil)
+  local file_comment_counts = build_file_comment_counts(
+    type(details) == "table" and details.review_threads or nil,
+    type(details) == "table" and details.pending_review_comments or nil
+  )
   local total_files = 0
   local viewed_files = 0
 
@@ -180,12 +306,13 @@ function M.build_nodes(pr, details, repo_full_name)
       if viewed then
         viewed_files = viewed_files + 1
       end
-      if not (hide_viewed and viewed) then
+      local normalized_status = normalize_file_status(file.status)
+      if file_matches_filters(normalized_path, normalized_status, viewed, filters, hide_viewed) then
         entries[#entries + 1] = {
           path = normalized_path,
           payload = file,
           metadata = {
-            file_status = normalize_file_status(file.status),
+            file_status = normalized_status,
             is_viewed = viewed == true,
             file_comment_count = tonumber(file_comment_counts[normalized_path]) or 0,
             open_thread_count = tonumber(file_comment_counts[normalized_path]) or 0,
@@ -197,10 +324,14 @@ function M.build_nodes(pr, details, repo_full_name)
   end
 
   if vim.tbl_isempty(entries) then
+    local empty_name = "No files"
+    if total_files > 0 and filters_active(filters, configured_hide_viewed) then
+      empty_name = "No files match current filters"
+    end
     return {
       {
         id = string.format("ghpr-review:%d:files-empty", pr.number),
-        name = "No files",
+        name = empty_name,
         type = "message",
         extra = {
           kind = "message",
@@ -208,7 +339,11 @@ function M.build_nodes(pr, details, repo_full_name)
           details = details,
         },
       },
-    }, viewed_files, total_files
+    }, viewed_files, total_files, {
+      shown_files = 0,
+      filters = filters,
+      filters_active = filters_active(filters, configured_hide_viewed),
+    }
   end
 
   local nodes = path_tree.build_nodes(entries, {
@@ -261,7 +396,11 @@ function M.build_nodes(pr, details, repo_full_name)
     end,
   })
 
-  return nodes, viewed_files, total_files
+  return nodes, viewed_files, total_files, {
+    shown_files = #entries,
+    filters = filters,
+    filters_active = filters_active(filters, configured_hide_viewed),
+  }
 end
 
 return M

@@ -119,10 +119,22 @@ end
 
 local function build_lines(opts)
   if type(opts.lines) == "table" and not vim.tbl_isempty(opts.lines) then
-    return vim.deepcopy(opts.lines)
+    local lines = vim.deepcopy(opts.lines)
+    local footer_lines = type(opts.footer_lines) == "table" and opts.footer_lines or {}
+    if not vim.tbl_isempty(footer_lines) then
+      if #lines > 0 and lines[#lines] ~= "" then
+        lines[#lines + 1] = ""
+      end
+      for _, line in ipairs(footer_lines) do
+        lines[#lines + 1] = type(line) == "string" and line or tostring(line)
+      end
+    end
+    return lines, {}, {}
   end
 
   local lines = {}
+  local line_items = {}
+  local normalized_items = {}
   lines[#lines + 1] = safe_string(opts.title, "PR comments")
 
   local location = safe_string(opts.location, "")
@@ -141,17 +153,37 @@ local function build_lines(opts)
   local items = type(opts.items) == "table" and opts.items or {}
   if vim.tbl_isempty(items) then
     lines[#lines + 1] = "(no comments)"
-    return lines
+    local footer_lines = type(opts.footer_lines) == "table" and opts.footer_lines or {}
+    if not vim.tbl_isempty(footer_lines) then
+      lines[#lines + 1] = ""
+      for _, line in ipairs(footer_lines) do
+        lines[#lines + 1] = type(line) == "string" and line or tostring(line)
+      end
+    end
+    return lines, line_items, normalized_items
   end
 
   for index, item in ipairs(items) do
-    local marker = safe_string(item.marker, " ")
-    local state = safe_string(item.state, "OPEN")
-    local author = safe_string(item.author, "unknown")
-    local created_at = safe_string(item.created_at, "-")
+    local normalized = {
+      id = safe_string(item.id, tostring(index)),
+      marker = safe_string(item.marker, " "),
+      state = safe_string(item.state, "OPEN"),
+      author = safe_string(item.author, "unknown"),
+      created_at = safe_string(item.created_at, "-"),
+      body = safe_string(item.body, "(empty comment)"),
+      url = safe_string(item.url, ""),
+      meta = type(item.meta) == "table" and vim.deepcopy(item.meta) or nil,
+    }
+    normalized_items[#normalized_items + 1] = normalized
+
+    local marker = normalized.marker
+    local state = normalized.state
+    local author = normalized.author
+    local created_at = normalized.created_at
+    local first_line = #lines + 1
     lines[#lines + 1] = string.format("%s[%s] @%s - %s", marker, state, author, created_at)
 
-    local body = safe_string(item.body, "(empty comment)")
+    local body = normalized.body
     local body_lines = vim.split(body, "\n", { plain = true })
     if vim.tbl_isempty(body_lines) then
       body_lines = { "(empty comment)" }
@@ -160,7 +192,23 @@ local function build_lines(opts)
       lines[#lines + 1] = "  " .. body_line
     end
 
-    local url = safe_string(item.url, "")
+    local reaction_groups = type(normalized.meta) == "table" and normalized.meta.reaction_groups or nil
+    if type(reaction_groups) == "table" and not vim.tbl_isempty(reaction_groups) then
+      local reaction_parts = {}
+      for _, group in ipairs(reaction_groups) do
+        local content = safe_string(type(group) == "table" and group.content or "", "")
+        local total_count = tonumber(type(group) == "table" and group.total_count or 0) or 0
+        if content ~= "" and total_count > 0 then
+          local suffix = type(group) == "table" and group.viewer_has_reacted == true and "*" or ""
+          reaction_parts[#reaction_parts + 1] = string.format("%s:%d%s", content, total_count, suffix)
+        end
+      end
+      if not vim.tbl_isempty(reaction_parts) then
+        lines[#lines + 1] = "  Reactions: " .. table.concat(reaction_parts, "  ")
+      end
+    end
+
+    local url = normalized.url
     if url ~= "" then
       lines[#lines + 1] = "  " .. url
     end
@@ -168,9 +216,22 @@ local function build_lines(opts)
     if index < #items then
       lines[#lines + 1] = ""
     end
+
+    local last_line = #lines
+    for line = first_line, last_line do
+      line_items[line] = index
+    end
   end
 
-  return lines
+  local footer_lines = type(opts.footer_lines) == "table" and opts.footer_lines or {}
+  if not vim.tbl_isempty(footer_lines) then
+    lines[#lines + 1] = ""
+    for _, line in ipairs(footer_lines) do
+      lines[#lines + 1] = type(line) == "string" and line or tostring(line)
+    end
+  end
+
+  return lines, line_items, normalized_items
 end
 
 local function wrapped_rows(lines, content_width)
@@ -264,11 +325,43 @@ local function popup_position(width, height, opts)
   }
 end
 
-local function setup_keymaps(popup_buf)
+local function current_item(popup_buf)
+  if not valid_buf(popup_buf) then
+    return nil
+  end
+
+  local line = vim.api.nvim_win_get_cursor(0)[1]
+  local line_items = vim.b[popup_buf].gh_pr_popup_line_items
+  local item_index = type(line_items) == "table" and line_items[line] or nil
+  local items = vim.b[popup_buf].gh_pr_popup_items
+  if type(items) ~= "table" or not item_index then
+    return nil
+  end
+  return items[item_index]
+end
+
+local function setup_keymaps(popup_buf, popup_win, origin_bufnr, tag, opts)
   local function close_current_popup()
-    local winid = vim.api.nvim_get_current_win()
-    if valid_win(winid) then
-      pcall(vim.api.nvim_win_close, winid, true)
+    if valid_win(popup_win) then
+      pcall(vim.api.nvim_win_close, popup_win, true)
+    end
+  end
+
+  local function with_item(callback)
+    return function()
+      local item = current_item(popup_buf)
+      if not item then
+        vim.notify("Move the cursor onto a comment first", vim.log.levels.INFO)
+        return
+      end
+
+      callback(item, {
+        popup_bufnr = popup_buf,
+        popup_winid = popup_win,
+        origin_bufnr = origin_bufnr,
+        tag = tag,
+        close_popup = close_current_popup,
+      })
     end
   end
 
@@ -284,6 +377,64 @@ local function setup_keymaps(popup_buf)
     nowait = true,
     desc = "Close PR comments popup",
   })
+
+  local actions = type(opts.actions) == "table" and opts.actions or {}
+  if type(actions.reply) == "function" then
+    vim.keymap.set("n", "r", with_item(actions.reply), {
+      buffer = popup_buf,
+      silent = true,
+      nowait = true,
+      desc = "Reply to selected PR thread",
+    })
+  end
+  if type(actions.quote) == "function" then
+    vim.keymap.set("n", "R", with_item(actions.quote), {
+      buffer = popup_buf,
+      silent = true,
+      nowait = true,
+      desc = "Quote-reply to selected PR thread",
+    })
+  end
+  if type(actions.toggle_thread) == "function" then
+    vim.keymap.set("n", "x", with_item(actions.toggle_thread), {
+      buffer = popup_buf,
+      silent = true,
+      nowait = true,
+      desc = "Resolve or unresolve selected PR thread",
+    })
+  end
+  if type(actions.edit) == "function" then
+    vim.keymap.set("n", "e", with_item(actions.edit), {
+      buffer = popup_buf,
+      silent = true,
+      nowait = true,
+      desc = "Edit selected PR comment",
+    })
+  end
+  if type(actions.delete) == "function" then
+    vim.keymap.set("n", "D", with_item(actions.delete), {
+      buffer = popup_buf,
+      silent = true,
+      nowait = true,
+      desc = "Delete selected PR comment",
+    })
+  end
+  if type(actions.add_reaction) == "function" then
+    vim.keymap.set("n", "+", with_item(actions.add_reaction), {
+      buffer = popup_buf,
+      silent = true,
+      nowait = true,
+      desc = "Add reaction to selected PR comment",
+    })
+  end
+  if type(actions.remove_reaction) == "function" then
+    vim.keymap.set("n", "-", with_item(actions.remove_reaction), {
+      buffer = popup_buf,
+      silent = true,
+      nowait = true,
+      desc = "Remove reaction from selected PR comment",
+    })
+  end
 end
 
 function M.open(opts)
@@ -293,7 +444,7 @@ function M.open(opts)
   local tag = tag_key(opts.tag)
   M.close_for_origin(origin_bufnr, tag)
 
-  local lines = build_lines(opts)
+  local lines, line_items, normalized_items = build_lines(opts)
   local width, height = popup_size(lines, opts)
   local placement = popup_position(width, height, opts)
   local final_width = placement.width or width
@@ -328,7 +479,9 @@ function M.open(opts)
   vim.api.nvim_win_set_option(popup_win, "linebreak", wrap)
   vim.api.nvim_win_set_option(popup_win, "winhl", safe_string(opts.winhl, "NormalFloat:NormalFloat,FloatBorder:FloatBorder"))
 
-  setup_keymaps(popup_buf)
+  vim.b[popup_buf].gh_pr_popup_items = normalized_items
+  vim.b[popup_buf].gh_pr_popup_line_items = line_items
+  setup_keymaps(popup_buf, popup_win, origin_bufnr, tag, opts)
 
   active_popups.by_origin[origin_bufnr] = active_popups.by_origin[origin_bufnr] or {}
   active_popups.by_origin[origin_bufnr][tag] = popup_win

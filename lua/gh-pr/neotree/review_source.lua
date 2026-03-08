@@ -11,9 +11,11 @@ local highlights = require("gh-pr.highlights")
 local review_prefetch = require("gh-pr.core.review_prefetch")
 local review_checks_section = require("gh-pr.neotree.review_sections.checks")
 local review_comments_section = require("gh-pr.neotree.review_sections.comments")
+local review_drafts_section = require("gh-pr.neotree.review_sections.drafts")
 local review_files_section = require("gh-pr.neotree.review_sections.files")
 local review_overview_section = require("gh-pr.neotree.review_sections.overview")
 local review_reviewers_section = require("gh-pr.neotree.review_sections.reviewers")
+local review_security_section = require("gh-pr.neotree.review_sections.security")
 local pr_service = require("gh-pr.pr_service")
 local repo = require("gh-pr.repo")
 local runtime_state = require("gh-pr.state")
@@ -75,6 +77,49 @@ local runtime_cache = {
 local REFRESH_MODE_UI = "ui-refresh"
 local REFRESH_MODE_CACHE_ONLY = "cache-only"
 local SOURCE_NAME = "gh_pr_review"
+local FILE_FILTER_STATUS = {
+  all = true,
+  added = true,
+  modified = true,
+  deleted = true,
+  renamed = true,
+  copied = true,
+}
+
+local function default_file_filters()
+  return {
+    path_query = "",
+    status = "all",
+    extension = "",
+    no_extension = false,
+    dotfiles = false,
+    viewed_state = "all",
+    hide_viewed = nil,
+    hide_deleted = false,
+  }
+end
+
+local function sanitize_file_filters(input)
+  local filters = vim.tbl_extend("force", default_file_filters(), type(input) == "table" and input or {})
+  filters.path_query = type(filters.path_query) == "string" and vim.trim(filters.path_query) or ""
+  filters.status = type(filters.status) == "string" and filters.status:lower() or "all"
+  if not FILE_FILTER_STATUS[filters.status] then
+    filters.status = "all"
+  end
+  filters.extension = type(filters.extension) == "string" and vim.trim(filters.extension):lower() or ""
+  filters.extension = filters.extension:gsub("^%.+", "")
+  filters.no_extension = filters.no_extension == true
+  filters.dotfiles = filters.dotfiles == true
+  filters.viewed_state = type(filters.viewed_state) == "string" and filters.viewed_state:lower() or "all"
+  if filters.viewed_state ~= "viewed" and filters.viewed_state ~= "unviewed" then
+    filters.viewed_state = "all"
+  end
+  if type(filters.hide_viewed) ~= "boolean" then
+    filters.hide_viewed = nil
+  end
+  filters.hide_deleted = filters.hide_deleted == true
+  return filters
+end
 
 local function valid_window(winid)
   return type(winid) == "number" and winid > 0 and vim.api.nvim_win_is_valid(winid)
@@ -359,7 +404,15 @@ local function new_repo_session(repo_context)
     last_error = nil,
     stale = false,
     follow = {},
+    file_filters = default_file_filters(),
     commit_files_by_key = {},
+    check_annotations_by_key = {},
+    check_annotations_generation = 0,
+    security_cache = {
+      code_scanning = nil,
+      dependency_review = nil,
+      generation = 0,
+    },
     loaded_from_disk = false,
   }
 end
@@ -386,6 +439,7 @@ local function ensure_repo_session(repo_context)
 
   session.repository = repo_context.repository
   session.git_root = repo_context.git_root
+  session.file_filters = sanitize_file_filters(session.file_filters)
 
   if cache_enabled() and not session.loaded_from_disk then
     maybe_prune_persisted_cache()
@@ -456,6 +510,68 @@ local function ensure_commit_file_cache(session)
   return session.commit_files_by_key
 end
 
+local function ensure_check_annotation_cache(session)
+  if type(session) ~= "table" then
+    return {}
+  end
+
+  if type(session.check_annotations_by_key) ~= "table" then
+    session.check_annotations_by_key = {}
+  end
+
+  if type(session.check_annotations_generation) ~= "number" then
+    session.check_annotations_generation = 0
+  end
+
+  return session.check_annotations_by_key
+end
+
+local function invalidate_check_annotation_cache(session)
+  if type(session) ~= "table" then
+    return
+  end
+
+  session.check_annotations_by_key = {}
+  session.check_annotations_generation = math.max(0, math.floor(tonumber(session.check_annotations_generation) or 0)) + 1
+end
+
+local function ensure_security_cache(session)
+  if type(session) ~= "table" then
+    return {
+      code_scanning = nil,
+      dependency_review = nil,
+      generation = 0,
+    }
+  end
+
+  if type(session.security_cache) ~= "table" then
+    session.security_cache = {
+      code_scanning = nil,
+      dependency_review = nil,
+      generation = 0,
+    }
+  end
+
+  if type(session.security_cache.generation) ~= "number" then
+    session.security_cache.generation = 0
+  end
+
+  return session.security_cache
+end
+
+local function invalidate_security_cache(session)
+  if type(session) ~= "table" then
+    return
+  end
+
+  session.security_cache = {
+    code_scanning = nil,
+    dependency_review = nil,
+    generation = math.max(0, math.floor(tonumber(type(session.security_cache) == "table" and session.security_cache.generation or 0) or 0))
+      + 1,
+  }
+end
+
 local function remember_revealed_node(session, node_id, context)
   local follow_state = ensure_follow_state(session)
   if type(node_id) == "string" and node_id ~= "" then
@@ -500,8 +616,10 @@ local function repository_full_name(details)
   return owner .. "/" .. name
 end
 
-local function build_file_nodes(pr, details, repo_full_name)
-  return review_files_section.build_nodes(pr, details, repo_full_name)
+local function build_file_nodes(pr, details, repo_full_name, session)
+  return review_files_section.build_nodes(pr, details, repo_full_name, {
+    filters = type(session) == "table" and session.file_filters or nil,
+  })
 end
 
 local function build_reviewer_nodes(pr, details)
@@ -717,8 +835,10 @@ local function build_commit_nodes(pr, details, session)
   return nodes
 end
 
-local function build_check_nodes(pr, details)
-  return review_checks_section.build_nodes(pr, details)
+local function build_check_nodes(pr, details, session)
+  return review_checks_section.build_nodes(pr, details, {
+    session = session,
+  })
 end
 
 local function collect_commit_signature(details)
@@ -956,13 +1076,23 @@ local function build_comment_nodes(pr, details)
   })
 end
 
+local function build_draft_nodes(pr, details)
+  return review_drafts_section.build_nodes(pr, details)
+end
+
+local function build_security_nodes(pr, details, session)
+  return review_security_section.build_nodes(pr, details, session)
+end
+
 local function build_root_nodes(pr, details, repo_full_name, session)
-  local files_children, viewed_files, total_files = build_file_nodes(pr, details, repo_full_name)
+  local files_children, viewed_files, total_files, files_meta = build_file_nodes(pr, details, repo_full_name, session)
   local labels_children = build_label_nodes(pr, details)
   local reviewers_children = build_reviewer_nodes(pr, details)
   local commits_children = build_commit_nodes(pr, details, session)
-  local checks_children = build_check_nodes(pr, details)
+  local checks_children = build_check_nodes(pr, details, session)
+  local security_children = build_security_nodes(pr, details, session)
   local comments_children = build_comment_nodes(pr, details)
+  local drafts_children = build_draft_nodes(pr, details)
   local reviewer_states, _ = review_reviewers_section.count_states(reviewers_children)
   local commits_total = review_overview_section.count_commit_entries(commits_children)
   local check_states, _ = review_checks_section.count_states(checks_children)
@@ -970,7 +1100,7 @@ local function build_root_nodes(pr, details, repo_full_name, session)
   return review_overview_section.build_root_nodes(pr, details, {
     labels = labels_children,
     files = {
-      title = review_overview_section.files_title(viewed_files, total_files),
+      title = review_overview_section.files_title(viewed_files, total_files, files_meta),
       children = files_children,
     },
     reviewers = {
@@ -985,9 +1115,17 @@ local function build_root_nodes(pr, details, repo_full_name, session)
       title = review_overview_section.checks_title(check_states),
       children = checks_children,
     },
+    security = {
+      title = review_overview_section.security_title(review_security_section.build_section_title(session)),
+      children = security_children,
+    },
     comments = {
       title = review_comments_section.build_section_title(details),
       children = comments_children,
+    },
+    drafts = {
+      title = review_drafts_section.build_section_title(details),
+      children = drafts_children,
     },
   })
 end
@@ -1075,18 +1213,37 @@ local function build_nodes(session, repo_context)
 end
 
 local function render_state(state, session, repo_context, opts)
+  opts = type(opts) == "table" and opts or {}
   if not state_can_render(state, opts) then
     return false
   end
 
   local details = matching_details(session, active_review_for_repo(repo_context))
-  if details then
+  if details and opts.sync_runtime ~= false then
     runtime_state.set_active_pr(details, details)
     runtime_state.set_active_review(repo_context.repository.full_name, details, details)
   end
 
   local ok = pcall(renderer.show_nodes, build_nodes(session, repo_context), state)
   return ok
+end
+
+local function visible_repo_states(repo_key)
+  local visible = {}
+  for _, state in ipairs(follow.visible_source_states(SOURCE_NAME)) do
+    if type(state) == "table" and state.gh_pr_review_repo_key == repo_key then
+      visible[#visible + 1] = state
+    end
+  end
+  return visible
+end
+
+local function current_repo_state_is_focused(repo_key)
+  local focused, state = resolve_current_live_state()
+  if not focused or type(state) ~= "table" then
+    return false
+  end
+  return state.gh_pr_review_repo_key == repo_key
 end
 
 local function render_repo_states(repo_key)
@@ -1115,6 +1272,118 @@ local function render_repo_states(repo_key)
   end
 end
 
+local function render_visible_repo_states(repo_key, opts)
+  local session = runtime_cache.repos[repo_key]
+  if type(session) ~= "table" then
+    return false
+  end
+
+  local repo_context = {
+    key = repo_key,
+    repository = session.repository,
+    git_root = session.git_root,
+  }
+
+  local render_opts = type(opts) == "table" and vim.deepcopy(opts) or {}
+  if render_opts.sync_runtime == nil then
+    render_opts.sync_runtime = false
+  end
+
+  local rendered = false
+  for _, state in ipairs(visible_repo_states(repo_key)) do
+    register_state(session, state)
+    local ok = render_state(state, session, repo_context, render_opts)
+    if ok then
+      rendered = true
+    else
+      session.states[tostring(state)] = nil
+    end
+  end
+
+  return rendered
+end
+
+local function resolve_repo_context_for_state(state)
+  local repo_key = type(state) == "table" and type(state.gh_pr_review_repo_key) == "string" and state.gh_pr_review_repo_key or nil
+  local session = type(repo_key) == "string" and runtime_cache.repos[repo_key] or nil
+  if type(session) == "table" and type(session.repository) == "table" then
+    return {
+      key = repo_key,
+      repository = session.repository,
+      git_root = session.git_root,
+    }, session
+  end
+
+  local repo_context, context_err = resolve_repo_context()
+  if not repo_context then
+    return nil, nil, context_err
+  end
+
+  return repo_context, ensure_repo_session(repo_context), nil
+end
+
+local function rerender_repo_context(repo_context)
+  if type(repo_context) ~= "table" or type(repo_context.key) ~= "string" then
+    return false
+  end
+
+  if current_repo_state_is_focused(repo_context.key) then
+    render_repo_states(repo_context.key)
+    return true
+  end
+
+  return render_visible_repo_states(repo_context.key, {
+    sync_runtime = false,
+  })
+end
+
+local function rerender_repo_states_for_async(repo_key)
+  if type(repo_key) ~= "string" or repo_key == "" then
+    return false
+  end
+
+  if current_repo_state_is_focused(repo_key) then
+    render_repo_states(repo_key)
+    return true
+  end
+
+  return render_visible_repo_states(repo_key, {
+    sync_runtime = false,
+  })
+end
+
+function M.get_file_filters(state)
+  local repo_context, session = resolve_repo_context_for_state(state)
+  if not repo_context or type(session) ~= "table" then
+    return sanitize_file_filters(nil)
+  end
+
+  session.file_filters = sanitize_file_filters(session.file_filters)
+  return vim.deepcopy(session.file_filters)
+end
+
+function M.update_file_filters(state, updates)
+  local repo_context, session, err = resolve_repo_context_for_state(state)
+  if not repo_context or type(session) ~= "table" then
+    return false, err or "Unable to resolve PR Review session"
+  end
+
+  session.file_filters = sanitize_file_filters(vim.tbl_extend("force", session.file_filters or {}, type(updates) == "table" and updates or {}))
+  rerender_repo_context(repo_context)
+  return true, nil, vim.deepcopy(session.file_filters)
+end
+
+function M.reset_file_filters(state)
+  local repo_context, session, err = resolve_repo_context_for_state(state)
+  if not repo_context or type(session) ~= "table" then
+    return false, err or "Unable to resolve PR Review session"
+  end
+
+  session.file_filters = default_file_filters()
+  rerender_repo_context(repo_context)
+  return true, nil, vim.deepcopy(session.file_filters)
+end
+
 local function apply_runtime_cache(session)
   local review_pr, review_details = runtime_state.get_active_review(session.repository.full_name)
   local review_number = type(review_pr) == "table" and tonumber(review_pr.number) or nil
@@ -1128,6 +1397,8 @@ local function apply_runtime_cache(session)
 
   if tonumber(session.pr_number) ~= review_number then
     session.commit_files_by_key = {}
+    invalidate_check_annotation_cache(session)
+    invalidate_security_cache(session)
   end
   session.pr_number = review_number
   session.details = review_details
@@ -1228,8 +1499,8 @@ local start_background_refresh
 local function finish_refresh(repo_context, payload)
   payload = type(payload) == "table" and payload or {}
   local refresh_context = normalize_refresh_context(payload.refresh_context)
-  local ui_refresh = should_update_ui(refresh_context) and select(1, resolve_current_live_state())
   local session = ensure_repo_session(repo_context)
+  local ui_refresh = should_update_ui(refresh_context) and not vim.tbl_isempty(visible_repo_states(repo_context.key))
   session.inflight = false
   session.loading = false
 
@@ -1237,7 +1508,13 @@ local function finish_refresh(repo_context, payload)
     session.last_error = payload.error
     session.stale = session_is_stale(session)
     if ui_refresh then
-      render_repo_states(repo_context.key)
+      if current_repo_state_is_focused(repo_context.key) then
+        render_repo_states(repo_context.key)
+      else
+        render_visible_repo_states(repo_context.key, {
+          sync_runtime = false,
+        })
+      end
     end
 
     local pending = consume_pending_refresh(session)
@@ -1252,11 +1529,15 @@ local function finish_refresh(repo_context, payload)
   session.last_error = nil
   session.pr_number = payload.pr_number
   session.details = dedupe_details_files(payload.details)
+  invalidate_check_annotation_cache(session)
+  invalidate_security_cache(session)
   session.updated_at = now_seconds()
   session.stale = session_is_stale(session)
 
   local current_snapshot = build_review_snapshot(session.pr_number, session.details)
-  if previous_snapshot.pr_number ~= current_snapshot.pr_number
+  if not previous_snapshot or not current_snapshot then
+    session.commit_files_by_key = {}
+  elseif previous_snapshot.pr_number ~= current_snapshot.pr_number
     or previous_snapshot.commits.signature ~= current_snapshot.commits.signature then
     session.commit_files_by_key = {}
   end
@@ -1272,8 +1553,21 @@ local function finish_refresh(repo_context, payload)
     })
   end
 
+  local actions_ok, actions = pcall(require, "gh-pr.actions")
+  if actions_ok and type(actions.sync_remote_viewed_state) == "function" then
+    pcall(actions.sync_remote_viewed_state, session.pr_number, session.details, {
+      notify_error = false,
+    })
+  end
+
   if ui_refresh then
-    render_repo_states(repo_context.key)
+    if current_repo_state_is_focused(repo_context.key) then
+      render_repo_states(repo_context.key)
+    else
+      render_visible_repo_states(repo_context.key, {
+        sync_runtime = false,
+      })
+    end
     follow_current_file_if_visible({ reason = "refresh" })
 
     if cache_options().sync_visible_buffers ~= false then
@@ -1312,15 +1606,21 @@ end
 start_background_refresh = function(repo_context, opts)
   opts = opts or {}
   opts.refresh_context = normalize_refresh_context(opts.refresh_context)
-  local ui_refresh = should_update_ui(opts.refresh_context) and select(1, resolve_current_live_state())
   local session = ensure_repo_session(repo_context)
+  local ui_refresh = should_update_ui(opts.refresh_context) and not vim.tbl_isempty(visible_repo_states(repo_context.key))
   local review_pr, _ = active_review_for_repo(repo_context)
   local review_number = type(review_pr) == "table" and tonumber(review_pr.number) or nil
   if not review_number then
     session.loading = false
     session.inflight = false
     if ui_refresh then
-      render_repo_states(repo_context.key)
+      if current_repo_state_is_focused(repo_context.key) then
+        render_repo_states(repo_context.key)
+      else
+        render_visible_repo_states(repo_context.key, {
+          sync_runtime = false,
+        })
+      end
     end
     return false
   end
@@ -1347,7 +1647,13 @@ start_background_refresh = function(repo_context, opts)
     if opts.refresh_context.reason == "timer" and opts.refresh_context.notify then
       vim.notify("Updating PR...", vim.log.levels.INFO)
     end
-    render_repo_states(repo_context.key)
+    if current_repo_state_is_focused(repo_context.key) then
+      render_repo_states(repo_context.key)
+    else
+      render_visible_repo_states(repo_context.key, {
+        sync_runtime = false,
+      })
+    end
   end
 
   pr_service.fetch_details_async(review_number, function(details, details_err)
@@ -1357,6 +1663,20 @@ start_background_refresh = function(repo_context, opts)
         refresh_context = opts.refresh_context,
       })
       return
+    end
+
+    local pending_requests = 2
+    local function complete_refresh()
+      pending_requests = pending_requests - 1
+      if pending_requests > 0 then
+        return
+      end
+
+      finish_refresh(repo_context, {
+        pr_number = review_number,
+        details = details,
+        refresh_context = opts.refresh_context,
+      })
     end
 
     pr_service.fetch_review_threads_async(review_number, {
@@ -1370,13 +1690,30 @@ start_background_refresh = function(repo_context, opts)
         details.review_threads = type(details.review_threads) == "table" and details.review_threads or {}
         details.review_threads_error = threads_err or "Unable to load review threads"
       end
-
-      finish_refresh(repo_context, {
-        pr_number = review_number,
-        details = details,
-        refresh_context = opts.refresh_context,
-      })
+      complete_refresh()
     end)
+
+    if type(pr_service.fetch_pending_review_comments_async) == "function" then
+      pr_service.fetch_pending_review_comments_async(review_number, function(pending_review, pending_err)
+        if pending_review then
+          details.pending_review = type(pending_review.review) == "table" and pending_review.review or nil
+          details.pending_review_comments = type(pending_review.comments) == "table" and pending_review.comments or {}
+          details.pending_review_error = nil
+        else
+          details.pending_review = nil
+          details.pending_review_comments = {}
+          details.pending_review_error = pending_err or "Unable to load pending review comments"
+        end
+        details.pending_review_loaded = true
+        complete_refresh()
+      end)
+    else
+      details.pending_review = nil
+      details.pending_review_comments = {}
+      details.pending_review_error = nil
+      details.pending_review_loaded = true
+      complete_refresh()
+    end
   end)
 
   return true
@@ -1482,6 +1819,230 @@ function M.ensure_commit_files(state, node)
   end
 
   return true, nil, true
+end
+
+function M.request_check_annotations(state, node)
+  if type(state) ~= "table" then
+    return false, "Unable to resolve PR Review state"
+  end
+
+  local check_node = type(node) == "table" and node or (type(state.tree) == "table" and state.tree:get_node() or nil)
+  local extra = type(check_node) == "table" and type(check_node.extra) == "table" and check_node.extra or nil
+  if type(extra) ~= "table" or extra.kind ~= "check" then
+    return false, "Selected node is not a check"
+  end
+
+  local check = type(extra.check) == "table" and extra.check or nil
+  local check_key = type(extra.check_key) == "string" and extra.check_key or nil
+  local pr = type(extra.pr) == "table" and extra.pr or nil
+  local details = type(extra.details) == "table" and extra.details or nil
+  local pr_number = tonumber(type(pr) == "table" and pr.number or nil) or tonumber(type(details) == "table" and details.number or nil)
+  if not check or type(check_key) ~= "string" or check_key == "" or not pr_number then
+    return false, "Selected check is missing required metadata"
+  end
+
+  local repo_key = type(state.gh_pr_review_repo_key) == "string" and state.gh_pr_review_repo_key or nil
+  local session = type(repo_key) == "string" and runtime_cache.repos[repo_key] or nil
+  if not session then
+    local repo_context, context_err = resolve_repo_context()
+    if not repo_context then
+      return false, "Unable to resolve repository context: " .. tostring(context_err)
+    end
+    session = ensure_repo_session(repo_context)
+    repo_key = repo_context.key
+  end
+
+  local cache = ensure_check_annotation_cache(session)
+  local cached = type(cache[check_key]) == "table" and cache[check_key] or nil
+  if cached and (cached.loading == true or cached.loaded == true) then
+    return true, nil
+  end
+
+  local details_for_request = type(details) == "table" and details or session.details
+  local repository = repository_full_name(details_for_request)
+  if repository == "" and type(session.repository) == "table" and type(session.repository.full_name) == "string" then
+    repository = session.repository.full_name
+  end
+
+  local head_repository = nil
+  if type(details_for_request) == "table" and type(details_for_request.headRepository) == "table"
+    and type(details_for_request.headRepository.nameWithOwner) == "string"
+    and details_for_request.headRepository.nameWithOwner ~= "" then
+    head_repository = details_for_request.headRepository.nameWithOwner
+  end
+
+  local generation = tonumber(session.check_annotations_generation) or 0
+  cache[check_key] = {
+    loading = true,
+    loaded = false,
+    annotations = {},
+    error = nil,
+  }
+  rerender_repo_states_for_async(repo_key)
+
+  pr_service.fetch_check_annotations_async(pr_number, check, {
+    repository = repository ~= "" and repository or nil,
+    head_repository = head_repository,
+    details = details_for_request,
+  }, function(payload, err)
+    if type(repo_key) ~= "string" or not runtime_cache.repos[repo_key] then
+      return
+    end
+
+    local active_session = runtime_cache.repos[repo_key]
+    if (tonumber(active_session.check_annotations_generation) or 0) ~= generation then
+      return
+    end
+
+    local active_cache = ensure_check_annotation_cache(active_session)
+    if payload then
+      active_cache[check_key] = {
+        loading = false,
+        loaded = true,
+        annotations = type(payload.annotations) == "table" and payload.annotations or {},
+        error = nil,
+        check_run_id = tonumber(payload.check_run_id),
+      }
+    else
+      active_cache[check_key] = {
+        loading = false,
+        loaded = false,
+        annotations = {},
+        error = err or "Unable to load annotations",
+      }
+    end
+
+    rerender_repo_states_for_async(repo_key)
+  end)
+
+  return true, nil
+end
+
+local function request_security_payload(state, node, request_kind)
+  if type(state) ~= "table" then
+    return false, "Unable to resolve PR Review state"
+  end
+
+  local security_node = type(node) == "table" and node or (type(state.tree) == "table" and state.tree:get_node() or nil)
+  local extra = type(security_node) == "table" and type(security_node.extra) == "table" and security_node.extra or nil
+  if type(extra) ~= "table" or extra.kind ~= request_kind then
+    return false, "Selected node is not a security section"
+  end
+
+  local cache_key = request_kind == "security_code_scanning" and "code_scanning" or "dependency_review"
+  local pr = type(extra.pr) == "table" and extra.pr or nil
+  local details = type(extra.details) == "table" and extra.details or nil
+  local pr_number = tonumber(type(pr) == "table" and pr.number or nil) or tonumber(type(details) == "table" and details.number or nil)
+  if not pr_number then
+    return false, "Selected security section is missing pull request metadata"
+  end
+
+  local repo_key = type(state.gh_pr_review_repo_key) == "string" and state.gh_pr_review_repo_key or nil
+  local session = type(repo_key) == "string" and runtime_cache.repos[repo_key] or nil
+  if not session then
+    local repo_context, context_err = resolve_repo_context()
+    if not repo_context then
+      return false, "Unable to resolve repository context: " .. tostring(context_err)
+    end
+    session = ensure_repo_session(repo_context)
+    repo_key = repo_context.key
+  end
+
+  local cache = ensure_security_cache(session)
+  local cached = type(cache[cache_key]) == "table" and cache[cache_key] or nil
+  if cached and (cached.loading == true or cached.loaded == true) then
+    return true, nil
+  end
+
+  local details_for_request = type(details) == "table" and details or session.details
+  local repository = repository_full_name(details_for_request)
+  if repository == "" and type(session.repository) == "table" and type(session.repository.full_name) == "string" then
+    repository = session.repository.full_name
+  end
+
+  local head_repository = nil
+  if type(details_for_request) == "table" and type(details_for_request.headRepository) == "table"
+    and type(details_for_request.headRepository.nameWithOwner) == "string"
+    and details_for_request.headRepository.nameWithOwner ~= "" then
+    head_repository = details_for_request.headRepository.nameWithOwner
+  end
+
+  local generation = tonumber(cache.generation) or 0
+  cache[cache_key] = {
+    loading = true,
+    loaded = false,
+    unavailable = false,
+    message = nil,
+    error = nil,
+    alerts = {},
+    changes = {},
+    vulnerable_count = 0,
+  }
+  rerender_repo_states_for_async(repo_key)
+
+  local request_opts = {
+    repository = repository ~= "" and repository or nil,
+    head_repository = head_repository,
+    details = details_for_request,
+  }
+
+  local function assign_payload(payload, err)
+    if type(repo_key) ~= "string" or not runtime_cache.repos[repo_key] then
+      return
+    end
+
+    local active_session = runtime_cache.repos[repo_key]
+    local active_cache = ensure_security_cache(active_session)
+    if (tonumber(active_cache.generation) or 0) ~= generation then
+      return
+    end
+
+    if payload then
+      local next_entry = {
+        loading = false,
+        loaded = true,
+        unavailable = payload.unavailable == true,
+        message = payload.message,
+        error = nil,
+      }
+      if cache_key == "code_scanning" then
+        next_entry.alerts = type(payload.alerts) == "table" and payload.alerts or {}
+      else
+        next_entry.changes = type(payload.changes) == "table" and payload.changes or {}
+        next_entry.vulnerable_count = tonumber(payload.vulnerable_count) or 0
+      end
+      active_cache[cache_key] = next_entry
+    else
+      active_cache[cache_key] = {
+        loading = false,
+        loaded = false,
+        unavailable = false,
+        message = nil,
+        error = err or "Unable to load security findings",
+        alerts = {},
+        changes = {},
+        vulnerable_count = 0,
+      }
+    end
+
+    rerender_repo_states_for_async(repo_key)
+  end
+
+  if cache_key == "code_scanning" then
+    pr_service.fetch_code_scanning_alerts_async(pr_number, request_opts, assign_payload)
+  else
+    pr_service.fetch_dependency_review_async(pr_number, request_opts, assign_payload)
+  end
+
+  return true, nil
+end
+
+function M.request_security_code_scanning(state, node)
+  return request_security_payload(state, node, "security_code_scanning")
+end
+
+function M.request_security_dependency_review(state, node)
+  return request_security_payload(state, node, "security_dependency_review")
 end
 
 local function show_message(state, id, message)
@@ -1621,6 +2182,17 @@ M.setup = function(source_config, _)
     ["zt"] = "toggle_files_flat_mode",
     ["zV"] = "expand_viewed_file_paths",
     ["zv"] = "collapse_viewed_file_paths",
+    ["/"] = "filter_files_by_path",
+    ["z/"] = "clear_file_path_filter",
+    ["zs"] = "select_file_status_filter",
+    ["ze"] = "filter_files_by_extension",
+    ["zn"] = "toggle_no_extension_filter",
+    ["z."] = "toggle_dotfiles_filter",
+    ["zu"] = "toggle_unviewed_only_filter",
+    ["zw"] = "toggle_viewed_only_filter",
+    ["zh"] = "toggle_hide_viewed_filter",
+    ["zd"] = "toggle_hide_deleted_filter",
+    ["zr"] = "reset_file_filters",
     ["zG"] = "expand_comments_global",
     ["zg"] = "collapse_comments_global",
     ["x"] = "toggle_review_tree",

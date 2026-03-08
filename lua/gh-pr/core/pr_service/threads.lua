@@ -28,11 +28,19 @@ query($owner:String!, $name:String!, $number:Int!, $threadsFirst:Int!, $comments
               commit { oid }
               originalCommit { oid }
               author { login }
+              viewerDidAuthor
               body
               createdAt
               state
               outdated
               url
+              reactionGroups {
+                content
+                viewerHasReacted
+                users {
+                  totalCount
+                }
+              }
             }
           }
         }
@@ -351,6 +359,9 @@ function M.build_line_comment_index(threads, opts, ctx)
         created_at = comment.created_at,
         state = comment.state,
         url = comment.url,
+        viewer_did_author = comment.viewer_did_author == true,
+        reaction_groups = comment.reaction_groups,
+        is_pending = comment.is_pending == true,
         is_resolved = thread.is_resolved == true,
         is_outdated = thread.is_outdated == true,
         diff_side = side_hint,

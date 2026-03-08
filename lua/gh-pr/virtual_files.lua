@@ -224,12 +224,104 @@ local function resolve_image_options()
   }
 end
 
+local function resolve_non_text_options()
+  local diff_view = (config.get() or {}).diff_view or {}
+  local non_text = type(diff_view.non_text) == "table" and diff_view.non_text or {}
+  return {
+    enabled = non_text.enabled ~= false,
+    auto_preview = non_text.auto_preview ~= false,
+    show_metadata = non_text.show_metadata ~= false,
+  }
+end
+
+local function resolve_text_extension_set()
+  local diff_view = (config.get() or {}).diff_view or {}
+  local prefetch = type(diff_view.prefetch) == "table" and diff_view.prefetch or {}
+  local set = {}
+  for _, ext in ipairs(type(prefetch.text_extensions) == "table" and prefetch.text_extensions or {}) do
+    if type(ext) == "string" and ext ~= "" then
+      set[ext:lower():gsub("^%.+", "")] = true
+    end
+  end
+  return set
+end
+
 local function normalize_asset_path(path)
   if type(path) ~= "string" then
     return ""
   end
   return path:gsub("\\", "/")
 end
+
+local function path_extension(path)
+  return image_renderer.extension(normalize_asset_path(path))
+end
+
+local function file_patch_available(file)
+  return type(file) == "table" and type(file.patch) == "string" and file.patch ~= ""
+end
+
+local function looks_like_binary_bytes(bytes)
+  if type(bytes) ~= "string" or bytes == "" then
+    return false
+  end
+  if bytes:find("\0", 1, true) then
+    return true
+  end
+
+  local sample = bytes:sub(1, 4096)
+  local invalid = 0
+  for index = 1, #sample do
+    local byte = sample:byte(index)
+    if byte < 9 or (byte > 13 and byte < 32) then
+      invalid = invalid + 1
+    end
+  end
+
+  return invalid > 0 and (invalid / #sample) > 0.12
+end
+
+local function resolve_file_path(file)
+  if type(file) ~= "table" then
+    return ""
+  end
+  return normalize_asset_path(file.path or file.filename or "")
+end
+
+local function classify_file(file, opts)
+  opts = type(opts) == "table" and opts or {}
+  local path = resolve_file_path(file)
+  if path == "" then
+    return "text"
+  end
+
+  local image_options = type(opts.image_options) == "table" and opts.image_options or resolve_image_options()
+  if image_renderer.is_image_path(path, image_options.formats) then
+    return "image"
+  end
+
+  if file_patch_available(file) then
+    return "text"
+  end
+
+  local ext = path_extension(path)
+  local text_extensions = type(opts.text_extensions) == "table" and opts.text_extensions or resolve_text_extension_set()
+  if ext ~= "" and text_extensions[ext] == true then
+    return "text"
+  end
+
+  local asset = type(opts.asset) == "table" and opts.asset or nil
+  if asset and asset.is_binary == true then
+    return "asset"
+  end
+  if asset and looks_like_binary_bytes(asset.bytes) then
+    return "asset"
+  end
+
+  return "asset"
+end
+
+M.classify_file = classify_file
 
 local function empty_asset(path)
   return {
@@ -239,6 +331,7 @@ local function empty_asset(path)
     sha = "",
     encoding = "",
     is_image = false,
+    is_binary = false,
     bytes = "",
     text = "",
     skipped = false,
@@ -259,6 +352,7 @@ local function asset_from_payload(path, payload, image_options)
       sha = type(payload.sha) == "string" and payload.sha or "",
       encoding = type(payload.encoding) == "string" and payload.encoding or "",
       is_image = is_image,
+      is_binary = is_image ~= true,
       bytes = "",
       text = "",
       skipped = false,
@@ -273,6 +367,7 @@ local function asset_from_payload(path, payload, image_options)
       sha = type(payload.sha) == "string" and payload.sha or "",
       encoding = payload.encoding,
       is_image = true,
+      is_binary = false,
       bytes = "",
       text = "",
       skipped = true,
@@ -281,6 +376,7 @@ local function asset_from_payload(path, payload, image_options)
   end
 
   local decoded = decode_base64(payload.content)
+  local is_binary = (not is_image) and looks_like_binary_bytes(decoded)
   return {
     path = normalized_path,
     ext = ext,
@@ -288,8 +384,9 @@ local function asset_from_payload(path, payload, image_options)
     sha = type(payload.sha) == "string" and payload.sha or "",
     encoding = payload.encoding,
     is_image = is_image,
+    is_binary = is_binary,
     bytes = decoded,
-    text = decoded,
+    text = is_binary and "" or decoded,
     skipped = false,
   }, nil
 end
@@ -638,6 +735,176 @@ local function display_keybinding(key)
   return vim.fn.keytrans(vim.api.nvim_replace_termcodes(expanded, true, true, true))
 end
 
+local function format_asset_bytes(bytes)
+  local size = tonumber(bytes) or 0
+  if size < 1024 then
+    return string.format("%d B", size)
+  end
+  if size < (1024 * 1024) then
+    return string.format("%.1f KB", size / 1024)
+  end
+  if size < (1024 * 1024 * 1024) then
+    return string.format("%.1f MB", size / (1024 * 1024))
+  end
+  return string.format("%.1f GB", size / (1024 * 1024 * 1024))
+end
+
+local MIME_BY_EXTENSION = {
+  png = "image/png",
+  jpg = "image/jpeg",
+  jpeg = "image/jpeg",
+  gif = "image/gif",
+  webp = "image/webp",
+  bmp = "image/bmp",
+  svg = "image/svg+xml",
+  zip = "application/zip",
+  pdf = "application/pdf",
+  mp4 = "video/mp4",
+  mov = "video/quicktime",
+  avi = "video/x-msvideo",
+  mp3 = "audio/mpeg",
+  wav = "audio/wav",
+  doc = "application/msword",
+  docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls = "application/vnd.ms-excel",
+  xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt = "application/vnd.ms-powerpoint",
+  pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  exe = "application/vnd.microsoft.portable-executable",
+  dll = "application/vnd.microsoft.portable-executable",
+  bin = "application/octet-stream",
+}
+
+local function infer_asset_mime(path, asset_kind)
+  if asset_kind == "image" then
+    local ext = path_extension(path)
+    return MIME_BY_EXTENSION[ext] or "image/*"
+  end
+  local ext = path_extension(path)
+  return MIME_BY_EXTENSION[ext] or "application/octet-stream"
+end
+
+local function normalize_asset_card_action(action)
+  local value = type(action) == "string" and action:lower() or ""
+  if value == "metadata" or value == "open_local_current" or value == "open_local_both" or value == "open_github" then
+    return value
+  end
+  return "metadata"
+end
+
+local function asset_action_label(action, asset_kind)
+  local normalized = normalize_asset_card_action(action)
+  if normalized == "metadata" then
+    return "Show metadata/actions in buffer"
+  end
+  if normalized == "open_local_current" then
+    return asset_kind == "image" and "Open current image locally" or "Open current revision locally"
+  end
+  if normalized == "open_local_both" then
+    return asset_kind == "image" and "Open base + modified images locally" or "Open both revisions locally"
+  end
+  return asset_kind == "image" and "Open GitHub PR image comparison" or "Open GitHub PR file view"
+end
+
+local function build_asset_side_entry(side, path, asset, present, asset_kind)
+  local normalized_path = normalize_asset_path(path)
+  local resolved_asset = type(asset) == "table" and asset or empty_asset(normalized_path)
+  return {
+    side = side,
+    label = side == "base" and "Base" or "Modified",
+    present = present ~= false,
+    path = normalized_path,
+    ext = type(resolved_asset.ext) == "string" and resolved_asset.ext or path_extension(normalized_path),
+    size = tonumber(resolved_asset.size) or 0,
+    sha = type(resolved_asset.sha) == "string" and resolved_asset.sha or "",
+    mime = infer_asset_mime(normalized_path, asset_kind),
+    error = type(resolved_asset.error) == "string" and resolved_asset.error or "",
+  }
+end
+
+local function append_asset_side_lines(lines, entry, show_metadata)
+  lines[#lines + 1] = string.format("%s revision", entry.label)
+  if entry.present ~= true then
+    lines[#lines + 1] = "  status: not present in this revision"
+    return
+  end
+
+  lines[#lines + 1] = string.format("  path: %s", entry.path ~= "" and entry.path or "(unknown)")
+  if entry.error ~= "" then
+    lines[#lines + 1] = string.format("  error: %s", entry.error)
+    return
+  end
+  if show_metadata ~= false then
+    lines[#lines + 1] = string.format("  mime: %s", entry.mime)
+    lines[#lines + 1] = string.format("  size: %s (%d bytes)", format_asset_bytes(entry.size), entry.size)
+    lines[#lines + 1] = string.format("  sha: %s", entry.sha ~= "" and entry.sha:sub(1, 12) or "-")
+    if entry.ext ~= "" then
+      lines[#lines + 1] = string.format("  extension: .%s", entry.ext)
+    end
+  end
+end
+
+local function build_asset_card_lines(opts)
+  opts = type(opts) == "table" and opts or {}
+  local shortcuts = resolve_diff_view_shortcuts()
+  local default_key = display_keybinding(shortcuts.image_default_action or "<localleader>io")
+  local menu_key = display_keybinding(shortcuts.image_fallback_menu or "<localleader>im")
+  local asset_kind = opts.asset_kind == "image" and "image" or "binary"
+  local current_side = opts.current_side == "base" and "base" or "head"
+  local lines = {
+    string.format("gh-pr %s preview", asset_kind),
+    "",
+    string.format("path: %s", opts.display_path ~= "" and opts.display_path or "(unknown)"),
+    string.format("status: %s", type(opts.status) == "string" and opts.status ~= "" and opts.status or "unknown"),
+    string.format("current side: %s", current_side == "base" and "base" or "modified"),
+  }
+  if type(opts.reason) == "string" and opts.reason ~= "" then
+    lines[#lines + 1] = string.format("preview note: %s", opts.reason)
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Metadata"
+
+  local action_lines = {}
+  append_asset_side_lines(lines, opts.base_entry, opts.show_metadata)
+  lines[#lines + 1] = ""
+  append_asset_side_lines(lines, opts.head_entry, opts.show_metadata)
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Actions"
+
+  local ordered_actions = {
+    "open_local_current",
+    "open_local_both",
+    "open_github",
+    "metadata",
+  }
+  for _, action in ipairs(ordered_actions) do
+    if action == "open_local_current" then
+      local current_entry = current_side == "base" and opts.base_entry or opts.head_entry
+      if current_entry.present == true then
+        lines[#lines + 1] = string.format("  %s", asset_action_label(action, asset_kind))
+        action_lines[#lines] = action
+      end
+    elseif action == "open_local_both" then
+      if opts.base_entry.present == true and opts.head_entry.present == true then
+        lines[#lines + 1] = string.format("  %s", asset_action_label(action, asset_kind))
+        action_lines[#lines] = action
+      end
+    else
+      lines[#lines + 1] = string.format("  %s", asset_action_label(action, asset_kind))
+      action_lines[#lines] = action
+    end
+  end
+
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = string.format(
+    "Tip: press <CR> on an action row, %s for the default action, or %s for the full menu.",
+    default_key ~= "" and default_key or "<localleader>io",
+    menu_key ~= "" and menu_key or "<localleader>im"
+  )
+
+  return lines, action_lines
+end
+
 local function should_show_diff_open_hint(bufnr, file_kind, shortcuts)
   if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
     return false
@@ -711,7 +978,7 @@ end
 
 local function set_pr_buffer_keymaps(bufnr, keymap_opts)
   keymap_opts = type(keymap_opts) == "table" and keymap_opts or {}
-  local image_mode = keymap_opts.is_image == true
+  local asset_mode = keymap_opts.is_non_text == true
 
   local function remove_buffer_keymap(mode, lhs)
     if type(lhs) == "string" and lhs ~= "" then
@@ -831,14 +1098,15 @@ local function set_pr_buffer_keymaps(bufnr, keymap_opts)
   set_buffer_keymap("n", diff_shortcuts.toggle_review_tree, call_action("toggle_review_tree"), "Toggle PR Review source")
   set_buffer_keymap("n", diff_shortcuts.toggle_comments_panel, call_action("toggle_diff_comments_panel"), "Toggle diff comments panel")
 
-  if image_mode then
+  if asset_mode then
     set_buffer_keymap(
       "n",
       diff_shortcuts.image_default_action,
-      call_action("run_image_fallback_default_action"),
-      "Run default image fallback action"
+      call_action("run_non_text_default_action"),
+      "Run default non-text preview action"
     )
-    set_buffer_keymap("n", diff_shortcuts.image_fallback_menu, call_action("open_image_fallback_menu"), "Open image fallback actions menu")
+    set_buffer_keymap("n", diff_shortcuts.image_fallback_menu, call_action("open_non_text_actions_menu"), "Open non-text preview actions menu")
+    set_buffer_keymap("n", "<CR>", call_action("run_non_text_action_at_cursor"), "Run action under cursor in non-text preview")
     maybe_notify_diff_open_hint(bufnr, file_kind, diff_shortcuts)
     return
   end
@@ -881,21 +1149,20 @@ end
 
 local function apply_buffer_mode_cleanup(bufnr, opts)
   opts = type(opts) == "table" and opts or {}
-  local is_image = opts.is_image == true
+  local is_non_text = opts.is_non_text == true
   local images = type(opts.images) == "table" and opts.images or resolve_image_options()
 
   set_pr_buffer_keymaps(bufnr, {
-    is_image = is_image,
+    is_non_text = is_non_text,
     images = images,
   })
   ensure_virtual_buffer_cleanup(bufnr)
+  image_renderer.clear(bufnr)
 
-  if is_image then
+  if is_non_text then
     clear_extmark_namespaces(bufnr, { "whitespace", "endline" })
     return
   end
-
-  image_renderer.clear(bufnr)
 end
 
 local function apply_line_highlights(bufnr, highlights)
@@ -1050,13 +1317,22 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
   buffer_opts = type(buffer_opts) == "table" and buffer_opts or {}
   local repository = repo_override or resolve_base_repository(details)
   local image_asset = type(buffer_opts.image_asset) == "table" and buffer_opts.image_asset or nil
-  local is_image = buffer_opts.is_image == true and image_asset ~= nil
+  local asset_kind = type(buffer_opts.asset_kind) == "string" and buffer_opts.asset_kind or nil
+  if asset_kind ~= "image" and asset_kind ~= "binary" then
+    asset_kind = nil
+  end
+  local is_image = asset_kind == "image" and image_asset ~= nil
+  local is_non_text = asset_kind == "image" or asset_kind == "binary"
   local images_cfg = type(buffer_opts.images) == "table" and buffer_opts.images or resolve_image_options()
   local image_reason = type(buffer_opts.image_reason) == "string" and buffer_opts.image_reason or ""
   local file_status = type(buffer_opts.file_status) == "string" and buffer_opts.file_status or ""
   local image_side = type(buffer_opts.image_side) == "string" and buffer_opts.image_side or kind
   local image_base_path = type(buffer_opts.image_base_path) == "string" and buffer_opts.image_base_path or nil
   local image_head_path = type(buffer_opts.image_head_path) == "string" and buffer_opts.image_head_path or nil
+  local preview_lines = type(buffer_opts.preview_lines) == "table" and vim.deepcopy(buffer_opts.preview_lines) or nil
+  local asset_actions = type(buffer_opts.asset_actions) == "table" and vim.deepcopy(buffer_opts.asset_actions) or {}
+  local base_preview_entry = type(buffer_opts.base_preview_entry) == "table" and vim.deepcopy(buffer_opts.base_preview_entry) or nil
+  local head_preview_entry = type(buffer_opts.head_preview_entry) == "table" and vim.deepcopy(buffer_opts.head_preview_entry) or nil
   local pr_url = type(buffer_opts.pr_url) == "string" and buffer_opts.pr_url or ""
   if pr_url == "" and type(details) == "table" and type(details.url) == "string" then
     pr_url = details.url
@@ -1101,7 +1377,9 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
   local bufnr = existing or vim.api.nvim_create_buf(true, true)
   local lines
   local endline_map = nil
-  if is_image then
+  if type(preview_lines) == "table" then
+    lines = preview_lines
+  elseif is_image then
     lines = image_renderer.build_placeholder_lines({
       path = path,
       side = image_side,
@@ -1115,7 +1393,7 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
     lines, endline_map = split_buffer_text_with_endings(content or "")
   end
   local ft = type(buffer_opts.filetype) == "string" and buffer_opts.filetype
-    or (is_image and "markdown" or ((kind == "patch" or kind == "unified") and "diff" or resolve_path_filetype(path)))
+    or (is_non_text and "markdown" or ((kind == "patch" or kind == "unified") and "diff" or resolve_path_filetype(path)))
 
   set_buffer_content(bufnr, lines)
 
@@ -1145,6 +1423,19 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
   vim.b[bufnr].gh_pr_file_mode = type(buffer_opts.file_mode) == "string" and buffer_opts.file_mode or nil
   vim.b[bufnr].gh_pr_diff_backend = "virtual"
   vim.b[bufnr].gh_pr_is_image = is_image
+  vim.b[bufnr].gh_pr_is_non_text = is_non_text
+  vim.b[bufnr].gh_pr_asset_kind = is_non_text and asset_kind or nil
+  vim.b[bufnr].gh_pr_asset_side = is_non_text and image_side or nil
+  vim.b[bufnr].gh_pr_asset_status = is_non_text and file_status or nil
+  vim.b[bufnr].gh_pr_asset_actions = is_non_text and asset_actions or nil
+  vim.b[bufnr].gh_pr_asset_preview = is_non_text and {
+    asset_kind = asset_kind,
+    current_side = image_side,
+    status = file_status,
+    reason = image_reason,
+    base = base_preview_entry,
+    head = head_preview_entry,
+  } or nil
   vim.b[bufnr].gh_pr_image_side = is_image and image_side or nil
   vim.b[bufnr].gh_pr_image_cache_path = nil
   vim.b[bufnr].gh_pr_image_reason = is_image and image_reason or nil
@@ -1160,9 +1451,9 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
   vim.b[bufnr].gh_pr_image_fallback_notified_reason = nil
   vim.b[bufnr].gh_pr_comment_side = nil
   vim.b[bufnr].gh_pr_unified_line_map = nil
-  vim.b[bufnr].gh_pr_endline_map = is_image and nil or endline_map
+  vim.b[bufnr].gh_pr_endline_map = is_non_text and nil or endline_map
 
-  if (not is_image) and type(comment_ctx) == "table" then
+  if (not is_non_text) and type(comment_ctx) == "table" then
     local side = comment_ctx.side
     if side == "base" or side == "head" then
       vim.b[bufnr].gh_pr_comment_side = side
@@ -1181,17 +1472,17 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
 
   apply_line_highlights(bufnr, buffer_opts.line_highlights)
 
-  if type(buffer_opts.unified_line_map) == "table" then
+  if (not is_non_text) and type(buffer_opts.unified_line_map) == "table" then
     vim.b[bufnr].gh_pr_unified_line_map = buffer_opts.unified_line_map
   end
-  if kind == "unified" then
+  if (not is_non_text) and kind == "unified" then
     apply_unified_syntax_highlights(bufnr, canonical ~= "" and canonical or path, vim.b[bufnr].gh_pr_unified_line_map)
   else
     clear_extmark_namespaces(bufnr, { "unified_syntax" })
   end
 
   apply_buffer_mode_cleanup(bufnr, {
-    is_image = is_image,
+    is_non_text = is_non_text,
     images = images_cfg,
   })
 
@@ -1256,6 +1547,12 @@ local function finalize_remote_pair(opts)
     )
   end
 
+  local asset_kind = classify_file(opts.file, {
+    image_options = opts.image_options,
+    text_extensions = opts.text_extensions,
+    asset = (type(head_asset) == "table" and head_asset.is_image ~= true and head_asset.present ~= false) and head_asset or base_asset,
+  })
+
   return {
     base_content = base_asset.text or "",
     head_content = head_asset.text or "",
@@ -1269,8 +1566,9 @@ local function finalize_remote_pair(opts)
     image_options = opts.image_options,
     base_asset = base_asset,
     head_asset = head_asset,
-    is_image = (type(base_asset) == "table" and base_asset.is_image == true)
-      or (type(head_asset) == "table" and head_asset.is_image == true),
+    asset_kind = asset_kind,
+    is_image = asset_kind == "image",
+    is_non_text = asset_kind == "image" or asset_kind == "asset",
   }, nil
 end
 
@@ -1304,9 +1602,11 @@ local function read_base_and_head(details, _, file)
 
   return finalize_remote_pair({
     status = status,
+    file = file,
     base_path = base_path,
     head_path = head_path,
     image_options = image_options,
+    text_extensions = resolve_text_extension_set(),
     base_repository = base_repository,
     head_repository = head_repository,
     base_asset = base_asset,
@@ -1349,9 +1649,11 @@ local function read_base_and_head_async(details, _, file, callback)
     finished = true
     callback(finalize_remote_pair({
       status = status,
+      file = file,
       base_path = base_path,
       head_path = head_path,
       image_options = image_options,
+      text_extensions = resolve_text_extension_set(),
       base_repository = base_repository,
       head_repository = head_repository,
       base_asset = base_asset,
@@ -1660,7 +1962,7 @@ local function apply_window_whitespace_render(winid, enabled)
     winvars.gh_pr_whitespace_prev_winhl = nil
   end
 
-  if enabled ~= true or vim.b[bufnr].gh_pr_is_image == true then
+  if enabled ~= true or vim.b[bufnr].gh_pr_is_non_text == true then
     return
   end
 
@@ -1730,7 +2032,7 @@ local function apply_window_endline_render(winid, enabled)
   end
 
   clear_extmark_namespaces(bufnr, { "endline" })
-  if enabled ~= true or vim.b[bufnr].gh_pr_is_image == true then
+  if enabled ~= true or vim.b[bufnr].gh_pr_is_non_text == true then
     return
   end
 
@@ -1908,6 +2210,32 @@ local function render_image_in_window(bufnr, winid, details, pr, side, status, a
   return false, message
 end
 
+local function build_binary_preview_payload(data, current_side, display_path, reason)
+  current_side = current_side == "base" and "base" or "head"
+  local non_text_opts = resolve_non_text_options()
+  local base_present = data.file_mode ~= "added_single"
+  local head_present = data.file_mode ~= "removed_single"
+  local base_entry = build_asset_side_entry("base", data.base_path, data.base_asset, base_present, "binary")
+  local head_entry = build_asset_side_entry("head", data.head_path, data.head_asset, head_present, "binary")
+  local lines, action_lines = build_asset_card_lines({
+    asset_kind = "binary",
+    current_side = current_side,
+    display_path = normalize_asset_path(display_path or data.head_path or data.base_path),
+    status = data.status,
+    reason = reason,
+    show_metadata = non_text_opts.show_metadata,
+    base_entry = base_entry,
+    head_entry = head_entry,
+  })
+  return {
+    asset_kind = "binary",
+    preview_lines = lines,
+    asset_actions = action_lines,
+    base_preview_entry = base_entry,
+    head_preview_entry = head_entry,
+  }
+end
+
 function M.open_original(details, pr, file, opts)
   opts = opts or {}
   local data, err = read_base_and_head(details, pr, file)
@@ -1918,7 +2246,7 @@ function M.open_original(details, pr, file, opts)
   local canonical_path = normalize_path(file.path or file.filename)
   local mode = data.file_mode == "added_single" and "added_single" or (data.file_mode == "removed_single" and "removed_single" or "diff_pair")
   local kind = mode == "added_single" and "head" or "base"
-  local comment_ctx = data.is_image and nil or build_comment_ctx(opts.line_comments, kind == "head" and "head" or "base", {
+  local comment_ctx = data.is_non_text and nil or build_comment_ctx(opts.line_comments, kind == "head" and "head" or "base", {
     data.base_path,
     data.head_path,
     file.path,
@@ -1929,6 +2257,7 @@ function M.open_original(details, pr, file, opts)
   local display_path = kind == "head" and data.head_path or data.base_path
   local content = kind == "head" and data.head_content or data.base_content
   local asset = kind == "head" and data.head_asset or data.base_asset
+  local binary_preview = data.asset_kind == "asset" and build_binary_preview_payload(data, kind, display_path, "") or nil
   local existing = resolve_existing_buffer(data.repo, pr.number, canonical_path, kind)
   if existing then
     focus_existing_buffer(existing)
@@ -1936,7 +2265,7 @@ function M.open_original(details, pr, file, opts)
   local buf = open_buffer(content, display_path, kind, details, pr, data.repo, comment_ctx, canonical_path, {
     existing_bufnr = existing,
     file_mode = mode,
-    is_image = data.is_image,
+    asset_kind = data.asset_kind == "asset" and "binary" or (data.is_image and "image" or nil),
     image_side = kind,
     image_asset = asset,
     image_reason = "",
@@ -1944,6 +2273,10 @@ function M.open_original(details, pr, file, opts)
     images = data.image_options,
     image_base_path = data.base_path,
     image_head_path = data.head_path,
+    preview_lines = binary_preview and binary_preview.preview_lines or nil,
+    asset_actions = binary_preview and binary_preview.asset_actions or nil,
+    base_preview_entry = binary_preview and binary_preview.base_preview_entry or nil,
+    head_preview_entry = binary_preview and binary_preview.head_preview_entry or nil,
     pr_url = type(details.url) == "string" and details.url or (type(pr.url) == "string" and pr.url or ""),
   })
   vim.api.nvim_win_set_buf(0, buf)
@@ -1963,7 +2296,7 @@ function M.open_modified(details, pr, file, opts)
   local canonical_path = normalize_path(file.path or file.filename)
   local mode = data.file_mode == "added_single" and "added_single" or (data.file_mode == "removed_single" and "removed_single" or "diff_pair")
   local kind = mode == "removed_single" and "base" or "head"
-  local comment_ctx = data.is_image and nil or build_comment_ctx(opts.line_comments, kind == "base" and "base" or "head", {
+  local comment_ctx = data.is_non_text and nil or build_comment_ctx(opts.line_comments, kind == "base" and "base" or "head", {
     data.head_path,
     data.base_path,
     file.path,
@@ -1974,6 +2307,7 @@ function M.open_modified(details, pr, file, opts)
   local display_path = kind == "base" and data.base_path or data.head_path
   local content = kind == "base" and data.base_content or data.head_content
   local asset = kind == "base" and data.base_asset or data.head_asset
+  local binary_preview = data.asset_kind == "asset" and build_binary_preview_payload(data, kind, display_path, "") or nil
   local existing = resolve_existing_buffer(data.repo, pr.number, canonical_path, kind)
   if existing then
     focus_existing_buffer(existing)
@@ -1981,7 +2315,7 @@ function M.open_modified(details, pr, file, opts)
   local buf = open_buffer(content, display_path, kind, details, pr, data.repo, comment_ctx, canonical_path, {
     existing_bufnr = existing,
     file_mode = mode,
-    is_image = data.is_image,
+    asset_kind = data.asset_kind == "asset" and "binary" or (data.is_image and "image" or nil),
     image_side = kind,
     image_asset = asset,
     image_reason = "",
@@ -1989,6 +2323,10 @@ function M.open_modified(details, pr, file, opts)
     images = data.image_options,
     image_base_path = data.base_path,
     image_head_path = data.head_path,
+    preview_lines = binary_preview and binary_preview.preview_lines or nil,
+    asset_actions = binary_preview and binary_preview.asset_actions or nil,
+    base_preview_entry = binary_preview and binary_preview.base_preview_entry or nil,
+    head_preview_entry = binary_preview and binary_preview.head_preview_entry or nil,
     pr_url = type(details.url) == "string" and details.url or (type(pr.url) == "string" and pr.url or ""),
   })
   vim.api.nvim_win_set_buf(0, buf)
@@ -2018,7 +2356,7 @@ function M.open_diff(details, pr, file, opts)
     local single_content = single_kind == "head" and (data.head_content or "") or (data.base_content or "")
     local single_path = single_kind == "head" and (data.head_path or canonical_path) or (data.base_path or canonical_path)
     local single_asset = single_kind == "head" and data.head_asset or data.base_asset
-    local single_comment_ctx = data.is_image and nil or build_comment_ctx(opts.line_comments, single_kind == "head" and "head" or "base", {
+    local single_comment_ctx = data.is_non_text and nil or build_comment_ctx(opts.line_comments, single_kind == "head" and "head" or "base", {
       data.head_path,
       data.base_path,
       file.path,
@@ -2039,6 +2377,7 @@ function M.open_diff(details, pr, file, opts)
       return nil, "Unable to prepare diff workspace"
     end
 
+    local binary_preview = data.asset_kind == "asset" and build_binary_preview_payload(data, single_kind, single_path, "") or nil
     local single_buf = open_buffer(
       single_content,
       single_path,
@@ -2051,7 +2390,7 @@ function M.open_diff(details, pr, file, opts)
       {
         existing_bufnr = existing_single,
         file_mode = data.file_mode,
-        is_image = data.is_image,
+        asset_kind = data.asset_kind == "asset" and "binary" or (data.is_image and "image" or nil),
         image_side = single_kind,
         image_asset = single_asset,
         image_reason = "",
@@ -2059,6 +2398,10 @@ function M.open_diff(details, pr, file, opts)
         images = data.image_options,
         image_base_path = data.base_path,
         image_head_path = data.head_path,
+        preview_lines = binary_preview and binary_preview.preview_lines or nil,
+        asset_actions = binary_preview and binary_preview.asset_actions or nil,
+        base_preview_entry = binary_preview and binary_preview.base_preview_entry or nil,
+        head_preview_entry = binary_preview and binary_preview.head_preview_entry or nil,
         pr_url = type(details.url) == "string" and details.url or (type(pr.url) == "string" and pr.url or ""),
       }
     )
@@ -2069,6 +2412,9 @@ function M.open_diff(details, pr, file, opts)
       render_image_in_window(single_buf, target_win, details, pr, single_kind, data.status, single_asset, data.image_options)
       apply_window_whitespace_render(target_win, false)
       apply_window_endline_render(target_win, false)
+    elseif data.asset_kind == "asset" then
+      apply_window_whitespace_render(target_win, false)
+      apply_window_endline_render(target_win, false)
     else
       apply_window_whitespace_render(target_win, diff_view.render_whitespace)
       apply_window_endline_render(target_win, diff_view.render_endlines)
@@ -2076,6 +2422,60 @@ function M.open_diff(details, pr, file, opts)
     pcall(vim.api.nvim_set_current_win, target_win)
     return {
       single_buf = single_buf,
+      mode = render_mode,
+      file_mode = data.file_mode,
+    }, nil
+  end
+
+  if data.asset_kind == "asset" then
+    local existing_unified = resolve_existing_buffer(data.repo, pr.number, canonical_path, "unified")
+    local target_win = nil
+    if existing_unified and focus_existing_buffer(existing_unified) then
+      target_win = vim.api.nvim_get_current_win()
+    else
+      target_win = prepare_diff_workspace(opts.new_tab)
+    end
+
+    if not target_win or not vim.api.nvim_win_is_valid(target_win) then
+      return nil, "Unable to prepare diff workspace"
+    end
+
+    local display_path = data.head_path or data.base_path or canonical_path
+    local binary_preview = build_binary_preview_payload(data, "head", display_path, "")
+    local unified_buf = open_buffer(
+      "",
+      display_path,
+      "unified",
+      details,
+      pr,
+      data.repo,
+      nil,
+      canonical_path,
+      {
+        existing_bufnr = existing_unified,
+        filetype = "markdown",
+        file_mode = "unified",
+        asset_kind = "binary",
+        image_side = "head",
+        image_reason = "",
+        file_status = data.status,
+        images = data.image_options,
+        image_base_path = data.base_path,
+        image_head_path = data.head_path,
+        preview_lines = binary_preview.preview_lines,
+        asset_actions = binary_preview.asset_actions,
+        base_preview_entry = binary_preview.base_preview_entry,
+        head_preview_entry = binary_preview.head_preview_entry,
+        pr_url = type(details.url) == "string" and details.url or (type(pr.url) == "string" and pr.url or ""),
+      }
+    )
+    clear_diff_window_state(target_win)
+    vim.api.nvim_win_set_buf(target_win, unified_buf)
+    apply_window_whitespace_render(target_win, false)
+    apply_window_endline_render(target_win, false)
+    pcall(vim.api.nvim_set_current_win, target_win)
+    return {
+      unified_buf = unified_buf,
       mode = render_mode,
       file_mode = data.file_mode,
     }, nil
@@ -2142,7 +2542,7 @@ function M.open_diff(details, pr, file, opts)
   end
 
   pcall(vim.api.nvim_set_current_win, target_win)
-  local base_comment_ctx = data.is_image and nil or build_comment_ctx(opts.line_comments, "base", {
+  local base_comment_ctx = data.is_non_text and nil or build_comment_ctx(opts.line_comments, "base", {
     data.base_path,
     data.head_path,
     file.path,
@@ -2158,14 +2558,14 @@ function M.open_diff(details, pr, file, opts)
     pr,
     data.repo,
     base_comment_ctx,
-    canonical_path,
-    {
-      existing_bufnr = existing_base,
-      file_mode = "diff_pair",
-      is_image = data.is_image,
-      image_side = "base",
-      image_asset = data.base_asset,
-      image_reason = "",
+      canonical_path,
+      {
+        existing_bufnr = existing_base,
+        file_mode = "diff_pair",
+        asset_kind = data.is_image and "image" or nil,
+        image_side = "base",
+        image_asset = data.base_asset,
+        image_reason = "",
       file_status = data.status,
       images = data.image_options,
       image_base_path = data.base_path,
@@ -2196,7 +2596,7 @@ function M.open_diff(details, pr, file, opts)
     head_win = vim.api.nvim_get_current_win()
   end
 
-  local head_comment_ctx = data.is_image and nil or build_comment_ctx(opts.line_comments, "head", {
+  local head_comment_ctx = data.is_non_text and nil or build_comment_ctx(opts.line_comments, "head", {
     data.head_path,
     data.base_path,
     file.path,
@@ -2212,14 +2612,14 @@ function M.open_diff(details, pr, file, opts)
     pr,
     data.repo,
     head_comment_ctx,
-    canonical_path,
-    {
-      existing_bufnr = existing_head,
-      file_mode = "diff_pair",
-      is_image = data.is_image,
-      image_side = "head",
-      image_asset = data.head_asset,
-      image_reason = "",
+      canonical_path,
+      {
+        existing_bufnr = existing_head,
+        file_mode = "diff_pair",
+        asset_kind = data.is_image and "image" or nil,
+        image_side = "head",
+        image_asset = data.head_asset,
+        image_reason = "",
       file_status = data.status,
       images = data.image_options,
       image_base_path = data.base_path,
@@ -2386,6 +2786,34 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
       image_asset = data.head_asset
       image_side = "head"
     end
+  end
+
+  if data.asset_kind == "asset" then
+    local preview_file_mode = kind == "unified" and "unified" or file_mode
+    local binary_preview = build_binary_preview_payload(data, image_side, next_path, "")
+    open_buffer("", next_path, kind, details, pr, repository, nil, canonical_path, {
+      existing_bufnr = bufnr,
+      filetype = "markdown",
+      file_mode = preview_file_mode,
+      asset_kind = "binary",
+      image_side = image_side,
+      image_reason = "",
+      file_status = data.status,
+      images = data.image_options,
+      image_base_path = data.base_path,
+      image_head_path = data.head_path,
+      preview_lines = binary_preview.preview_lines,
+      asset_actions = binary_preview.asset_actions,
+      base_preview_entry = binary_preview.base_preview_entry,
+      head_preview_entry = binary_preview.head_preview_entry,
+      pr_url = pr_url,
+    })
+    for _, win in ipairs(windows_showing_buffer(bufnr)) do
+      clear_diff_window_state(win.winid)
+      apply_window_whitespace_render(win.winid, false)
+      apply_window_endline_render(win.winid, false)
+    end
+    return true, nil
   end
 
   if not is_image_buffer then

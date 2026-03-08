@@ -1,5 +1,6 @@
 local M = {}
 
+local comment_thread_actions = require("gh-pr.comment_thread_actions")
 local comment_popup = require("gh-pr.comment_popup")
 local config = require("gh-pr.config")
 
@@ -50,6 +51,12 @@ local function normalize_comments(raw_comments)
       url = safe_string(item.url, ""),
       state = safe_string(item.state, ""),
       outdated = item.outdated == true,
+      is_pending = item.is_pending == true,
+      path = safe_string(item.path, ""),
+      line = tonumber(item.line),
+      original_line = tonumber(item.original_line),
+      viewer_did_author = item.viewer_did_author == true,
+      reaction_groups = type(item.reaction_groups) == "table" and vim.deepcopy(item.reaction_groups) or {},
     }
   end
 
@@ -98,21 +105,52 @@ function M.open(thread, open_opts)
   for _, comment in ipairs(normalized_comments) do
     local item_state = safe_string(comment.state, "")
     if item_state == "" then
-      item_state = state
+      if comment.is_pending == true then
+        item_state = "PENDING"
+      else
+        item_state = state
+      end
     end
     items[#items + 1] = {
+      id = comment.id,
       marker = comment.id == selected_comment_id and ">" or " ",
       state = item_state,
       author = comment.author,
       created_at = comment.created_at,
       body = comment.body,
       url = comment.url,
+      meta = {
+        pr_number = tonumber(thread.pr_number),
+        thread_id = safe_string(thread.thread_id, ""),
+        path = safe_string(comment.path, safe_string(thread.path, "")),
+        line = tonumber(comment.line) or tonumber(thread.line),
+        original_line = tonumber(comment.original_line) or tonumber(thread.original_line),
+        comment_id = comment.id,
+        comment_author = comment.author,
+        comment_body = comment.body,
+        comment_state = item_state,
+        comment_is_pending = comment.is_pending == true,
+        viewer_did_author = comment.viewer_did_author == true,
+        reaction_groups = type(comment.reaction_groups) == "table" and vim.deepcopy(comment.reaction_groups) or {},
+        thread_is_resolved = thread.is_resolved == true,
+        thread_is_outdated = thread.is_outdated == true,
+      },
     }
   end
 
   local origin_bufnr = type(open_opts.origin_bufnr) == "number" and open_opts.origin_bufnr or vim.api.nvim_get_current_buf()
   local enter_popup = type(open_opts.enter) == "boolean" and open_opts.enter or opts.enter
   local title = string.format("PR Thread [%s] (%d)", state, #items)
+  local popup_actions = comment_thread_actions.build_popup_actions({
+    pr_number = tonumber(thread.pr_number),
+    details = type(thread.details) == "table" and thread.details or nil,
+    thread_id = safe_string(thread.thread_id, ""),
+    path = safe_string(thread.path, ""),
+    line = tonumber(thread.line),
+    original_line = tonumber(thread.original_line),
+    thread_is_resolved = thread.is_resolved == true,
+    thread_is_outdated = thread.is_outdated == true,
+  })
 
   return comment_popup.open({
     origin_bufnr = origin_bufnr,
@@ -121,6 +159,10 @@ function M.open(thread, open_opts)
     location = thread_location(thread),
     subtitle = "Thread: " .. safe_string(thread.thread_id, "-"),
     items = items,
+    actions = popup_actions,
+    footer_lines = {
+      "r reply  R quote  x resolve  e edit  D delete  +/- reactions  q close",
+    },
     mode = safe_string(open_opts.mode, "open"),
     anchor_win = open_opts.anchor_win,
     enter = enter_popup,

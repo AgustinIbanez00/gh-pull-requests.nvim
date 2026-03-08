@@ -242,6 +242,7 @@ local defaults = {
     comments_panel = {
       enabled = true,
       auto_open = "if_comments",
+      position = "bottom",
       height_ratio = 0.28,
       min_height = 8,
       max_height = 18,
@@ -265,6 +266,11 @@ local defaults = {
       metadata_resolution_strategy = "hybrid",
       metadata_external_command = { "magick", "identify", "-format", "%w %h", "{file}" },
       max_bytes = 26214400,
+    },
+    non_text = {
+      enabled = true,
+      auto_preview = true,
+      show_metadata = true,
     },
     prefetch = {
       enabled = true,
@@ -1345,6 +1351,14 @@ local function sanitize_diff_view(diff_view)
   end
   result.comments_panel.auto_open = comments_panel_auto_open
 
+  local comments_panel_position = type(result.comments_panel.position) == "string"
+      and result.comments_panel.position:lower()
+    or defaults.diff_view.comments_panel.position
+  if comments_panel_position ~= "bottom" and comments_panel_position ~= "right" then
+    comments_panel_position = defaults.diff_view.comments_panel.position
+  end
+  result.comments_panel.position = comments_panel_position
+
   local comments_panel_height_ratio = tonumber(result.comments_panel.height_ratio)
   if type(comments_panel_height_ratio) ~= "number" or comments_panel_height_ratio < 0.10 or comments_panel_height_ratio > 0.80 then
     comments_panel_height_ratio = defaults.diff_view.comments_panel.height_ratio
@@ -1494,6 +1508,17 @@ local function sanitize_diff_view(diff_view)
     max_bytes = defaults.diff_view.images.max_bytes
   end
   result.images.max_bytes = math.floor(max_bytes)
+
+  result.non_text = type(result.non_text) == "table" and result.non_text or {}
+  if type(result.non_text.enabled) ~= "boolean" then
+    result.non_text.enabled = defaults.diff_view.non_text.enabled
+  end
+  if type(result.non_text.auto_preview) ~= "boolean" then
+    result.non_text.auto_preview = defaults.diff_view.non_text.auto_preview
+  end
+  if type(result.non_text.show_metadata) ~= "boolean" then
+    result.non_text.show_metadata = defaults.diff_view.non_text.show_metadata
+  end
 
   result.prefetch = type(result.prefetch) == "table" and result.prefetch or {}
   if type(result.prefetch.enabled) ~= "boolean" then

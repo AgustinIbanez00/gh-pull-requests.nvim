@@ -1,5 +1,6 @@
 local M = {}
 
+local comment_thread_actions = require("gh-pr.comment_thread_actions")
 local comment_popup = require("gh-pr.comment_popup")
 local config = require("gh-pr.config")
 local highlights = require("gh-pr.highlights")
@@ -150,6 +151,9 @@ local function marker_kind(entries)
 end
 
 local function line_entry_state(entry)
+  if entry.is_pending then
+    return "PENDING"
+  end
   if entry.is_resolved then
     return "RESOLVED"
   end
@@ -308,16 +312,34 @@ local function popup_options(bufnr, lc_config)
   }
 end
 
-local function line_popup_items(entries)
+local function line_popup_items(entries, meta)
+  meta = type(meta) == "table" and meta or {}
   local items = {}
   for _, entry in ipairs(entries or {}) do
     items[#items + 1] = {
+      id = safe_string(entry.comment_id, ""),
       marker = " ",
       state = line_entry_state(entry),
       author = safe_string(entry.author, "unknown"),
       created_at = safe_string(entry.created_at, "-"),
       body = safe_string(entry.body, "(empty comment)"),
       url = safe_string(entry.url, ""),
+      meta = {
+        pr_number = tonumber(meta.pr_number),
+        thread_id = safe_string(entry.thread_id, ""),
+        path = safe_string(entry.path, safe_string(meta.path, "")),
+        line = tonumber(entry.line) or tonumber(meta.line),
+        original_line = tonumber(entry.original_line) or tonumber(meta.original_line),
+        comment_id = safe_string(entry.comment_id, ""),
+        comment_author = safe_string(entry.author, "unknown"),
+        comment_body = safe_string(entry.body, ""),
+        comment_state = safe_string(entry.state, ""),
+        viewer_did_author = entry.viewer_did_author == true,
+        reaction_groups = type(entry.reaction_groups) == "table" and vim.deepcopy(entry.reaction_groups) or {},
+        comment_is_pending = entry.is_pending == true,
+        thread_is_resolved = entry.is_resolved == true,
+        thread_is_outdated = entry.is_outdated == true,
+      },
     }
   end
   return items
@@ -334,36 +356,60 @@ function M.clear_buffer(bufnr)
   vim.b[bufnr].gh_pr_line_comments = {}
 end
 
-function M.show_at_cursor(bufnr)
-  bufnr = bufnr or vim.api.nvim_get_current_buf()
+local function line_entries(bufnr, line)
   if not vim.api.nvim_buf_is_valid(bufnr) then
-    return
+    return nil, "No PR comments available for this buffer"
   end
 
   local line_map = vim.b[bufnr].gh_pr_line_comments
   if type(line_map) ~= "table" then
-    notify_info("No PR comments available for this buffer")
-    return
+    return nil, "No PR comments available for this buffer"
   end
 
-  local line = vim.api.nvim_win_get_cursor(0)[1]
   local entries = line_map[line]
   if type(entries) ~= "table" or vim.tbl_isempty(entries) then
-    notify_info("No PR comments for the current line")
-    return
+    return nil, "No PR comments for the current line"
+  end
+
+  return entries, nil
+end
+
+function M.show_at_line(bufnr, line, opts)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  opts = type(opts) == "table" and opts or {}
+
+  local entries, err = line_entries(bufnr, line)
+  if not entries then
+    if opts.notify_empty ~= false and type(err) == "string" and err ~= "" then
+      notify_info(err)
+    end
+    return false
   end
 
   local lc_config = (config.get() or {}).line_comments or {}
   local popup_cfg = popup_options(bufnr, lc_config)
   local path = safe_string(vim.b[bufnr].gh_pr_path, "?")
   local anchor_win = vim.api.nvim_get_current_win()
+  local popup_actions = comment_thread_actions.build_popup_actions({
+    pr_number = tonumber(vim.b[bufnr].gh_pr_number),
+    path = path,
+    line = tonumber(line),
+  })
 
   local ok, err = comment_popup.open({
     origin_bufnr = bufnr,
     tag = "line",
     title = string.format("PR line comments (%d)", #entries),
     location = string.format("%s:%d", path, line),
-    items = line_popup_items(entries),
+    items = line_popup_items(entries, {
+      pr_number = tonumber(vim.b[bufnr].gh_pr_number),
+      path = path,
+      line = tonumber(line),
+    }),
+    actions = popup_actions,
+    footer_lines = {
+      "r reply  R quote  x resolve  e edit  D delete  +/- reactions  q close",
+    },
     mode = popup_cfg.enter and "open" or "preview",
     anchor_win = anchor_win,
     enter = popup_cfg.enter,
@@ -380,6 +426,18 @@ function M.show_at_cursor(bufnr)
   if not ok and err then
     vim.notify("Unable to open line comments popup: " .. tostring(err), vim.log.levels.WARN)
   end
+
+  return true
+end
+
+function M.show_at_cursor(bufnr, opts)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+
+  local line = vim.api.nvim_win_get_cursor(0)[1]
+  return M.show_at_line(bufnr, line, opts)
 end
 
 function M.attach_to_buffer(bufnr, ctx)

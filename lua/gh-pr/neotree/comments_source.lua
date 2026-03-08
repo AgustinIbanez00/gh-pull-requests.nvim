@@ -241,6 +241,8 @@ local function normalize_thread_comment(comment, fallback_index)
     url = type(comment.url) == "string" and comment.url or "",
     state = type(comment.state) == "string" and comment.state or "",
     outdated = comment.outdated == true,
+    viewer_did_author = comment.viewerDidAuthor == true or comment.viewer_did_author == true,
+    reaction_groups = vim.deepcopy(type(comment.reactionGroups) == "table" and comment.reactionGroups or (type(comment.reaction_groups) == "table" and comment.reaction_groups or {})),
   }
 end
 
@@ -264,6 +266,8 @@ local function normalize_line_bucket_comments(comments)
       url = type(comment.url) == "string" and comment.url or "",
       state = type(comment.state) == "string" and comment.state or "",
       outdated = comment.outdated == true,
+      viewer_did_author = comment.viewer_did_author == true,
+      reaction_groups = vim.deepcopy(type(comment.reaction_groups) == "table" and comment.reaction_groups or {}),
     }
   end
   sort_comments_by_time(items)
@@ -409,6 +413,8 @@ local function build_nodes(pr, details, threads, options)
               url = comment.url,
               state = comment.state,
               outdated = comment.outdated == true,
+              viewer_did_author = comment.viewer_did_author == true,
+              reaction_groups = vim.deepcopy(type(comment.reaction_groups) == "table" and comment.reaction_groups or {}),
               thread_id = thread.id,
               target = {
                 pr = pr,

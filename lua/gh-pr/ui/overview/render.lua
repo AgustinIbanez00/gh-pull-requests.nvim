@@ -551,6 +551,9 @@ local function build_thread_popup_comments(thread)
         url = utils.safe_string(comment.url, ""),
         state = utils.safe_string(comment.state, ""),
         outdated = comment.outdated == true,
+        is_pending = comment.is_pending == true,
+        viewer_did_author = comment.viewer_did_author == true,
+        reaction_groups = vim.deepcopy(type(comment.reaction_groups) == "table" and comment.reaction_groups or {}),
       }
     end
   end
@@ -1211,7 +1214,7 @@ local function thread_comment_meta(comment, date_format)
   return when
 end
 
-local function build_thread_workspace_payload(session, thread)
+local function build_thread_open_payload(session, thread)
   local function normalize_side(value)
     local side = utils.safe_string(value, "head"):lower()
     if side == "left" or side == "base" then
@@ -1232,33 +1235,47 @@ local function build_thread_workspace_payload(session, thread)
     return nil
   end
 
-  local comments = {}
-  for index, comment in ipairs(type(thread.comments) == "table" and thread.comments or {}) do
+  local comments = type(thread.comments) == "table" and thread.comments or {}
+  local primary_comment = nil
+  for _, comment in ipairs(comments) do
     if type(comment) == "table" then
-      comments[#comments + 1] = {
-        id = utils.safe_string(comment.id, tostring(index)),
-        author = utils.safe_string(comment.author, "unknown"),
-        created_at = utils.safe_string(comment.created_at, ""),
-        body = utils.safe_string(comment.body, ""),
-        state = utils.safe_string(comment.state, ""),
-        url = utils.safe_string(comment.url, ""),
-        side = normalize_side(comment.side),
-        line = pick_line(comment.line, thread.line),
-        original_line = pick_line(comment.original_line, thread.original_line),
-      }
+      local commit_oid = utils.safe_string(comment.commit_oid, "")
+      local original_commit_oid = utils.safe_string(comment.original_commit_oid, "")
+      if commit_oid ~= "" or original_commit_oid ~= "" then
+        primary_comment = comment
+        break
+      end
     end
   end
+  if type(primary_comment) ~= "table" then
+    primary_comment = type(comments[1]) == "table" and comments[1] or nil
+  end
+
+  local side = normalize_side(thread.side)
+  local line = pick_line(thread.line, thread.original_line)
+  local original_line = pick_line(thread.original_line, thread.line)
 
   return {
     thread_id = utils.safe_string(thread.id, ""),
     pr_number = tonumber(session.model and session.model.number) or 0,
     path = utils.safe_string(thread.path, ""),
-    side = normalize_side(thread.side),
-    line = pick_line(thread.line, thread.original_line),
-    original_line = pick_line(thread.original_line, thread.line),
-    is_resolved = thread.is_resolved == true,
-    is_outdated = thread.is_outdated == true,
-    comments = comments,
+    side = side,
+    line = line,
+    original_line = original_line,
+    comment_commit_oid = utils.safe_string(type(primary_comment) == "table" and primary_comment.commit_oid or "", ""),
+    comment_original_commit_oid = utils.safe_string(
+      type(primary_comment) == "table" and primary_comment.original_commit_oid or "",
+      ""
+    ),
+    fallback_target = {
+      path = utils.safe_string(thread.path, ""),
+      side = side,
+      line = line,
+      original_line = original_line,
+      thread_id = utils.safe_string(thread.id, ""),
+      thread_is_resolved = thread.is_resolved == true,
+      thread_is_outdated = thread.is_outdated == true,
+    },
   }
 end
 
@@ -1268,7 +1285,7 @@ local function render_activity_thread_classic(session, payload, thread)
   local comments_count = #(type(thread.comments) == "table" and thread.comments or {})
   local thread_action = {
     kind = "open_activity_thread_workspace",
-    payload = build_thread_workspace_payload(session, thread),
+    payload = build_thread_open_payload(session, thread),
   }
 
   add_action_line(
@@ -1276,7 +1293,7 @@ local function render_activity_thread_classic(session, payload, thread)
     string.format("%s | %s | %d comments", prefix, location, comments_count),
     "GhPrOverviewTimelineThread",
     thread_action,
-    "· <CR> open"
+    "· <CR> open diff"
   )
   add_line(payload, "")
 end
@@ -1288,7 +1305,7 @@ local function render_activity_thread_minimal(session, payload, thread)
   local comments_count = #(type(thread.comments) == "table" and thread.comments or {})
   local thread_action = {
     kind = "open_activity_thread_workspace",
-    payload = build_thread_workspace_payload(session, thread),
+    payload = build_thread_open_payload(session, thread),
   }
 
   add_action_line(
@@ -1296,7 +1313,7 @@ local function render_activity_thread_minimal(session, payload, thread)
     string.format("%s thread %s%s (%d)", indicator, location, suffix, comments_count),
     "GhPrOverviewTimelineThread",
     thread_action,
-    "· <CR> open"
+    "· <CR> open diff"
   )
 
   add_line(payload, "")

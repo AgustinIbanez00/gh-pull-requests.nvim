@@ -38,6 +38,23 @@ local FILE_STATUS_DISPLAY = {
 }
 local FILE_PARENT_PATH_MAX_CHARS = 26
 
+local function severity_highlight(value)
+  local severity = type(value) == "string" and value:lower() or ""
+  if severity == "critical" then
+    return "GhPrSecurityAlertCritical"
+  end
+  if severity == "high" then
+    return "GhPrSecurityAlertHigh"
+  end
+  if severity == "medium" or severity == "moderate" then
+    return "GhPrSecurityAlertMedium"
+  end
+  if severity == "low" then
+    return "GhPrSecurityAlertLow"
+  end
+  return nil
+end
+
 local function display_width(value)
   if type(value) ~= "string" or value == "" then
     return 0
@@ -198,6 +215,39 @@ local function icon_for_node(node)
 
   if node.extra and node.extra.kind == "check" then
     return { text = "󰙨 ", highlight = highlights.FILE_ICON }
+  end
+
+  if node.extra and (node.extra.kind == "security" or node.extra.kind == "security_code_scanning" or node.extra.kind == "security_dependency_review") then
+    return { text = "󰒃 ", highlight = highlights.FILE_ICON }
+  end
+
+  if node.extra and (node.extra.kind == "security_code_scanning_file" or node.extra.kind == "security_dependency_manifest") then
+    local name = node.extra.file_path or node.extra.manifest_path or node.name
+    local icon = file_icon_from_name(name)
+    if icon then
+      return icon
+    end
+    return { text = "󰈙 ", highlight = highlights.FILE_ICON }
+  end
+
+  if node.extra and node.extra.kind == "security_code_scanning_alert" then
+    return { text = "󰅚 ", highlight = highlights.FILE_ICON }
+  end
+
+  if node.extra and node.extra.kind == "security_dependency_package" then
+    return { text = "󰏖 ", highlight = highlights.FILE_ICON }
+  end
+
+  if node.extra and node.extra.kind == "security_dependency_vulnerability" then
+    return { text = "󰳦 ", highlight = highlights.FILE_ICON }
+  end
+
+  if node.extra and node.extra.kind == "check_annotation_file" then
+    return { text = "󰈙 ", highlight = highlights.FILE_ICON }
+  end
+
+  if node.extra and node.extra.kind == "check_annotation" then
+    return { text = "󰅚 ", highlight = highlights.FILE_ICON }
   end
 
   if node.extra and node.extra.kind == "label" then
@@ -413,6 +463,25 @@ M.name = function(config, node, _)
     elseif state == "PENDING" then
       hl = "DiagnosticWarn"
     end
+  end
+
+  if node.extra and node.extra.kind == "check_annotation" then
+    local level = type(node.extra.annotation_level) == "string" and node.extra.annotation_level:lower() or "notice"
+    if level == "failure" then
+      hl = "GhPrCheckAnnotationFail"
+    elseif level == "warning" then
+      hl = "GhPrCheckAnnotationWarn"
+    else
+      hl = "GhPrCheckAnnotationNotice"
+    end
+  end
+
+  if node.extra and (node.extra.kind == "security_code_scanning_alert" or node.extra.kind == "security_dependency_vulnerability") then
+    hl = severity_highlight(node.extra.alert_severity or node.extra.security_severity) or hl
+  end
+
+  if node.extra and node.extra.kind == "security_dependency_package" and node.extra.has_vulnerabilities == true then
+    hl = severity_highlight(node.extra.security_severity) or hl
   end
 
   if node.extra and node.extra.kind == "label" then

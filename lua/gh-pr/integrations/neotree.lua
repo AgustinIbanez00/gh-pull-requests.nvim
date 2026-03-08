@@ -13,6 +13,7 @@ local pending_open = {}
 local DISPLAY_NAMES = {
   gh_pr = "  PR ",
   gh_pr_comments = "  Comments ",
+  gh_pr_diff_comments = "  Diff Comments ",
   gh_pr_review = "  PR Review ",
 }
 
@@ -74,6 +75,10 @@ local function valid_window(winid)
   return type(winid) == "number" and winid > 0 and vim.api.nvim_win_is_valid(winid)
 end
 
+local function valid_tabpage(tabid)
+  return type(tabid) == "number" and tabid > 0 and vim.api.nvim_tabpage_is_valid(tabid)
+end
+
 local function visible_neotree_state_paths()
   local paths = {}
   if package.loaded["neo-tree"] == nil then
@@ -105,12 +110,13 @@ local function visible_neotree_state_paths()
   return paths
 end
 
-local function source_is_visible(source_name)
+local function source_is_visible(source_name, tabid)
   if package.loaded["neo-tree"] == nil then
     return false
   end
 
-  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+  local target_tab = valid_tabpage(tabid) and tabid or vim.api.nvim_get_current_tabpage()
+  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(target_tab)) do
     if valid_window(winid) then
       local bufnr = vim.api.nvim_win_get_buf(winid)
       local ok, filetype = pcall(vim.api.nvim_get_option_value, "filetype", { buf = bufnr })
@@ -174,14 +180,24 @@ local function find_source_entry(items, source_name)
   return nil, nil
 end
 
-local function ensure_source_config(neo_tree, source_name)
+local function ensure_source_config(neo_tree, source_name, opts)
+  opts = opts or {}
   if type(neo_tree.config[source_name]) ~= "table" then
     neo_tree.config[source_name] = {}
   end
 
   neo_tree.config[source_name].name = source_name
   neo_tree.config[source_name].window = neo_tree.config[source_name].window or {}
-  neo_tree.config[source_name].window.position = neo_tree.config[source_name].window.position or "left"
+  neo_tree.config[source_name].window.position = type(opts.position) == "string"
+      and opts.position
+    or neo_tree.config[source_name].window.position
+    or "left"
+  local height = tonumber(opts.height)
+  if height and height > 0 then
+    neo_tree.config[source_name].window.height = math.floor(height)
+  else
+    neo_tree.config[source_name].window.height = nil
+  end
   neo_tree.config.sources = type(neo_tree.config.sources) == "table" and neo_tree.config.sources or {}
 end
 
@@ -275,20 +291,21 @@ local function redraw_visible_neotree_windows()
   end
 end
 
-local function close_source_if_visible(source_name)
+local function close_source_if_visible(source_name, opts)
+  opts = opts or {}
   if package.loaded["neo-tree"] == nil then
-    return
+    return false
   end
 
   local ok, command = pcall(require, "neo-tree.command")
   if not ok or type(command.execute) ~= "function" then
-    return
+    return false
   end
 
-  pcall(command.execute, {
+  return pcall(command.execute, {
     action = "close",
     source = source_name,
-    position = "left",
+    position = type(opts.position) == "string" and opts.position or "left",
   })
 end
 
@@ -309,7 +326,7 @@ local function execute_source(source_name, opts)
     source = source_name,
     toggle = opts.toggle == true,
     reveal = false,
-    position = "left",
+    position = type(opts.position) == "string" and opts.position or "left",
   })
 
   if not status then
@@ -330,9 +347,11 @@ function M.ensure_source(source_name, source_module_name, opts)
     return false
   end
 
-  ensure_source_config(neo_tree, source_name)
+  ensure_source_config(neo_tree, source_name, opts)
   ensure_source_entry(neo_tree, source_name, { auto_managed = opts.auto_managed == true })
-  ensure_selector_entry(neo_tree, source_name, { auto_managed = opts.auto_managed == true })
+  if opts.selector ~= false then
+    ensure_selector_entry(neo_tree, source_name, { auto_managed = opts.auto_managed == true })
+  end
 
   if configured_sources[source_name] then
     return true
@@ -357,6 +376,66 @@ function M.ensure_source(source_name, source_module_name, opts)
 
   configured_sources[source_name] = true
   return true
+end
+
+function M.is_source_visible(source_name, tabid)
+  return source_is_visible(source_name, tabid)
+end
+
+function M.close_source(source_name, opts)
+  opts = opts or {}
+  if package.loaded["neo-tree"] == nil then
+    return false
+  end
+
+  local neo_tree = maybe_get_neotree(false)
+
+  local target_tab = valid_tabpage(tonumber(opts.tabid)) and tonumber(opts.tabid) or vim.api.nvim_get_current_tabpage()
+  local previous_tab = vim.api.nvim_get_current_tabpage()
+  if target_tab ~= previous_tab then
+    pcall(vim.api.nvim_set_current_tabpage, target_tab)
+  end
+
+  local closed = false
+  if source_is_visible(source_name, target_tab) then
+    local positions = {}
+    local seen = {}
+    local function add_position(position)
+      if type(position) ~= "string" or position == "" or seen[position] then
+        return
+      end
+      seen[position] = true
+      positions[#positions + 1] = position
+    end
+
+    add_position(opts.position)
+    local configured_position = neo_tree
+        and neo_tree.config
+        and neo_tree.config[source_name]
+        and neo_tree.config[source_name].window
+        and neo_tree.config[source_name].window.position
+      or nil
+    add_position(configured_position)
+    add_position("bottom")
+    add_position("right")
+    add_position("left")
+
+    for _, position in ipairs(positions) do
+      close_source_if_visible(source_name, {
+        position = position,
+      })
+      if not source_is_visible(source_name, target_tab) then
+        closed = true
+        break
+      end
+    end
+  end
+
+  if valid_tabpage(previous_tab) and previous_tab ~= target_tab then
+    pcall(vim.api.nvim_set_current_tabpage, previous_tab)
+  end
+
+  return closed
 end
 
 local function handle_pr_probe_result(probe_key, source_name, source_module_name, opts, result)
@@ -471,7 +550,7 @@ function M.open_source(source_name, source_module_name, opts)
     return request_pr_probe(source_name, source_module_name, {
       action = type(opts.action) == "string" and opts.action or (source_is_visible(source_name) and "focus" or "show"),
       toggle = false,
-      position = "left",
+      position = type(opts.position) == "string" and opts.position or "left",
       on_error = opts.on_error,
       auto_managed = settings.gate ~= "manual" and settings.auto_register == true,
       pending_open = true,

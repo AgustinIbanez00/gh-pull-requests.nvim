@@ -632,6 +632,7 @@ local function create_session(tabid, pr_number, ctx)
     pr_number = pr_number,
     pr = type(ctx.pr) == "table" and ctx.pr or {},
     details = type(ctx.details) == "table" and ctx.details or {},
+    comments_ctx = type(ctx.comments_ctx) == "table" and ctx.comments_ctx or nil,
     actions = {},
     suspend_follow = false,
     last_line = nil,
@@ -693,6 +694,7 @@ local function ensure_session_window(runtime, opts, ctx)
   else
     session.pr = type(ctx.pr) == "table" and ctx.pr or session.pr
     session.details = type(ctx.details) == "table" and ctx.details or session.details
+    session.comments_ctx = type(ctx.comments_ctx) == "table" and ctx.comments_ctx or session.comments_ctx
     session.origin = {
       origin_win = tonumber(ctx.origin_win),
       origin_buf = tonumber(ctx.origin_buf),
@@ -711,13 +713,22 @@ local function ensure_session_window(runtime, opts, ctx)
   return session, nil
 end
 
-local function fetch_threads_async(pr_number, comments_ctx, callback)
+local function fetch_threads_async(pr_number, comments_ctx, callback, opts)
+  opts = type(opts) == "table" and opts or {}
   callback = callback or function() end
 
-  if type(comments_ctx) == "table" and type(comments_ctx.threads) == "table" then
+  if opts.force_fetch ~= true and type(comments_ctx) == "table" and type(comments_ctx.threads) == "table" then
     vim.schedule(function()
       callback(comments_ctx.threads, nil)
     end)
+    return
+  end
+
+  if type(pr_service.fetch_review_threads_with_pending_async) == "function" then
+    pr_service.fetch_review_threads_with_pending_async(pr_number, {
+      threads_first = 100,
+      comments_first = 100,
+    }, callback)
     return
   end
 
@@ -730,10 +741,18 @@ local function fetch_threads_async(pr_number, comments_ctx, callback)
   end
 
   vim.schedule(function()
-    local threads, err = pr_service.fetch_review_threads(pr_number, {
-      threads_first = 100,
-      comments_first = 100,
-    })
+    local threads, err
+    if type(pr_service.fetch_review_threads_with_pending) == "function" then
+      threads, err = pr_service.fetch_review_threads_with_pending(pr_number, {
+        threads_first = 100,
+        comments_first = 100,
+      })
+    else
+      threads, err = pr_service.fetch_review_threads(pr_number, {
+        threads_first = 100,
+        comments_first = 100,
+      })
+    end
     callback(threads, err)
   end)
 end
@@ -746,7 +765,8 @@ local function request_still_current(tabid, request_id, pr_number, target_path)
     and pending.target_path == target_path
 end
 
-local function start_async_load(runtime, opts, ctx, mode)
+local function start_async_load(runtime, opts, ctx, mode, request_opts)
+  request_opts = type(request_opts) == "table" and request_opts or {}
   local target_path = runtime.target.path
   local request_id = request_token(runtime.tabid)
   pending_requests[runtime.tabid] = {
@@ -760,8 +780,14 @@ local function start_async_load(runtime, opts, ctx, mode)
       return
     end
 
+    local live_session = get_session(runtime.tabid)
     local model
     if threads then
+      if live_session then
+        live_session.comments_ctx = vim.tbl_deep_extend("force", {}, type(live_session.comments_ctx) == "table" and live_session.comments_ctx or {}, {
+          threads = threads,
+        })
+      end
       model = build_comment_model(threads, opts, runtime.pr_number, target_path, runtime.target.kind)
     end
 
@@ -771,7 +797,6 @@ local function start_async_load(runtime, opts, ctx, mode)
       if mode == "probe" then
         return
       end
-      local live_session = get_session(runtime.tabid)
       if live_session then
         render_error(live_session, err)
       end
@@ -782,7 +807,6 @@ local function start_async_load(runtime, opts, ctx, mode)
       return
     end
 
-    local live_session = get_session(runtime.tabid)
     if not live_session then
       local ensured_session, ensure_err = ensure_session_window(runtime, opts, ctx)
       if not ensured_session then
@@ -800,7 +824,7 @@ local function start_async_load(runtime, opts, ctx, mode)
     end
 
     render_ready(live_session, model)
-  end)
+  end, request_opts)
 end
 
 local function open_or_refresh(ctx, force_open)
@@ -829,11 +853,32 @@ local function open_or_refresh(ctx, force_open)
   return false, nil
 end
 
+local function tree_backend()
+  local ok, source = pcall(require, "gh-pr.neotree.diff_comments_source")
+  if not ok or type(source) ~= "table" or type(source.available) ~= "function" then
+    return nil
+  end
+
+  if source.available() ~= true then
+    return nil
+  end
+
+  return source
+end
+
 function M.sync_for_diff(ctx)
+  local tree = tree_backend()
+  if tree and type(tree.sync_for_diff) == "function" then
+    return tree.sync_for_diff(ctx)
+  end
   return open_or_refresh(type(ctx) == "table" and ctx or {}, false)
 end
 
 function M.toggle(ctx)
+  local tree = tree_backend()
+  if tree and type(tree.toggle) == "function" then
+    return tree.toggle(ctx)
+  end
   local tabid = vim.api.nvim_get_current_tabpage()
   if get_session(tabid) then
     close_session(tabid)
@@ -843,11 +888,63 @@ function M.toggle(ctx)
 end
 
 function M.is_open_current_tab()
+  local tree = tree_backend()
+  if tree and type(tree.is_open_current_tab) == "function" and tree.is_open_current_tab() then
+    return true
+  end
   return get_session(vim.api.nvim_get_current_tabpage()) ~= nil
+end
+
+function M.refresh_current_tab(opts)
+  opts = type(opts) == "table" and opts or {}
+  local tree = tree_backend()
+  if tree and type(tree.refresh_current_tab) == "function" then
+    return tree.refresh_current_tab(opts)
+  end
+
+  local tabid = vim.api.nvim_get_current_tabpage()
+  local session = get_session(tabid)
+  if not session then
+    return false
+  end
+
+  local runtime = {
+    tabid = tabid,
+    pr_number = session.pr_number,
+    session = session,
+    target = {
+      path = session.target_path,
+      kind = session.target_kind,
+    },
+  }
+  local opts_panel = panel_opts()
+  local ctx = {
+    pr_number = session.pr_number,
+    pr = session.pr,
+    details = session.details,
+    comments_ctx = opts.force_fetch == true and nil or session.comments_ctx,
+    origin_win = session.origin and session.origin.origin_win or nil,
+    origin_buf = session.origin and session.origin.origin_buf or nil,
+    file_path = session.target_path,
+    file_kind = session.target_kind,
+  }
+
+  render_loading(session)
+  start_async_load(runtime, opts_panel, ctx, "open", {
+    force_fetch = opts.force_fetch == true,
+  })
+  return true
 end
 
 function M.close_current_tab(opts)
   opts = type(opts) == "table" and opts or {}
+  local tree = tree_backend()
+  if tree and type(tree.close_current_tab) == "function" then
+    local closed = tree.close_current_tab(opts)
+    if closed == true then
+      return true
+    end
+  end
   if opts.respect_close_with_dq == true and panel_opts().close_with_dq == false then
     return false
   end
@@ -855,6 +952,10 @@ function M.close_current_tab(opts)
 end
 
 function M.close_all()
+  local tree = tree_backend()
+  if tree and type(tree.close_all) == "function" then
+    tree.close_all()
+  end
   for _, tabid in ipairs(vim.tbl_keys(sessions)) do
     close_session(tabid)
   end

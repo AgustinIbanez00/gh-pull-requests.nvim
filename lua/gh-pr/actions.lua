@@ -25,6 +25,9 @@ local diff_backend_session = {
   virtual_fallback = nil,
   prompt_open = false,
 }
+local non_text_preview = {
+  menu_state = nil,
+}
 
 local function normalize_repository(details)
   local repository = details.baseRepository or details.headRepository
@@ -201,14 +204,33 @@ local function build_line_comment_context(pr_number)
     return nil
   end
 
-  local threads, thread_err = pr_service.fetch_review_threads(pr_number, {
+  local pending_review = nil
+  local pending_err = nil
+  local fetch_opts = {
     threads_first = 100,
     comments_first = 100,
-  })
+  }
+  local threads, thread_err
+
+  if type(pr_service.fetch_review_threads_with_pending) == "function" then
+    threads, thread_err = pr_service.fetch_review_threads_with_pending(pr_number, fetch_opts)
+  else
+    threads, thread_err = pr_service.fetch_review_threads(pr_number, fetch_opts)
+    if threads and type(pr_service.fetch_pending_review_comments) == "function" then
+      pending_review, pending_err = pr_service.fetch_pending_review_comments(pr_number)
+      if pending_review and type(pr_service.merge_pending_review_comments) == "function" then
+        threads = pr_service.merge_pending_review_comments(threads, pending_review)
+      end
+    end
+  end
 
   if not threads then
     notify_warn("Unable to load line comments for this PR: " .. tostring(thread_err))
     return nil
+  end
+
+  if pending_err then
+    notify_warn("Unable to load pending review comments for this PR: " .. tostring(pending_err))
   end
 
   local index = pr_service.build_line_comment_index(threads, {
@@ -219,12 +241,16 @@ local function build_line_comment_context(pr_number)
   return {
     index = index,
     threads = threads,
+    pending_review = pending_review,
     keymap = options.keymap,
     signs = options.signs,
     max_popup_width = options.max_popup_width,
     max_popup_height = options.max_popup_height,
   }
 end
+
+local refresh_line_comments_for_pr
+local remote_viewed_sync_inflight = {}
 
 local function refresh_pr_sources_after_state_change(opts)
   opts = opts or {}
@@ -262,6 +288,67 @@ local function refresh_pr_sources_after_state_change(opts)
       })
     end
   end
+end
+
+local function render_pr_sources_from_cache()
+  local registry = require("gh-pr.neotree.registry")
+
+  local source = registry.get("gh_pr")
+  if type(source) == "table" and type(source.render_cached_states) == "function" then
+    pcall(source.render_cached_states)
+  end
+
+  local review_source = registry.get("gh_pr_review")
+  if type(review_source) == "table" and type(review_source.render_cached_states) == "function" then
+    pcall(review_source.render_cached_states)
+  end
+end
+
+local function refresh_diff_comments_panel_after_state_change()
+  local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
+  if not ok_panel or type(panel) ~= "table" then
+    return
+  end
+
+  if type(panel.refresh_current_tab) == "function" then
+    pcall(panel.refresh_current_tab, {
+      force_fetch = true,
+    })
+  end
+end
+
+local function sync_remote_viewed_state_for_pr(pr_number, details, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(pr_service.fetch_viewed_files_async) ~= "function" then
+    return false
+  end
+
+  local number = tonumber(pr_number) or tonumber(type(details) == "table" and details.number or nil)
+  local repository = type(details) == "table" and normalize_repository(details) or nil
+  if not number or type(repository) ~= "string" or repository == "" then
+    return false
+  end
+
+  local key = string.format("%s#%d", repository, number)
+  if remote_viewed_sync_inflight[key] then
+    return false
+  end
+  remote_viewed_sync_inflight[key] = true
+
+  pr_service.fetch_viewed_files_async(number, opts.fetch or {}, function(result, err)
+    remote_viewed_sync_inflight[key] = nil
+    if not result or type(result.files) ~= "table" then
+      if opts.notify_error == true and type(err) == "string" and err ~= "" then
+        notify_warn("Unable to sync GitHub viewed state: " .. err)
+      end
+      return
+    end
+
+    state.replace_remote_viewed(repository, number, result.files)
+    render_pr_sources_from_cache()
+  end)
+
+  return true
 end
 
 local function normalize_diff_view_mode(mode)
@@ -532,44 +619,42 @@ local function resolve_active_pr(number, opts)
   return details, details, nil
 end
 
-local IMAGE_FALLBACK_ACTION_LABELS = {
-  metadata = "Render metadata diff in buffer",
-  open_local_current = "Open current image locally",
-  open_local_both = "Open base + modified images locally",
-  open_github = "Open GitHub PR image comparison",
+non_text_preview.action_labels = {
+  metadata = "Show metadata/actions in buffer",
+  open_local_current = "Open current revision locally",
+  open_local_both = "Open both revisions locally",
+  open_github = "Open GitHub PR file view",
 }
 
-local IMAGE_FALLBACK_ACTION_ORDER = {
+non_text_preview.action_order = {
   "open_local_current",
   "open_local_both",
   "open_github",
   "metadata",
 }
 
-local image_fallback_menu_state = nil
-
-local function is_valid_image_action(action)
+function non_text_preview.is_valid_image_action(action)
   return action == "metadata" or action == "open_local_current" or action == "open_local_both" or action == "open_github"
 end
 
-local function normalize_image_action(action, fallback)
+function non_text_preview.normalize_image_action(action, fallback)
   local value = type(action) == "string" and action:lower() or ""
-  if is_valid_image_action(value) then
+  if non_text_preview.is_valid_image_action(value) then
     return value
   end
   local default_value = type(fallback) == "string" and fallback:lower() or "metadata"
-  if is_valid_image_action(default_value) then
+  if non_text_preview.is_valid_image_action(default_value) then
     return default_value
   end
   return "metadata"
 end
 
-local function image_action_label(action)
-  local normalized = normalize_image_action(action, "metadata")
-  return IMAGE_FALLBACK_ACTION_LABELS[normalized] or normalized
+function non_text_preview.action_label(action)
+  local normalized = non_text_preview.normalize_image_action(action, "metadata")
+  return non_text_preview.action_labels[normalized] or normalized
 end
 
-local function image_diff_options()
+function non_text_preview.image_diff_options()
   local diff_view = (config.get() or {}).diff_view or {}
   local images = type(diff_view.images) == "table" and diff_view.images or {}
   local external_command = {}
@@ -584,7 +669,7 @@ local function image_diff_options()
 
   return {
     fallback_mode = type(images.fallback_mode) == "string" and images.fallback_mode:lower() or "menu",
-    fallback_default_action = normalize_image_action(images.fallback_default_action, "metadata"),
+    fallback_default_action = non_text_preview.normalize_image_action(images.fallback_default_action, "metadata"),
     fallback_menu_keymap = type(images.fallback_menu_keymap) == "string" and images.fallback_menu_keymap or "gf",
     fallback_open_local = type(images.fallback_open_local) == "string" and images.fallback_open_local:lower() or "system",
     fallback_github_target = type(images.fallback_github_target) == "string"
@@ -597,20 +682,30 @@ local function image_diff_options()
   }
 end
 
-local function resolve_image_default_action(images_cfg)
+function non_text_preview.options()
+  local diff_view = (config.get() or {}).diff_view or {}
+  local non_text = type(diff_view.non_text) == "table" and diff_view.non_text or {}
+  return {
+    enabled = non_text.enabled ~= false,
+    auto_preview = non_text.auto_preview ~= false,
+    show_metadata = non_text.show_metadata ~= false,
+  }
+end
+
+function non_text_preview.resolve_default_action(images_cfg)
   local fallback = type(images_cfg) == "table" and images_cfg.fallback_default_action or "metadata"
-  local action = normalize_image_action(fallback, "metadata")
+  local action = non_text_preview.normalize_image_action(fallback, "metadata")
   if type(state.get_image_prefs) == "function" then
     local prefs = state.get_image_prefs()
     if type(prefs) == "table" then
-      action = normalize_image_action(prefs.fallback_default_action, action)
+      action = non_text_preview.normalize_image_action(prefs.fallback_default_action, action)
     end
   end
   return action
 end
 
-local function persist_image_default_action(action)
-  local normalized = normalize_image_action(action, "metadata")
+function non_text_preview.persist_default_action(action)
+  local normalized = non_text_preview.normalize_image_action(action, "metadata")
   if type(state.update_image_pref) == "function" then
     state.update_image_pref("fallback_default_action", normalized)
     return true
@@ -624,6 +719,26 @@ local function persist_image_default_action(action)
   return false
 end
 
+function non_text_preview.classify_target(file)
+  local non_text = non_text_preview.options()
+  if non_text.enabled ~= true or non_text.auto_preview ~= true then
+    return "text"
+  end
+  if type(virtual_files.classify_file) ~= "function" then
+    return "text"
+  end
+  local kind = virtual_files.classify_file(file)
+  if kind == "image" or kind == "asset" then
+    return kind
+  end
+  return "text"
+end
+
+function non_text_preview.file_uses_non_text_preview(file)
+  local kind = non_text_preview.classify_target(file)
+  return kind == "image" or kind == "asset", kind
+end
+
 local function file_readable(path)
   return type(path) == "string" and path ~= "" and vim.fn.filereadable(path) == 1
 end
@@ -635,7 +750,7 @@ local function trim_trailing_slash(url)
   return url:gsub("/+$", "")
 end
 
-local function current_image_side(ctx)
+function non_text_preview.current_side(ctx)
   local side = type(ctx.side) == "string" and ctx.side or ""
   if side == "base" or side == "head" then
     return side
@@ -646,7 +761,7 @@ local function current_image_side(ctx)
   return "head"
 end
 
-local function side_present_for_status(status, side)
+function non_text_preview.side_present_for_status(status, side)
   if status == "added" and side == "base" then
     return false
   end
@@ -656,7 +771,7 @@ local function side_present_for_status(status, side)
   return true
 end
 
-local function image_path_for_side(ctx, side)
+function non_text_preview.path_for_side(ctx, side)
   local side_path = ""
   if side == "base" then
     side_path = normalize_path(ctx.base_path or "")
@@ -713,7 +828,7 @@ local function extract_repo_info(repo)
   }
 end
 
-local function resolve_side_repository(details, side, fallback_full_name)
+function non_text_preview.resolve_side_repository(details, side, fallback_full_name)
   local base_repo = extract_repo_info(type(details) == "table" and details.baseRepository or nil)
   local head_repo = extract_repo_info(type(details) == "table" and details.headRepository or nil) or base_repo
   if side == "base" then
@@ -866,46 +981,99 @@ local function open_diff_with_forced_backend(opts)
   return nil, primary_message
 end
 
-local function resolve_image_buffer_context(bufnr)
+function non_text_preview.resolve_buffer_context(bufnr)
   bufnr = type(bufnr) == "number" and bufnr or vim.api.nvim_get_current_buf()
   if not is_valid_buf(bufnr) then
     return nil, "Invalid buffer"
   end
-  if vim.b[bufnr].gh_pr_is_image ~= true then
-    return nil, "Current buffer is not an image diff buffer"
+  local is_image = vim.b[bufnr].gh_pr_is_image == true
+  local is_non_text = vim.b[bufnr].gh_pr_is_non_text == true or is_image
+  if not is_non_text then
+    return nil, "Current buffer is not a non-text diff buffer"
   end
 
   local number = tonumber(vim.b[bufnr].gh_pr_number)
   if not number then
-    return nil, "Unable to resolve pull request number for image buffer"
+    return nil, "Unable to resolve pull request number for non-text buffer"
   end
+
+  local preview = type(vim.b[bufnr].gh_pr_asset_preview) == "table" and vim.deepcopy(vim.b[bufnr].gh_pr_asset_preview) or {}
+  local asset_kind = type(preview.asset_kind) == "string" and preview.asset_kind
+    or (type(vim.b[bufnr].gh_pr_asset_kind) == "string" and vim.b[bufnr].gh_pr_asset_kind or (is_image and "image" or "binary"))
+  if asset_kind ~= "image" and asset_kind ~= "binary" then
+    asset_kind = is_image and "image" or "binary"
+  end
+
+  local status = type(vim.b[bufnr].gh_pr_asset_status) == "string"
+      and vim.b[bufnr].gh_pr_asset_status:lower()
+    or (type(vim.b[bufnr].gh_pr_image_status) == "string" and vim.b[bufnr].gh_pr_image_status:lower() or "")
+  local current_side = type(vim.b[bufnr].gh_pr_asset_side) == "string" and vim.b[bufnr].gh_pr_asset_side
+    or (type(vim.b[bufnr].gh_pr_image_side) == "string" and vim.b[bufnr].gh_pr_image_side or "")
+
+  local function ensure_preview_side(side)
+    local entry = type(preview[side]) == "table" and preview[side] or {}
+    local image_path = side == "base" and vim.b[bufnr].gh_pr_image_base_path or vim.b[bufnr].gh_pr_image_head_path
+    local default_path = normalize_path(type(entry.path) == "string" and entry.path ~= "" and entry.path or image_path or "")
+    local present = entry.present
+    if type(present) ~= "boolean" then
+      present = non_text_preview.side_present_for_status(status, side)
+    end
+    entry.side = side
+    entry.present = present
+    entry.path = default_path
+    entry.size = tonumber(entry.size) or ((side == current_side) and (tonumber(vim.b[bufnr].gh_pr_image_size) or 0) or 0)
+    entry.sha = type(entry.sha) == "string" and entry.sha or ((side == current_side) and safe_string(vim.b[bufnr].gh_pr_image_sha) or "")
+    entry.ext = type(entry.ext) == "string" and entry.ext or ((side == current_side) and safe_string(vim.b[bufnr].gh_pr_image_ext):lower() or "")
+    entry.cache_path = type(entry.cache_path) == "string" and entry.cache_path or ((side == current_side) and safe_string(vim.b[bufnr].gh_pr_image_cache_path) or "")
+    preview[side] = entry
+    return entry
+  end
+
+  local base_entry = ensure_preview_side("base")
+  local head_entry = ensure_preview_side("head")
 
   return {
     bufnr = bufnr,
     number = number,
+    asset_kind = asset_kind,
+    is_image = asset_kind == "image",
+    is_non_text = true,
     repo = type(vim.b[bufnr].gh_pr_repo) == "string" and vim.b[bufnr].gh_pr_repo or "",
     kind = type(vim.b[bufnr].gh_pr_file_kind) == "string" and vim.b[bufnr].gh_pr_file_kind or "",
     file_path = normalize_path(vim.b[bufnr].gh_pr_file_path or ""),
     path = normalize_path(vim.b[bufnr].gh_pr_path or ""),
-    side = type(vim.b[bufnr].gh_pr_image_side) == "string" and vim.b[bufnr].gh_pr_image_side or "",
-    status = type(vim.b[bufnr].gh_pr_image_status) == "string" and vim.b[bufnr].gh_pr_image_status:lower() or "",
-    reason = type(vim.b[bufnr].gh_pr_image_reason) == "string" and vim.b[bufnr].gh_pr_image_reason or "",
+    side = current_side,
+    status = status,
+    reason = type(vim.b[bufnr].gh_pr_image_reason) == "string" and vim.b[bufnr].gh_pr_image_reason
+      or (type(preview.reason) == "string" and preview.reason or ""),
     pr_url = trim_trailing_slash(vim.b[bufnr].gh_pr_pr_url),
     pr_files_url = trim_trailing_slash(vim.b[bufnr].gh_pr_pr_files_url),
-    base_path = normalize_path(vim.b[bufnr].gh_pr_image_base_path or ""),
-    head_path = normalize_path(vim.b[bufnr].gh_pr_image_head_path or ""),
+    base_path = base_entry.path,
+    head_path = head_entry.path,
     cache_path = type(vim.b[bufnr].gh_pr_image_cache_path) == "string" and vim.b[bufnr].gh_pr_image_cache_path or "",
     size = tonumber(vim.b[bufnr].gh_pr_image_size) or 0,
     sha = type(vim.b[bufnr].gh_pr_image_sha) == "string" and vim.b[bufnr].gh_pr_image_sha or "",
     ext = type(vim.b[bufnr].gh_pr_image_ext) == "string" and vim.b[bufnr].gh_pr_image_ext:lower() or "",
+    preview = preview,
   }, nil
 end
 
-local function find_cached_image_asset(ctx, side)
+function non_text_preview.resolve_image_buffer_context(bufnr)
+  local ctx, err = non_text_preview.resolve_buffer_context(bufnr)
+  if not ctx then
+    return nil, err
+  end
+  if ctx.asset_kind ~= "image" then
+    return nil, "Current buffer is not an image diff buffer"
+  end
+  return ctx, nil
+end
+
+function non_text_preview.find_cached_image_asset(ctx, side)
   if side == ctx.side and file_readable(ctx.cache_path) then
     return {
       side = side,
-      path = image_path_for_side(ctx, side),
+      path = non_text_preview.path_for_side(ctx, side),
       cache_path = ctx.cache_path,
       size = ctx.size,
       sha = ctx.sha,
@@ -941,8 +1109,8 @@ local function find_cached_image_asset(ctx, side)
   return nil
 end
 
-local function fetch_and_cache_image_asset(details, ctx, side, images_cfg)
-  local side_path = image_path_for_side(ctx, side)
+function non_text_preview.fetch_and_cache_image_asset(details, ctx, side, images_cfg)
+  local side_path = non_text_preview.path_for_side(ctx, side)
   if side_path == "" then
     return nil, string.format("Missing %s image path", side)
   end
@@ -952,7 +1120,7 @@ local function fetch_and_cache_image_asset(details, ctx, side, images_cfg)
     return nil, string.format("Missing %s ref for pull request", side)
   end
 
-  local repository = resolve_side_repository(details, side, ctx.repo)
+  local repository = non_text_preview.resolve_side_repository(details, side, ctx.repo)
   if not repository then
     return nil, string.format("Unable to resolve %s repository", side)
   end
@@ -1009,16 +1177,16 @@ local function fetch_and_cache_image_asset(details, ctx, side, images_cfg)
   }, nil
 end
 
-local function ensure_image_side_asset(ctx, side, images_cfg)
-  if not side_present_for_status(ctx.status, side) then
+function non_text_preview.ensure_image_side_asset(ctx, side, images_cfg)
+  if not non_text_preview.side_present_for_status(ctx.status, side) then
     return {
       side = side,
       present = false,
-      path = image_path_for_side(ctx, side),
+      path = non_text_preview.path_for_side(ctx, side),
     }, nil
   end
 
-  local cached = find_cached_image_asset(ctx, side)
+  local cached = non_text_preview.find_cached_image_asset(ctx, side)
   if cached then
     cached.present = true
     return cached, nil
@@ -1029,7 +1197,7 @@ local function ensure_image_side_asset(ctx, side, images_cfg)
     return nil, details_err
   end
 
-  local fetched, fetch_err = fetch_and_cache_image_asset(details, ctx, side, images_cfg)
+  local fetched, fetch_err = non_text_preview.fetch_and_cache_image_asset(details, ctx, side, images_cfg)
   if not fetched then
     return nil, fetch_err
   end
@@ -1042,6 +1210,168 @@ local function ensure_image_side_asset(ctx, side, images_cfg)
     vim.b[ctx.bufnr].gh_pr_image_ext = fetched.ext
   end
   return fetched, nil
+end
+
+function non_text_preview.cached_binary_side_asset(ctx, side)
+  local entry = type(ctx.preview) == "table" and type(ctx.preview[side]) == "table" and ctx.preview[side] or nil
+  if entry and file_readable(entry.cache_path) then
+    return {
+      side = side,
+      present = entry.present ~= false,
+      path = entry.path,
+      cache_path = entry.cache_path,
+      size = tonumber(entry.size) or 0,
+      sha = type(entry.sha) == "string" and entry.sha or "",
+      ext = type(entry.ext) == "string" and entry.ext or "",
+    }
+  end
+
+  local target_path = normalize_path(ctx.file_path ~= "" and ctx.file_path or ctx.path)
+  for _, candidate in ipairs(vim.api.nvim_list_bufs()) do
+    if candidate ~= ctx.bufnr
+      and is_valid_buf(candidate)
+      and vim.b[candidate].gh_pr_is_non_text == true
+      and vim.b[candidate].gh_pr_asset_kind == "binary" then
+      local candidate_number = tonumber(vim.b[candidate].gh_pr_number)
+      local candidate_path = normalize_path(vim.b[candidate].gh_pr_file_path or vim.b[candidate].gh_pr_path or "")
+      if candidate_number == ctx.number and (candidate_path == "" or target_path == "" or candidate_path == target_path) then
+        local preview = type(vim.b[candidate].gh_pr_asset_preview) == "table" and vim.b[candidate].gh_pr_asset_preview or {}
+        local side_entry = type(preview[side]) == "table" and preview[side] or nil
+        if side_entry and file_readable(side_entry.cache_path) then
+          return {
+            side = side,
+            present = side_entry.present ~= false,
+            path = normalize_path(side_entry.path),
+            cache_path = side_entry.cache_path,
+            size = tonumber(side_entry.size) or 0,
+            sha = type(side_entry.sha) == "string" and side_entry.sha or "",
+            ext = type(side_entry.ext) == "string" and side_entry.ext or "",
+          }
+        end
+      end
+    end
+  end
+
+  return nil
+end
+
+function non_text_preview.binary_asset_cache_path(ctx, side, path, sha)
+  local repo_slug = sanitize_filename(ctx.repo ~= "" and ctx.repo or ("pr-" .. tostring(ctx.number)))
+  local filename = sanitize_filename((path:match("([^/]+)$") or (side .. "-asset")))
+  local cache_root = joinpath(vim.fn.stdpath("cache"), "gh-pr", "assets", repo_slug, tostring(ctx.number))
+  if not non_text_preview.ensure_dir(cache_root) then
+    return nil, "Unable to prepare binary asset cache directory"
+  end
+  local hash = type(sha) == "string" and sha ~= "" and sha:sub(1, 12) or "unknown"
+  return joinpath(cache_root, string.format("%s-%s-%s", side, hash, filename)), nil
+end
+
+function non_text_preview.fetch_and_cache_binary_asset(details, ctx, side)
+  local side_path = non_text_preview.path_for_side(ctx, side)
+  if side_path == "" then
+    return nil, string.format("Missing %s asset path", side)
+  end
+
+  local side_ref = side == "base" and details.baseRefName or details.headRefName
+  if type(side_ref) ~= "string" or side_ref == "" then
+    return nil, string.format("Missing %s ref for pull request", side)
+  end
+
+  local repository = non_text_preview.resolve_side_repository(details, side, ctx.repo)
+  if not repository then
+    return nil, string.format("Unable to resolve %s repository", side)
+  end
+
+  local api = string.format(
+    "repos/%s/%s/contents/%s?ref=%s",
+    repository.owner,
+    repository.name,
+    encode_path(side_path),
+    url_encode(side_ref)
+  )
+  local payload, payload_err = gh.run_json({ "api", api })
+  if not payload then
+    return nil, payload_err
+  end
+
+  local encoding = type(payload.encoding) == "string" and payload.encoding or ""
+  local content = type(payload.content) == "string" and payload.content or ""
+  if encoding ~= "base64" or content == "" then
+    return nil, string.format("Unable to decode %s asset bytes from GitHub contents API", side)
+  end
+
+  local bytes = non_text_preview.decode_base64(content)
+  if bytes == "" then
+    return nil, string.format("Unable to decode %s asset bytes from base64 payload", side)
+  end
+
+  local size = tonumber(payload.size) or #bytes
+  local sha = type(payload.sha) == "string" and payload.sha or ""
+  local ext = normalize_path(side_path):match("%.([^.]+)$")
+  ext = type(ext) == "string" and ext:lower() or ""
+  local cache_path, cache_err = non_text_preview.binary_asset_cache_path(ctx, side, side_path, sha)
+  if not cache_path then
+    return nil, cache_err
+  end
+  local ok_write, write_err = non_text_preview.write_binary_file(cache_path, bytes)
+  if not ok_write then
+    return nil, write_err
+  end
+  return {
+    side = side,
+    present = true,
+    path = side_path,
+    cache_path = cache_path,
+    size = size,
+    sha = sha,
+    ext = ext,
+  }, nil
+end
+
+function non_text_preview.ensure_binary_side_asset(ctx, side)
+  if not non_text_preview.side_present_for_status(ctx.status, side) then
+    return {
+      side = side,
+      present = false,
+      path = non_text_preview.path_for_side(ctx, side),
+    }, nil
+  end
+
+  local cached = non_text_preview.cached_binary_side_asset(ctx, side)
+  if cached then
+    return cached, nil
+  end
+
+  local _, details, details_err = resolve_active_pr(ctx.number, { refresh = false })
+  if not details then
+    return nil, details_err
+  end
+
+  local fetched, fetch_err = non_text_preview.fetch_and_cache_binary_asset(details, ctx, side)
+  if not fetched then
+    return nil, fetch_err
+  end
+
+  if is_valid_buf(ctx.bufnr) then
+    local preview = type(vim.b[ctx.bufnr].gh_pr_asset_preview) == "table" and vim.deepcopy(vim.b[ctx.bufnr].gh_pr_asset_preview) or {}
+    local entry = type(preview[side]) == "table" and preview[side] or {}
+    entry.present = true
+    entry.path = fetched.path
+    entry.cache_path = fetched.cache_path
+    entry.size = fetched.size
+    entry.sha = fetched.sha
+    entry.ext = fetched.ext
+    preview[side] = entry
+    vim.b[ctx.bufnr].gh_pr_asset_preview = preview
+  end
+  return fetched, nil
+end
+
+function non_text_preview.ensure_side_asset(ctx, side, images_cfg)
+  if ctx.asset_kind == "image" then
+    return non_text_preview.ensure_image_side_asset(ctx, side, images_cfg)
+  end
+  return non_text_preview.ensure_binary_side_asset(ctx, side)
 end
 
 local function ensure_open_target(target, label)
@@ -1151,6 +1481,84 @@ local function sanitize_filename(value)
     end
   end
   return name
+end
+
+non_text_preview.base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+function non_text_preview.decode_base64_fallback(data)
+  data = (data or ""):gsub("[^" .. non_text_preview.base64_chars .. "=]", "")
+  return (data:gsub(".", function(char)
+    if char == "=" then
+      return ""
+    end
+    local index = non_text_preview.base64_chars:find(char, 1, true)
+    if not index then
+      return ""
+    end
+    local bits = ""
+    local value = index - 1
+    for bit = 6, 1, -1 do
+      if value % (2 ^ bit) - value % (2 ^ (bit - 1)) > 0 then
+        bits = bits .. "1"
+      else
+        bits = bits .. "0"
+      end
+    end
+    return bits
+  end):gsub("%d%d%d?%d?%d?%d?%d?%d?", function(byte)
+    if #byte ~= 8 then
+      return ""
+    end
+    local value = 0
+    for bit = 1, 8 do
+      if byte:sub(bit, bit) == "1" then
+        value = value + 2 ^ (8 - bit)
+      end
+    end
+    return string.char(value)
+  end))
+end
+
+function non_text_preview.decode_base64(data)
+  local normalized = type(data) == "string" and data:gsub("\n", "") or ""
+  if normalized == "" then
+    return ""
+  end
+  if vim.base64 and type(vim.base64.decode) == "function" then
+    local ok, decoded = pcall(vim.base64.decode, normalized)
+    if ok and type(decoded) == "string" then
+      return decoded
+    end
+  end
+  return non_text_preview.decode_base64_fallback(normalized)
+end
+
+function non_text_preview.ensure_dir(path)
+  if type(path) ~= "string" or path == "" then
+    return false
+  end
+  vim.fn.mkdir(path, "p")
+  return vim.fn.isdirectory(path) == 1
+end
+
+function non_text_preview.write_binary_file(path, bytes)
+  if type(path) ~= "string" or path == "" then
+    return false, "Missing cache path"
+  end
+  local parent = path:match("^(.*)[/\\][^/\\]+$") or ""
+  if parent ~= "" and not non_text_preview.ensure_dir(parent) then
+    return false, "Unable to prepare asset cache directory"
+  end
+  local fd, open_err = uv.fs_open(path, "w", 438)
+  if not fd then
+    return false, tostring(open_err or "Unable to open asset cache file")
+  end
+  local ok_write, write_err = uv.fs_write(fd, bytes or "", 0)
+  uv.fs_close(fd)
+  if not ok_write then
+    return false, tostring(write_err or "Unable to write asset cache file")
+  end
+  return true, nil
 end
 
 local function extension_from_name(name)
@@ -1807,12 +2215,12 @@ local function write_readonly_buffer_lines(bufnr, lines, filetype)
 end
 
 local function collect_image_metadata_for_side(ctx, side, images_cfg)
-  local asset, asset_err = ensure_image_side_asset(ctx, side, images_cfg)
+  local asset, asset_err = non_text_preview.ensure_image_side_asset(ctx, side, images_cfg)
   if not asset then
     return {
       side = side,
-      present = side_present_for_status(ctx.status, side),
-      path = image_path_for_side(ctx, side),
+      present = non_text_preview.side_present_for_status(ctx.status, side),
+      path = non_text_preview.path_for_side(ctx, side),
       error = tostring(asset_err or "Unable to load image asset"),
     }
   end
@@ -1876,14 +2284,17 @@ local function append_side_metadata_lines(lines, prefix, label, entry)
 end
 
 local function render_image_metadata_diff(bufnr, reason_override)
-  local ctx, ctx_err = resolve_image_buffer_context(bufnr)
+  local ctx, ctx_err = non_text_preview.resolve_buffer_context(bufnr)
   if not ctx then
     return false, ctx_err
   end
+  if ctx.asset_kind ~= "image" then
+    return true, nil
+  end
 
-  local images_cfg = image_diff_options()
+  local images_cfg = non_text_preview.image_diff_options()
   local diff_shortcuts = diff_view_shortcuts()
-  local default_action = resolve_image_default_action(images_cfg)
+  local default_action = non_text_preview.resolve_default_action(images_cfg)
   local compare_url = resolve_image_compare_url(ctx, images_cfg)
   local reason = type(reason_override) == "string" and reason_override ~= "" and reason_override or ctx.reason
   local default_key = type(diff_shortcuts.image_default_action) == "string" and diff_shortcuts.image_default_action or "<localleader>io"
@@ -1898,7 +2309,7 @@ local function render_image_metadata_diff(bufnr, reason_override)
     "",
     string.format("path: %s", display_path ~= "" and display_path or "(unknown)"),
     string.format("status: %s", ctx.status ~= "" and ctx.status or "unknown"),
-    string.format("default action (%s): %s", default_key ~= "" and default_key or "<localleader>io", image_action_label(default_action)),
+    string.format("default action (%s): %s", default_key ~= "" and default_key or "<localleader>io", non_text_preview.action_label(default_action)),
     string.format("fallback menu (%s): image actions", fallback_key ~= "" and fallback_key or "<localleader>im"),
   }
   if reason ~= "" then
@@ -1933,32 +2344,35 @@ end
 
 local function run_image_fallback_action(action, bufnr, opts)
   opts = type(opts) == "table" and opts or {}
-  local ctx, ctx_err = resolve_image_buffer_context(bufnr)
+  local ctx, ctx_err = non_text_preview.resolve_buffer_context(bufnr)
   if not ctx then
     return false, ctx_err
   end
 
-  local images_cfg = image_diff_options()
-  local requested = normalize_image_action(action, resolve_image_default_action(images_cfg))
+  local images_cfg = non_text_preview.image_diff_options()
+  local requested = non_text_preview.normalize_image_action(action, non_text_preview.resolve_default_action(images_cfg))
   local reason = type(opts.reason) == "string" and opts.reason ~= "" and opts.reason or ctx.reason
 
   if requested == "metadata" then
+    if ctx.asset_kind ~= "image" then
+      return true, nil
+    end
     return render_image_metadata_diff(ctx.bufnr, reason)
   end
 
   if requested == "open_local_current" then
-    local side = current_image_side(ctx)
-    local asset, asset_err = ensure_image_side_asset(ctx, side, images_cfg)
+    local side = non_text_preview.current_side(ctx)
+    local asset, asset_err = non_text_preview.ensure_side_asset(ctx, side, images_cfg)
     if not asset then
       return false, asset_err
     end
     if asset.present == false then
-      return false, string.format("No %s image exists for this pull request file state", side)
+      return false, string.format("No %s revision exists for this pull request file state", side)
     end
     if not file_readable(asset.cache_path) then
-      return false, "Unable to resolve a local image file to open"
+      return false, "Unable to resolve a local asset file to open"
     end
-    return ensure_open_target(asset.cache_path, "local image")
+    return ensure_open_target(asset.cache_path, "local asset")
   end
 
   if requested == "open_local_both" then
@@ -1966,12 +2380,12 @@ local function run_image_fallback_action(action, bufnr, opts)
     local opened_count = 0
     local errors = {}
     for _, side in ipairs({ "base", "head" }) do
-      local asset, asset_err = ensure_image_side_asset(ctx, side, images_cfg)
+      local asset, asset_err = non_text_preview.ensure_side_asset(ctx, side, images_cfg)
       if not asset then
         errors[#errors + 1] = string.format("%s: %s", side, tostring(asset_err))
       elseif asset.present and file_readable(asset.cache_path) then
         if not opened_paths[asset.cache_path] then
-          local ok_open, open_err = ensure_open_target(asset.cache_path, side .. " image")
+          local ok_open, open_err = ensure_open_target(asset.cache_path, side .. " asset")
           if ok_open then
             opened_paths[asset.cache_path] = true
             opened_count = opened_count + 1
@@ -1990,23 +2404,23 @@ local function run_image_fallback_action(action, bufnr, opts)
     if #errors > 0 then
       return false, table.concat(errors, " | ")
     end
-    return false, "No local images available to open"
+    return false, "No local revisions available to open"
   end
 
   if requested == "open_github" then
     local url = resolve_image_compare_url(ctx, images_cfg)
     if url == "" then
-      return false, "Unable to resolve GitHub comparison URL for this image"
+      return false, "Unable to resolve GitHub URL for this file"
     end
-    return ensure_open_target(url, "GitHub comparison URL")
+    return ensure_open_target(url, "GitHub file URL")
   end
 
-  return false, "Unsupported image fallback action: " .. tostring(requested)
+  return false, "Unsupported non-text preview action: " .. tostring(requested)
 end
 
 local function execute_image_fallback_action(action, bufnr, opts)
   opts = type(opts) == "table" and opts or {}
-  local requested = normalize_image_action(action, "metadata")
+  local requested = non_text_preview.normalize_image_action(action, "metadata")
   local ok_action, action_err = run_image_fallback_action(requested, bufnr, opts)
   if ok_action then
     return true, nil
@@ -2019,7 +2433,7 @@ local function execute_image_fallback_action(action, bufnr, opts)
     })
     if ok_metadata then
       notify_warn(string.format(
-        "Image fallback action '%s' failed (%s). Rendered metadata diff instead.",
+        "Non-text preview action '%s' failed (%s). Rendered metadata preview instead.",
         requested,
         tostring(action_err)
       ))
@@ -2032,13 +2446,13 @@ local function execute_image_fallback_action(action, bufnr, opts)
 end
 
 local function close_image_fallback_menu()
-  if type(image_fallback_menu_state) ~= "table" then
-    image_fallback_menu_state = nil
+  if type(non_text_preview.menu_state) ~= "table" then
+    non_text_preview.menu_state = nil
     return
   end
 
-  local winid = image_fallback_menu_state.winid
-  image_fallback_menu_state = nil
+  local winid = non_text_preview.menu_state.winid
+  non_text_preview.menu_state = nil
   if is_valid_win(winid) then
     pcall(vim.api.nvim_win_close, winid, true)
   end
@@ -2053,10 +2467,10 @@ local function current_menu_action(state_value)
 end
 
 local function run_menu_action(state_value, action, set_default)
-  local action_id = normalize_image_action(action, resolve_image_default_action(image_diff_options()))
+  local action_id = non_text_preview.normalize_image_action(action, non_text_preview.resolve_default_action(non_text_preview.image_diff_options()))
   if set_default == true then
-    persist_image_default_action(action_id)
-    notify_info("Image fallback default action set to: " .. image_action_label(action_id))
+    non_text_preview.persist_default_action(action_id)
+    notify_info("Non-text preview default action set to: " .. non_text_preview.action_label(action_id))
   end
 
   local origin_winid = state_value.origin_winid
@@ -2076,7 +2490,7 @@ end
 
 function M.open_image_fallback_menu()
   local origin_bufnr = vim.api.nvim_get_current_buf()
-  local ctx, ctx_err = resolve_image_buffer_context(origin_bufnr)
+  local ctx, ctx_err = non_text_preview.resolve_buffer_context(origin_bufnr)
   if not ctx then
     return notify_error(ctx_err)
   end
@@ -2084,21 +2498,22 @@ function M.open_image_fallback_menu()
   local origin_winid = vim.api.nvim_get_current_win()
   close_image_fallback_menu()
 
-  local images_cfg = image_diff_options()
+  local images_cfg = non_text_preview.image_diff_options()
   local diff_shortcuts = diff_view_shortcuts()
-  local default_action = resolve_image_default_action(images_cfg)
+  local default_action = non_text_preview.resolve_default_action(images_cfg)
   local default_key = type(diff_shortcuts.image_default_action) == "string" and diff_shortcuts.image_default_action or "<localleader>io"
   local fallback_key = type(diff_shortcuts.image_fallback_menu) == "string" and diff_shortcuts.image_fallback_menu
     or "<localleader>im"
   local reason = type(vim.b[origin_bufnr].gh_pr_image_reason) == "string" and vim.b[origin_bufnr].gh_pr_image_reason or ""
+  local asset_label = ctx.asset_kind == "image" and "image" or "non-text"
 
   local lines = {
-    "gh-pr image fallback actions",
+    string.format("gh-pr %s preview actions", asset_label),
     "Enter/1..4: run action | d: set default | s: set default + run | q: close",
     string.rep("=", 74),
     string.format("file: %s", ctx.file_path ~= "" and ctx.file_path or ctx.path),
     string.format("status: %s", ctx.status ~= "" and ctx.status or "unknown"),
-    string.format("default (%s): %s", default_key ~= "" and default_key or "<localleader>io", image_action_label(default_action)),
+    string.format("default (%s): %s", default_key ~= "" and default_key or "<localleader>io", non_text_preview.action_label(default_action)),
     string.format("menu keymap: %s", fallback_key ~= "" and fallback_key or "<localleader>im"),
   }
   if reason ~= "" then
@@ -2107,9 +2522,9 @@ function M.open_image_fallback_menu()
   lines[#lines + 1] = ""
 
   local line_actions = {}
-  for index, action in ipairs(IMAGE_FALLBACK_ACTION_ORDER) do
+  for index, action in ipairs(non_text_preview.action_order) do
     local marker = action == default_action and "*" or " "
-    lines[#lines + 1] = string.format("%d. [%s] %s", index, marker, image_action_label(action))
+    lines[#lines + 1] = string.format("%d. [%s] %s", index, marker, non_text_preview.action_label(action))
     line_actions[#lines] = action
   end
 
@@ -2131,7 +2546,7 @@ function M.open_image_fallback_menu()
     height = height,
     style = "minimal",
     border = "rounded",
-    title = "Image Fallback",
+    title = asset_label == "image" and "Image Preview" or "Non-Text Preview",
     title_pos = "center",
     noautocmd = true,
   })
@@ -2153,13 +2568,13 @@ function M.open_image_fallback_menu()
   vim.api.nvim_win_set_option(menu_win, "signcolumn", "no")
   vim.api.nvim_win_set_option(menu_win, "winhl", "NormalFloat:NormalFloat,FloatBorder:FloatBorder")
 
-  image_fallback_menu_state = {
+  non_text_preview.menu_state = {
     bufnr = menu_buf,
     winid = menu_win,
     origin_winid = origin_winid,
     origin_bufnr = origin_bufnr,
     line_actions = line_actions,
-    first_action_line = #lines - #IMAGE_FALLBACK_ACTION_ORDER + 1,
+    first_action_line = #lines - #non_text_preview.action_order + 1,
   }
 
   local keymap_opts = {
@@ -2171,18 +2586,18 @@ function M.open_image_fallback_menu()
   vim.keymap.set("n", "q", close_image_fallback_menu, vim.tbl_extend("force", keymap_opts, { desc = "Close image fallback menu" }))
   vim.keymap.set("n", "<Esc>", close_image_fallback_menu, vim.tbl_extend("force", keymap_opts, { desc = "Close image fallback menu" }))
   vim.keymap.set("n", "<CR>", function()
-    local active = image_fallback_menu_state
+    local active = non_text_preview.menu_state
     local action = current_menu_action(active)
     if action then
       run_menu_action(active, action, false)
     end
   end, vim.tbl_extend("force", keymap_opts, { desc = "Run selected image fallback action" }))
   vim.keymap.set("n", "d", function()
-    local active = image_fallback_menu_state
+    local active = non_text_preview.menu_state
     local action = current_menu_action(active)
     if action then
-      persist_image_default_action(action)
-      notify_info("Image fallback default action set to: " .. image_action_label(action))
+      non_text_preview.persist_default_action(action)
+      notify_info("Non-text preview default action set to: " .. non_text_preview.action_label(action))
       local origin_winid = active.origin_winid
       close_image_fallback_menu()
       if is_valid_win(origin_winid) then
@@ -2192,17 +2607,17 @@ function M.open_image_fallback_menu()
     end
   end, vim.tbl_extend("force", keymap_opts, { desc = "Set selected action as default" }))
   vim.keymap.set("n", "s", function()
-    local active = image_fallback_menu_state
+    local active = non_text_preview.menu_state
     local action = current_menu_action(active)
     if action then
       run_menu_action(active, action, true)
     end
   end, vim.tbl_extend("force", keymap_opts, { desc = "Set selected action as default and run it" }))
 
-  for index, action in ipairs(IMAGE_FALLBACK_ACTION_ORDER) do
+  for index, action in ipairs(non_text_preview.action_order) do
     local action_id = action
     vim.keymap.set("n", tostring(index), function()
-      local active = image_fallback_menu_state
+      local active = non_text_preview.menu_state
       if active then
         run_menu_action(active, action_id, false)
       end
@@ -2213,22 +2628,22 @@ function M.open_image_fallback_menu()
     pattern = tostring(menu_win),
     once = true,
     callback = function()
-      image_fallback_menu_state = nil
+      non_text_preview.menu_state = nil
     end,
   })
 
-  pcall(vim.api.nvim_win_set_cursor, menu_win, { image_fallback_menu_state.first_action_line, 0 })
+  pcall(vim.api.nvim_win_set_cursor, menu_win, { non_text_preview.menu_state.first_action_line, 0 })
 end
 
 function M.run_image_fallback_default_action()
   local bufnr = vim.api.nvim_get_current_buf()
-  local _, ctx_err = resolve_image_buffer_context(bufnr)
+  local _, ctx_err = non_text_preview.resolve_buffer_context(bufnr)
   if ctx_err then
     return notify_error(ctx_err)
   end
 
-  local images_cfg = image_diff_options()
-  local action = resolve_image_default_action(images_cfg)
+  local images_cfg = non_text_preview.image_diff_options()
+  local action = non_text_preview.resolve_default_action(images_cfg)
   local ok_action, action_err = execute_image_fallback_action(action, bufnr, {
     fallback_to_metadata = true,
   })
@@ -2237,13 +2652,43 @@ function M.run_image_fallback_default_action()
   end
 end
 
+function M.run_non_text_default_action()
+  return M.run_image_fallback_default_action()
+end
+
+function M.open_non_text_actions_menu()
+  return M.open_image_fallback_menu()
+end
+
+function M.run_non_text_action_at_cursor()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local ctx, ctx_err = non_text_preview.resolve_buffer_context(bufnr)
+  if not ctx then
+    return notify_error(ctx_err)
+  end
+
+  local line = vim.api.nvim_win_get_cursor(0)[1]
+  local actions = type(vim.b[bufnr].gh_pr_asset_actions) == "table" and vim.b[bufnr].gh_pr_asset_actions or {}
+  local action = actions[line]
+  if type(action) ~= "string" or action == "" then
+    return
+  end
+
+  local ok_action, action_err = execute_image_fallback_action(action, bufnr, {
+    fallback_to_metadata = ctx.asset_kind == "image",
+  })
+  if not ok_action then
+    notify_error(action_err)
+  end
+end
+
 function M.on_image_render_fallback(bufnr, reason)
-  local ctx, ctx_err = resolve_image_buffer_context(bufnr)
+  local ctx, ctx_err = non_text_preview.resolve_image_buffer_context(bufnr)
   if not ctx then
     return notify_warn(ctx_err)
   end
 
-  local images_cfg = image_diff_options()
+  local images_cfg = non_text_preview.image_diff_options()
   local mode = images_cfg.fallback_mode
   if mode ~= "menu" and mode ~= "metadata_only" and mode ~= "auto_local" and mode ~= "auto_github" then
     mode = "menu"
@@ -2265,7 +2710,7 @@ function M.on_image_render_fallback(bufnr, reason)
   end
 
   if mode == "auto_local" then
-    local preferred = resolve_image_default_action(images_cfg)
+    local preferred = non_text_preview.resolve_default_action(images_cfg)
     if preferred ~= "open_local_current" and preferred ~= "open_local_both" then
       preferred = "open_local_current"
     end
@@ -2274,7 +2719,7 @@ function M.on_image_render_fallback(bufnr, reason)
       reason = reason,
     })
     if not ok_action then
-      notify_warn("Image fallback auto-local failed: " .. tostring(action_err))
+        notify_warn("Non-text preview auto-local failed: " .. tostring(action_err))
     end
     return
   end
@@ -2285,13 +2730,13 @@ function M.on_image_render_fallback(bufnr, reason)
       reason = reason,
     })
     if not ok_action then
-      notify_warn("Image fallback auto-github failed: " .. tostring(action_err))
+        notify_warn("Non-text preview auto-github failed: " .. tostring(action_err))
     end
     return
   end
 
   local diff_shortcuts = diff_view_shortcuts()
-  local default_action = resolve_image_default_action(images_cfg)
+  local default_action = non_text_preview.resolve_default_action(images_cfg)
   local default_key = type(diff_shortcuts.image_default_action) == "string" and diff_shortcuts.image_default_action or "<localleader>io"
   local fallback_key = type(diff_shortcuts.image_fallback_menu) == "string" and diff_shortcuts.image_fallback_menu
     or "<localleader>im"
@@ -2456,6 +2901,8 @@ local function resolve_comment_target(target)
   local popup_thread = nil
   if type(popup_comments) == "table" then
     popup_thread = {
+      pr_number = tonumber(pr.number),
+      details = details,
       thread_id = type(target.thread_id) == "string" and target.thread_id ~= ""
           and target.thread_id
         or string.format("line:%s:%s:%s", path, side, tostring(line or 0)),
@@ -2477,8 +2924,14 @@ local function resolve_comment_target(target)
           created_at = type(item.created_at) == "string" and item.created_at or "",
           body = type(item.body) == "string" and item.body or "",
           url = type(item.url) == "string" and item.url or "",
-          state = type(item.state) == "string" and item.state or "",
-          outdated = item.outdated == true,
+        state = type(item.state) == "string" and item.state or "",
+        outdated = item.outdated == true,
+        is_pending = item.is_pending == true,
+        viewer_did_author = item.viewer_did_author == true,
+        reaction_groups = type(item.reaction_groups) == "table" and vim.deepcopy(item.reaction_groups) or {},
+        path = type(item.path) == "string" and item.path ~= "" and item.path or path,
+        line = tonumber(item.line) or tonumber(target.line) or tonumber(line),
+        original_line = tonumber(item.original_line) or tonumber(target.original_line) or tonumber(line),
         }
       end
     end
@@ -2518,6 +2971,26 @@ function M.activate_pr(number, refresh)
     return nil, nil, err
   end
   return pr, details, nil
+end
+
+function M.refresh_after_thread_popup_mutation(pr_number, details, opts)
+  opts = type(opts) == "table" and opts or {}
+  local number = tonumber(pr_number or vim.b.gh_pr_number)
+  local resolved_details = type(details) == "table" and details or nil
+
+  if number and not resolved_details then
+    local _, fresh_details = resolve_active_pr(number, { refresh = false })
+    resolved_details = type(fresh_details) == "table" and fresh_details or nil
+  end
+
+  if number and resolved_details then
+    refresh_line_comments_for_pr(number, resolved_details)
+  end
+
+  refresh_pr_sources_after_state_change({
+    force = opts.force ~= false,
+  })
+  refresh_diff_comments_panel_after_state_change()
 end
 
 function M.open_comment_location(target, opts)
@@ -2600,6 +3073,118 @@ function M.preview_comment_location(target, opts)
   if preview_opts.keep_focus and valid_window(origin_window) and not popup_focused then
     pcall(vim.api.nvim_set_current_win, origin_window)
   end
+end
+
+function M.open_check_annotation_location(target, opts)
+  opts = type(opts) == "table" and opts or {}
+  local payload = type(target) == "table" and target or {}
+  local pr = type(payload.pr) == "table" and payload.pr or nil
+  local details = type(payload.details) == "table" and payload.details or nil
+  local annotation = type(payload.annotation) == "table" and payload.annotation or payload
+  local path = normalize_path(payload.target_path or annotation.path)
+  local line = positive_integer(payload.target_line, positive_integer(annotation.start_line, nil))
+  local check_url = safe_string(payload.check_url, safe_string(annotation.blob_href, ""))
+
+  if pr and details then
+    state.set_active_pr(pr, details)
+  elseif pr and not details then
+    state.set_active_pr(pr, pr)
+  end
+
+  if not details or not has_full_pr_details(details) then
+    local active_pr, active_details = state.get_active_pr()
+    if type(active_details) == "table" and has_full_pr_details(active_details) then
+      pr = type(active_pr) == "table" and active_pr or pr
+      details = active_details
+    end
+  end
+
+  local selected_file = resolve_file_in_details(details, path)
+  if not selected_file then
+    if check_url ~= "" then
+      url_open.open(check_url, {
+        notify_error = true,
+        context = "Unable to open check details",
+      })
+      return true
+    end
+    notify_error("Unable to resolve PR file for selected annotation")
+    return false
+  end
+
+  local context = nil
+  local annotations = type(payload.annotations) == "table" and payload.annotations or nil
+  if type(annotations) == "table" and not vim.tbl_isempty(annotations) then
+    context = {
+      check_key = safe_string(payload.check_key or annotation.check_key, ""),
+      check_name = safe_string(payload.check_name or annotation.check_name, ""),
+      annotations = vim.deepcopy(annotations),
+    }
+  end
+  if not context then
+    notify_warn("Selected check has no annotations to display on this diff")
+  end
+
+  return M.open_diff(selected_file, {
+    target_side = "head",
+    target_line = line,
+    target_original_line = line,
+    check_annotations_ctx = context,
+  })
+end
+
+function M.open_security_alert_location(target, opts)
+  opts = type(opts) == "table" and opts or {}
+  local payload = type(target) == "table" and target or {}
+  local pr = type(payload.pr) == "table" and payload.pr or nil
+  local details = type(payload.details) == "table" and payload.details or nil
+  local alert = type(payload.alert) == "table" and payload.alert or payload
+  local path = normalize_path(payload.target_path or alert.path)
+  local line = positive_integer(payload.target_line, positive_integer(alert.start_line, nil))
+  local alert_url = safe_string(payload.alert_url or alert.html_url, "")
+
+  if pr and details then
+    state.set_active_pr(pr, details)
+  elseif pr and not details then
+    state.set_active_pr(pr, pr)
+  end
+
+  if not details or not has_full_pr_details(details) then
+    local active_pr, active_details = state.get_active_pr()
+    if type(active_details) == "table" and has_full_pr_details(active_details) then
+      pr = type(active_pr) == "table" and active_pr or pr
+      details = active_details
+    end
+  end
+
+  local selected_file = resolve_file_in_details(details, path)
+  if not selected_file then
+    if alert_url ~= "" then
+      url_open.open(alert_url, {
+        notify_error = true,
+        context = "Unable to open code scanning alert",
+      })
+      return true
+    end
+    notify_error("Unable to resolve PR file for selected security alert")
+    return false
+  end
+
+  local context = nil
+  local alerts = type(payload.alerts) == "table" and payload.alerts or nil
+  if type(alerts) == "table" and not vim.tbl_isempty(alerts) then
+    context = {
+      alert_key = safe_string(payload.alert_key or alert.id or alert.number, ""),
+      alerts = vim.deepcopy(alerts),
+    }
+  end
+
+  return M.open_diff(selected_file, {
+    target_side = "head",
+    target_line = line,
+    target_original_line = line,
+    security_annotations_ctx = context,
+  })
 end
 
 local function timeline_kind_label(item)
@@ -3017,6 +3602,12 @@ local function set_codediff_buffer_keymap(bufnr, mode, lhs, rhs, desc)
   })
 end
 
+local function default_codediff_enter()
+  local prefix = vim.v.count > 0 and tostring(vim.v.count) or ""
+  local enter = vim.api.nvim_replace_termcodes("<CR>", true, false, true)
+  vim.api.nvim_feedkeys(prefix .. enter, "n", false)
+end
+
 local function apply_codediff_buffer_keymaps(bufnr)
   if not is_valid_buf(bufnr) then
     return
@@ -3072,6 +3663,11 @@ local function apply_codediff_buffer_keymaps(bufnr)
   set_codediff_buffer_keymap(bufnr, "n", shortcuts.line_comments_popup, function()
     line_comments.show_at_cursor(bufnr)
   end, "GH PR: show line comments")
+  set_codediff_buffer_keymap(bufnr, "n", "<CR>", function()
+    if not line_comments.show_at_cursor(bufnr, { notify_empty = false }) then
+      default_codediff_enter()
+    end
+  end, "GH PR: open line comments on commented lines")
   set_codediff_buffer_keymap(bufnr, "n", shortcuts.toggle_comments_panel, function()
     M.toggle_diff_comments_panel()
   end, "GH PR: toggle comments panel")
@@ -3109,6 +3705,12 @@ local function apply_codediff_buffer_metadata(bufnr, pr, details, path, side, fi
   vim.b[bufnr].gh_pr_file_mode = type(file_mode) == "string" and file_mode ~= "" and file_mode or nil
   vim.b[bufnr].gh_pr_diff_backend = "codediff"
   vim.b[bufnr].gh_pr_is_image = false
+  vim.b[bufnr].gh_pr_is_non_text = false
+  vim.b[bufnr].gh_pr_asset_kind = nil
+  vim.b[bufnr].gh_pr_asset_side = nil
+  vim.b[bufnr].gh_pr_asset_status = nil
+  vim.b[bufnr].gh_pr_asset_actions = nil
+  vim.b[bufnr].gh_pr_asset_preview = nil
   vim.b[bufnr].gh_pr_image_side = nil
   vim.b[bufnr].gh_pr_image_status = nil
   vim.b[bufnr].gh_pr_image_reason = nil
@@ -3116,6 +3718,8 @@ local function apply_codediff_buffer_metadata(bufnr, pr, details, path, side, fi
   vim.b[bufnr].gh_pr_unified_line_map = nil
   vim.b[bufnr].gh_pr_endline_map = nil
   vim.b[bufnr].gh_pr_comment_side = side
+  vim.b[bufnr].gh_pr_security_alerts = {}
+  vim.b[bufnr].gh_pr_active_security_alert_key = nil
   pcall(vim.api.nvim_set_option_value, "spell", false, { buf = bufnr })
 
   apply_codediff_buffer_keymaps(bufnr)
@@ -3166,6 +3770,10 @@ local function apply_codediff_open_result_context(pr, details, file, open_result
 
   local alternates = collect_alternate_paths(file, base_path, head_path)
   local comments_ctx = type(opts.comments_ctx) == "table" and opts.comments_ctx or nil
+  local check_annotations_ctx = type(opts.check_annotations_ctx) == "table" and opts.check_annotations_ctx or nil
+  local security_annotations_ctx = type(opts.security_annotations_ctx) == "table" and opts.security_annotations_ctx or nil
+  local annotation_renderer = require("gh-pr.check_annotations")
+  local security_annotation_renderer = require("gh-pr.security_annotations")
   local base_buf = tonumber(open_result.base_buf)
   local head_buf = tonumber(open_result.head_buf)
 
@@ -3187,6 +3795,8 @@ local function apply_codediff_open_result_context(pr, details, file, open_result
         max_popup_height = comments_ctx.max_popup_height,
       })
     end
+    annotation_renderer.clear_buffer(base_buf)
+    security_annotation_renderer.clear_buffer(base_buf)
   end
 
   if is_valid_buf(head_buf) then
@@ -3207,6 +3817,28 @@ local function apply_codediff_open_result_context(pr, details, file, open_result
         max_popup_height = comments_ctx.max_popup_height,
       })
     end
+    if check_annotations_ctx then
+      annotation_renderer.attach_to_buffer(head_buf, {
+        annotations = check_annotations_ctx.annotations,
+        check_key = check_annotations_ctx.check_key,
+        side = "head",
+        file_path = head_path,
+        alternate_paths = alternates,
+      })
+    else
+      annotation_renderer.clear_buffer(head_buf)
+    end
+    if security_annotations_ctx then
+      security_annotation_renderer.attach_to_buffer(head_buf, {
+        alerts = security_annotations_ctx.alerts,
+        alert_key = security_annotations_ctx.alert_key,
+        side = "head",
+        file_path = head_path,
+        alternate_paths = alternates,
+      })
+    else
+      security_annotation_renderer.clear_buffer(head_buf)
+    end
   end
 end
 
@@ -3215,6 +3847,9 @@ local function sync_diff_comments_panel(pr, details, comments_ctx)
   if ok_panel and type(panel.sync_for_diff) == "function" then
     local origin_win = vim.api.nvim_get_current_win()
     local origin_buf = vim.api.nvim_get_current_buf()
+    if vim.b[origin_buf].gh_pr_is_non_text == true then
+      return
+    end
     pcall(panel.sync_for_diff, {
       pr = pr,
       details = details,
@@ -3496,151 +4131,7 @@ local function resolve_workspace_code_window(tabpage, open_result, focus_side)
 end
 
 function M.open_overview_thread_workspace(payload, opts)
-  payload = type(payload) == "table" and payload or {}
-  opts = type(opts) == "table" and opts or {}
-
-  local pr, details, err = resolve_active_pr(payload.pr_number)
-  if not pr then
-    notify_error(err)
-    return false
-  end
-
-  local path = normalize_path(payload.path)
-  if path == "" then
-    notify_error("Unable to open thread workspace: missing file path")
-    return false
-  end
-
-  local selected_file = resolve_file_in_details(details, path)
-  if not selected_file then
-    notify_error("Unable to open thread workspace: file is no longer available in this PR")
-    return false
-  end
-
-  state.set_active_file(selected_file)
-
-  local focus_side = normalized_thread_side(payload.side)
-  local target_line = preferred_thread_line(focus_side, payload.line, payload.original_line)
-  local target_original_line = preferred_thread_line("base", payload.line, payload.original_line)
-  local comments_ctx = build_line_comment_context(pr.number)
-  local selected_path = normalize_path(selected_file.path or selected_file.filename)
-
-  local function finalize_workspace(open_result, backend)
-    open_result = type(open_result) == "table" and open_result or {}
-    local tabpage = tonumber(open_result.tabpage)
-    if not valid_tabpage(tabpage) then
-      tabpage = vim.api.nvim_get_current_tabpage()
-    end
-    if not valid_tabpage(tabpage) then
-      return nil, "Unable to resolve thread workspace tab"
-    end
-
-    local code_win = resolve_workspace_code_window(tabpage, open_result, focus_side)
-    if not is_valid_win(code_win) then
-      return nil, "Unable to resolve thread workspace diff window"
-    end
-
-    if backend == "virtual" then
-      local win_buf = vim.api.nvim_win_get_buf(code_win)
-      if is_valid_buf(win_buf) and type(target_line) == "number" and target_line > 0 then
-        pcall(vim.api.nvim_set_current_win, code_win)
-        restore_cursor_line(code_win, target_line)
-      end
-    end
-
-    local markdown_buf, _, panel_err = open_overview_thread_workspace_panel(tabpage, code_win, payload, pr.number)
-    if not markdown_buf then
-      return nil, panel_err
-    end
-
-    local seen = {}
-    for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
-      if is_valid_win(winid) then
-        pcall(vim.api.nvim_set_option_value, "spell", false, { win = winid })
-        local bufnr = vim.api.nvim_win_get_buf(winid)
-        if is_valid_buf(bufnr) and not seen[bufnr] then
-          seen[bufnr] = true
-          attach_workspace_close_keymaps(tabpage, bufnr)
-        end
-      end
-    end
-
-    if is_valid_win(code_win) then
-      pcall(vim.api.nvim_set_current_tabpage, tabpage)
-      pcall(vim.api.nvim_set_current_win, code_win)
-    end
-
-    return true, nil
-  end
-
-  local function open_with_codediff()
-    local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
-      details = details,
-      file = selected_file,
-      cache_scope = string.format(
-        "overview-thread|%d|%s|%s|%s",
-        pr.number,
-        safe_string(details.baseRefName),
-        safe_string(details.headRefName),
-        selected_path
-      ),
-      layout = "inline",
-      target_side = focus_side,
-      target_line = target_line,
-      target_original_line = target_original_line,
-    })
-    if not opened_result then
-      return nil, codediff_err
-    end
-
-    apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
-      comments_ctx = comments_ctx,
-    })
-    sync_diff_comments_panel(pr, details, comments_ctx)
-    return finalize_workspace(opened_result, "codediff")
-  end
-
-  local function open_with_virtual()
-    local diff_result, diff_err = virtual_files.open_diff(details, pr, selected_file, {
-      line_comments = comments_ctx,
-      view_mode = "unified",
-      ignore_whitespace = false,
-      render_whitespace = true,
-      render_endlines = false,
-      new_tab = true,
-    })
-    if diff_err then
-      return nil, diff_err
-    end
-
-    sync_diff_comments_panel(pr, details, comments_ctx)
-    local unified_or_single = type(diff_result) == "table"
-        and (tonumber(diff_result.unified_buf) or tonumber(diff_result.single_buf))
-      or nil
-    local open_result = {
-      mode = "file",
-      tabpage = vim.api.nvim_get_current_tabpage(),
-      head_buf = unified_or_single or (type(diff_result) == "table" and tonumber(diff_result.head_buf) or nil),
-      head_win = vim.api.nvim_get_current_win(),
-      base_buf = unified_or_single or (type(diff_result) == "table" and tonumber(diff_result.base_buf) or nil),
-      base_win = vim.api.nvim_get_current_win(),
-    }
-    return finalize_workspace(open_result, "virtual")
-  end
-
-  local opened, open_err = open_diff_with_forced_backend({
-    open_primary = open_with_codediff,
-    open_virtual = open_with_virtual,
-  })
-  if opened == false then
-    return false
-  end
-  if not opened then
-    notify_error(open_err)
-    return false
-  end
-
-  return true
+  return M.open_thread_comment_evolution_diff(payload, opts)
 end
 
 function M.open_commit_diff(commit, opts)
@@ -3810,6 +4301,7 @@ function M.open_commit_file_diff(commit, file, opts)
   end
 
   state.set_active_file(selected_file)
+  local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local function open_with_codediff()
     local opened_result, codediff_err = codediff_integration.open_commit_diff({
       details = commit_diff_details,
@@ -3893,10 +4385,15 @@ function M.open_commit_file_diff(commit, file, opts)
     return true, nil
   end
 
-  local opened, open_err = open_diff_with_forced_backend({
-    open_primary = open_with_codediff,
-    open_virtual = open_with_virtual,
-  })
+  local opened, open_err
+  if uses_non_text_preview then
+    opened, open_err = open_with_virtual()
+  else
+    opened, open_err = open_diff_with_forced_backend({
+      open_primary = open_with_codediff,
+      open_virtual = open_with_virtual,
+    })
+  end
   if opened == false then
     return false
   end
@@ -4104,6 +4601,8 @@ function M.open_thread_comment_evolution_diff(payload, opts)
     return open_fallback(err)
   end
 
+  local comments_ctx = build_line_comment_context(pr.number)
+
   local target_path = normalize_path(payload.path)
   if target_path == "" then
     return open_fallback("Unable to open thread comment diff: missing file path")
@@ -4216,6 +4715,10 @@ function M.open_thread_comment_evolution_diff(payload, opts)
   end
 
   state.set_active_file(compare_file)
+  local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(compare_file)
+  if uses_non_text_preview then
+    comments_ctx = nil
+  end
   local focus_side = target_side == "base" and "base" or "head"
   local focus_line = focus_side == "base" and target_original_line or target_line
   local function open_with_codediff()
@@ -4237,7 +4740,10 @@ function M.open_thread_comment_evolution_diff(payload, opts)
       return nil, codediff_err
     end
 
-    apply_codediff_open_result_context(pr, compare_details, compare_file, opened_result, {})
+    apply_codediff_open_result_context(pr, compare_details, compare_file, opened_result, {
+      comments_ctx = comments_ctx,
+    })
+    sync_diff_comments_panel(pr, compare_details, comments_ctx)
     return true, nil
   end
 
@@ -4253,7 +4759,7 @@ function M.open_thread_comment_evolution_diff(payload, opts)
     })
 
     local diff_result, diff_err = virtual_files.open_diff(compare_details, pr, compare_file, {
-      line_comments = nil,
+      line_comments = comments_ctx,
       view_mode = diff_view.mode,
       ignore_whitespace = diff_view.ignore_whitespace,
       render_whitespace = diff_view.render_whitespace,
@@ -4289,14 +4795,19 @@ function M.open_thread_comment_evolution_diff(payload, opts)
       end
     end
 
-    sync_diff_comments_panel(pr, details, nil)
+    sync_diff_comments_panel(pr, compare_details, comments_ctx)
     return true, nil
   end
 
-  local opened, open_err = open_diff_with_forced_backend({
-    open_primary = open_with_codediff,
-    open_virtual = open_with_virtual,
-  })
+  local opened, open_err
+  if uses_non_text_preview then
+    opened, open_err = open_with_virtual()
+  else
+    opened, open_err = open_diff_with_forced_backend({
+      open_primary = open_with_codediff,
+      open_virtual = open_with_virtual,
+    })
+  end
   if opened == false then
     return {
       ok = false,
@@ -4778,7 +5289,8 @@ function M.open_diff(file, opts)
 
   state.set_active_file(selected_file)
   local selected_path = normalize_path(selected_file.path or selected_file.filename)
-  local comments_ctx = build_line_comment_context(pr.number)
+  local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
+  local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
 
   local function open_with_codediff()
     local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
@@ -4801,6 +5313,8 @@ function M.open_diff(file, opts)
 
     apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
       comments_ctx = comments_ctx,
+      check_annotations_ctx = opts.check_annotations_ctx,
+      security_annotations_ctx = opts.security_annotations_ctx,
     })
     sync_diff_comments_panel(pr, details, comments_ctx)
     return true, nil
@@ -4839,10 +5353,15 @@ function M.open_diff(file, opts)
     return true, nil
   end
 
-  local opened, open_err = open_diff_with_forced_backend({
-    open_primary = open_with_codediff,
-    open_virtual = open_with_virtual,
-  })
+  local opened, open_err
+  if uses_non_text_preview then
+    opened, open_err = open_with_virtual()
+  else
+    opened, open_err = open_diff_with_forced_backend({
+      open_primary = open_with_codediff,
+      open_virtual = open_with_virtual,
+    })
+  end
   if opened == false then
     return false
   end
@@ -4872,7 +5391,8 @@ function M.open_original(file, opts)
   state.set_active_file(selected_file)
   local selected_path = normalize_path(selected_file.path or selected_file.filename)
   local target_line = positive_integer(opts.target_original_line, positive_integer(opts.target_line, nil))
-  local comments_ctx = build_line_comment_context(pr.number)
+  local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
+  local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
 
   local function open_with_codediff()
     local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
@@ -4895,6 +5415,8 @@ function M.open_original(file, opts)
 
     apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
       comments_ctx = comments_ctx,
+      check_annotations_ctx = opts.check_annotations_ctx,
+      security_annotations_ctx = opts.security_annotations_ctx,
     })
     sync_diff_comments_panel(pr, details, comments_ctx)
     return true, nil
@@ -4916,10 +5438,15 @@ function M.open_original(file, opts)
     return true, nil
   end
 
-  local opened, open_err = open_diff_with_forced_backend({
-    open_primary = open_with_codediff,
-    open_virtual = open_with_virtual,
-  })
+  local opened, open_err
+  if uses_non_text_preview then
+    opened, open_err = open_with_virtual()
+  else
+    opened, open_err = open_diff_with_forced_backend({
+      open_primary = open_with_codediff,
+      open_virtual = open_with_virtual,
+    })
+  end
   if opened == false then
     return false
   end
@@ -4948,7 +5475,8 @@ function M.open_modified(file, opts)
   state.set_active_file(selected_file)
   local selected_path = normalize_path(selected_file.path or selected_file.filename)
   local target_line = positive_integer(opts.target_line, positive_integer(opts.target_original_line, nil))
-  local comments_ctx = build_line_comment_context(pr.number)
+  local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
+  local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
 
   local function open_with_codediff()
     local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
@@ -4971,6 +5499,8 @@ function M.open_modified(file, opts)
 
     apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
       comments_ctx = comments_ctx,
+      check_annotations_ctx = opts.check_annotations_ctx,
+      security_annotations_ctx = opts.security_annotations_ctx,
     })
     sync_diff_comments_panel(pr, details, comments_ctx)
     return true, nil
@@ -4992,10 +5522,15 @@ function M.open_modified(file, opts)
     return true, nil
   end
 
-  local opened, open_err = open_diff_with_forced_backend({
-    open_primary = open_with_codediff,
-    open_virtual = open_with_virtual,
-  })
+  local opened, open_err
+  if uses_non_text_preview then
+    opened, open_err = open_with_virtual()
+  else
+    opened, open_err = open_diff_with_forced_backend({
+      open_primary = open_with_codediff,
+      open_virtual = open_with_virtual,
+    })
+  end
   if opened == false then
     return false
   end
@@ -5037,7 +5572,8 @@ local function reopen_current_diff_with_preferences_impl(opts)
   end
 
   state.set_active_file(selected_file)
-  local comments_ctx = build_line_comment_context(pr.number)
+  local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
+  local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
   local diff_view = current_diff_view_preferences({
     mode = opts.view_mode,
     ignore_whitespace = opts.ignore_whitespace,
@@ -5411,11 +5947,53 @@ function M.mark_files_viewed(files, viewed, opts)
   local updated_count = 0
   local unchanged_count = 0
   local failed_count = 0
+  local pending_targets = {}
+  local remote_cache_loaded = type(state.has_remote_viewed_state) == "function"
+      and state.has_remote_viewed_state(repository, pr.number)
+    or false
 
   for _, target in ipairs(targets) do
     if state.is_viewed(repository, pr.number, target.path) == viewed then
       unchanged_count = unchanged_count + 1
     else
+      pending_targets[#pending_targets + 1] = target
+    end
+  end
+
+  local remote_result = nil
+  local remote_err = nil
+  if not vim.tbl_isempty(pending_targets) and opts.local_only ~= true and type(pr_service.set_files_viewed) == "function" then
+    local paths = {}
+    for _, target in ipairs(pending_targets) do
+      paths[#paths + 1] = target.path
+    end
+    remote_result, remote_err = pr_service.set_files_viewed(pr.number, paths, viewed, opts.remote or {})
+  end
+
+  if remote_result then
+    local succeeded = {}
+    for _, path in ipairs(type(remote_result.updated_paths) == "table" and remote_result.updated_paths or {}) do
+      succeeded[path] = true
+    end
+
+    for _, target in ipairs(pending_targets) do
+      if succeeded[target.path] then
+        local ok_remote = true
+        if remote_cache_loaded and type(state.set_remote_viewed) == "function" then
+          ok_remote = state.set_remote_viewed(repository, pr.number, target.path, viewed)
+        end
+        local ok_local = state.set_viewed(repository, pr.number, target.path, viewed)
+        if ok_remote and ok_local then
+          updated_count = updated_count + 1
+        else
+          failed_count = failed_count + 1
+        end
+      else
+        failed_count = failed_count + 1
+      end
+    end
+  else
+    for _, target in ipairs(pending_targets) do
       local ok = state.set_viewed(repository, pr.number, target.path, viewed)
       if ok then
         updated_count = updated_count + 1
@@ -5431,7 +6009,11 @@ function M.mark_files_viewed(files, viewed, opts)
   end
 
   if updated_count > 0 then
-    refresh_pr_sources_after_state_change()
+    render_pr_sources_from_cache()
+  end
+
+  if remote_result == nil and type(remote_err) == "string" and remote_err ~= "" and opts.notify ~= false then
+    notify_warn("Unable to sync viewed state with GitHub, using local fallback: " .. remote_err)
   end
 
   if opts.notify ~= false then
@@ -5512,13 +6094,19 @@ function M.toggle_viewed()
       return notify_error("Unable to resolve file path")
     end
 
-    local viewed = state.toggle_viewed(repository, number, path)
-    notify_info(string.format("Marked %s as %s", path, viewed and "viewed" or "unviewed"))
-    refresh_pr_sources_after_state_change()
-    return
+    return M.mark_files_viewed({
+      {
+        path = path,
+        filename = path,
+      },
+    }, nil)
   end
 
   M.mark_file_viewed(nil, nil)
+end
+
+function M.sync_remote_viewed_state(pr_number, details, opts)
+  return sync_remote_viewed_state_for_pr(pr_number, details, opts)
 end
 
 function M.set_active_review(pr, details)
@@ -5562,6 +6150,9 @@ function M.toggle_diff_comments_panel()
   local kind = vim.b.gh_pr_file_kind
   if kind ~= "base" and kind ~= "head" and kind ~= "unified" then
     return notify_error("Current buffer is not a gh-pr diff buffer")
+  end
+  if vim.b.gh_pr_is_non_text == true then
+    return notify_warn("Diff comments panel is not available for non-text previews.")
   end
 
   local pr, details, err = resolve_active_pr(vim.b.gh_pr_number, { refresh = false })
@@ -5709,6 +6300,9 @@ function M.start_review(number)
 
     state.set_active_pr(pr, details)
     local opened, open_err = open_review_tree_from_plugin({ toggle = false })
+    sync_remote_viewed_state_for_pr(pr.number, details, {
+      notify_error = false,
+    })
     review_prefetch.prefetch_review(pr, details, {
       source = "start_review",
     })
@@ -6140,7 +6734,7 @@ local function leave_visual_mode()
   vim.api.nvim_feedkeys(esc, "nx", false)
 end
 
-local function refresh_line_comments_for_pr(pr_number, details)
+refresh_line_comments_for_pr = function(pr_number, details)
   local context = build_line_comment_context(pr_number)
   if not context then
     return
@@ -6721,13 +7315,15 @@ local function diff_shortcut_lines(bufnr)
   local kind = type(vim.b[bufnr].gh_pr_file_kind) == "string" and vim.b[bufnr].gh_pr_file_kind or "head"
   local file_mode = type(vim.b[bufnr].gh_pr_file_mode) == "string" and vim.b[bufnr].gh_pr_file_mode or ""
   local is_image = vim.b[bufnr].gh_pr_is_image == true
+  local is_non_text = vim.b[bufnr].gh_pr_is_non_text == true or is_image
+  local asset_label = is_image and "image" or "non-text"
   local backend = type(vim.b[bufnr].gh_pr_diff_backend) == "string"
       and vim.b[bufnr].gh_pr_diff_backend
     or (using_virtual_diff_backend() and "virtual" or "codediff")
   local prefs = current_diff_view_preferences()
   local shortcuts = diff_view_shortcuts()
-  local image_opts = image_diff_options()
-  local image_default_action = resolve_image_default_action(image_opts)
+  local image_opts = non_text_preview.image_diff_options()
+  local image_default_action = non_text_preview.resolve_default_action(image_opts)
   local configured_diff = (config.get() or {}).diff_view or {}
   local configured_whitespace = type(configured_diff.whitespace) == "table" and configured_diff.whitespace or {}
   local whitespace_tab = type(configured_whitespace.tab) == "string" and configured_whitespace.tab ~= ""
@@ -6751,8 +7347,8 @@ local function diff_shortcut_lines(bufnr)
   else
     mode_label = "unified"
   end
-  if is_image then
-    mode_label = mode_label .. " (image)"
+  if is_non_text then
+    mode_label = mode_label .. string.format(" (%s)", asset_label)
   end
 
   local function add_shortcut(lines, key, description)
@@ -6769,21 +7365,25 @@ local function diff_shortcut_lines(bufnr)
     shortcut_line("mode", mode_label),
   }
   if backend ~= "codediff" then
-    lines[#lines + 1] = shortcut_line("spaces", is_image and "n/a (image)" or (prefs.ignore_whitespace and "ignored" or "strict"))
-    lines[#lines + 1] = shortcut_line("render", is_image and "n/a (image)" or (prefs.render_whitespace and "visible" or "hidden"))
-    lines[#lines + 1] = shortcut_line("endline", is_image and "n/a (image)" or (prefs.render_endlines and "visible" or "hidden"))
-    lines[#lines + 1] = shortcut_line("tab", is_image and "n/a" or whitespace_tab)
-    lines[#lines + 1] = shortcut_line("space", is_image and "n/a" or whitespace_space)
+    lines[#lines + 1] = shortcut_line("spaces", is_non_text and string.format("n/a (%s)", asset_label) or (prefs.ignore_whitespace and "ignored" or "strict"))
+    lines[#lines + 1] = shortcut_line("render", is_non_text and string.format("n/a (%s)", asset_label) or (prefs.render_whitespace and "visible" or "hidden"))
+    lines[#lines + 1] = shortcut_line("endline", is_non_text and string.format("n/a (%s)", asset_label) or (prefs.render_endlines and "visible" or "hidden"))
+    lines[#lines + 1] = shortcut_line("tab", is_non_text and "n/a" or whitespace_tab)
+    lines[#lines + 1] = shortcut_line("space", is_non_text and "n/a" or whitespace_space)
   else
     lines[#lines + 1] = shortcut_line("render", "managed by codediff.nvim")
   end
   lines[#lines + 1] = ""
   lines[#lines + 1] = "General"
 
-  if is_image then
-    lines[#lines + 1] = shortcut_line("-", "Line comments popup not available for image files")
+  if is_non_text then
+    lines[#lines + 1] = shortcut_line("-", string.format("Line comments popup not available for %s files", asset_label))
   else
     add_shortcut(lines, shortcuts.line_comments_popup, kind == "unified" and "Not available in unified mode" or "Show line comments popup")
+    if backend == "codediff" then
+      lines[#lines + 1] = shortcut_line("<CR>", "Open line comments popup on commented lines")
+    end
+    lines[#lines + 1] = shortcut_line("popup r / R / x", "Reply, quote-reply, or resolve/unresolve the selected thread")
   end
   add_shortcut(lines, shortcuts.help, "Show this help")
   if backend ~= "codediff" then
@@ -6793,13 +7393,13 @@ local function diff_shortcut_lines(bufnr)
   add_shortcut(lines, shortcuts.close_all_open_review, "Close view(s) and open PR Review")
   add_shortcut(lines, shortcuts.toggle_comments_panel, "Toggle diff comments panel")
 
-  if backend ~= "codediff" and not is_image then
+  if backend ~= "codediff" and not is_non_text then
     add_shortcut(lines, shortcuts.toggle_render_whitespace, "Toggle leading/trailing space/tab symbols")
     add_shortcut(lines, shortcuts.toggle_render_endlines, "Toggle LF/CRLF endline markers")
   end
 
-  if is_image then
-    lines[#lines + 1] = shortcut_line("-", "Whitespace and diff layout toggles disabled for image files")
+  if is_non_text then
+    lines[#lines + 1] = shortcut_line("-", string.format("Whitespace and diff layout toggles disabled for %s files", asset_label))
   elseif backend == "codediff" then
     lines[#lines + 1] = shortcut_line("-", "Layout/render toggles are not available in codediff backend")
   elseif file_mode ~= "added_single" and file_mode ~= "removed_single" then
@@ -6812,18 +7412,19 @@ local function diff_shortcut_lines(bufnr)
     lines[#lines + 1] = shortcut_line("-", "Diff layout toggles disabled for single-file mode")
   end
 
-  if is_image then
+  if is_non_text then
     lines[#lines + 1] = ""
-    lines[#lines + 1] = "Image fallback"
-    add_shortcut(lines, shortcuts.image_default_action, string.format("Run default fallback action (%s)", image_action_label(image_default_action)))
-    add_shortcut(lines, shortcuts.image_fallback_menu, "Open fallback actions menu")
+    lines[#lines + 1] = "Non-text preview"
+    add_shortcut(lines, shortcuts.image_default_action, string.format("Run default preview action (%s)", non_text_preview.action_label(image_default_action)))
+    add_shortcut(lines, shortcuts.image_fallback_menu, "Open preview actions menu")
+    lines[#lines + 1] = shortcut_line("<CR>", "Run action under cursor when focused on an action row")
     lines[#lines + 1] = shortcut_line("-", "Menu allows setting default action (`d`/`s`)")
   end
 
   lines[#lines + 1] = ""
   lines[#lines + 1] = "Navigation"
-  if is_image then
-    lines[#lines + 1] = shortcut_line("-", "Change navigation disabled for image files")
+  if is_non_text then
+    lines[#lines + 1] = shortcut_line("-", string.format("Change navigation disabled for %s files", asset_label))
   else
     add_shortcut(lines, shortcuts.next_change, "Next change")
     add_shortcut(lines, shortcuts.prev_change, "Previous change")
@@ -6843,9 +7444,9 @@ local function diff_shortcut_lines(bufnr)
   lines[#lines + 1] = ""
   lines[#lines + 1] = "Inline comments"
 
-  if is_image then
-    lines[#lines + 1] = shortcut_line(shortcuts.inline_comment, "Not available for image files")
-    lines[#lines + 1] = shortcut_line(shortcuts.inline_suggestion, "Not available for image files")
+  if is_non_text then
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_comment, string.format("Not available for %s files", asset_label))
+    lines[#lines + 1] = shortcut_line(shortcuts.inline_suggestion, string.format("Not available for %s files", asset_label))
   elseif kind == "head" and file_mode == "added_single" then
     lines[#lines + 1] = shortcut_line(shortcuts.inline_comment, "Create inline comment at cursor (any line)")
     lines[#lines + 1] = shortcut_line("Visual + " .. shortcuts.inline_comment, "Create inline comment on selected range")

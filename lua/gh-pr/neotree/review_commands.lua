@@ -101,6 +101,65 @@ local function open_timeline_item(node)
   return true
 end
 
+local STATUS_FILTER_CHOICES = {
+  { value = "all", label = "All statuses" },
+  { value = "modified", label = "Modified only" },
+  { value = "added", label = "Added only" },
+  { value = "deleted", label = "Deleted only" },
+  { value = "renamed", label = "Renamed only" },
+  { value = "copied", label = "Copied only" },
+}
+
+local function current_file_filters(state)
+  local source = get_source()
+  if type(source.get_file_filters) ~= "function" then
+    return {
+      path_query = "",
+      status = "all",
+      extension = "",
+      no_extension = false,
+      dotfiles = false,
+      viewed_state = "all",
+      hide_viewed = nil,
+      hide_deleted = false,
+    }
+  end
+  return source.get_file_filters(state)
+end
+
+local function update_file_filters(state, updates)
+  local source = get_source()
+  if type(source.update_file_filters) ~= "function" then
+    vim.notify("PR Review file filters are unavailable", vim.log.levels.WARN)
+    return false, nil
+  end
+
+  local ok, err, filters = source.update_file_filters(state, updates)
+  if not ok then
+    vim.notify(err or "Unable to update PR Review file filters", vim.log.levels.ERROR)
+    return false, nil
+  end
+
+  return true, filters
+end
+
+local function reset_file_filters(state)
+  local source = get_source()
+  if type(source.reset_file_filters) ~= "function" then
+    vim.notify("PR Review file filters are unavailable", vim.log.levels.WARN)
+    return false
+  end
+
+  local ok, err = source.reset_file_filters(state)
+  if not ok then
+    vim.notify(err or "Unable to reset PR Review file filters", vim.log.levels.ERROR)
+    return false
+  end
+
+  vim.notify("PR Review file filters reset", vim.log.levels.INFO)
+  return true
+end
+
 local function node_id(node)
   if type(node) ~= "table" then
     return nil
@@ -491,7 +550,7 @@ M.gh_pr_review_open = function(state)
     return
   end
 
-  if kind == "comment" or kind == "line" or kind == "comment_thread" or kind == "comment_thread_item" then
+  if kind == "comment" or kind == "line" or kind == "comment_thread" or kind == "comment_thread_item" or kind == "draft_comment" then
     if not open_comment_target(node) then
       open_timeline_item(node)
     end
@@ -522,7 +581,74 @@ M.gh_pr_review_open = function(state)
     return
   end
 
-  if kind == "check" and type(node.extra.check_url) == "string" and node.extra.check_url ~= "" then
+  if kind == "check" then
+    local loaded, load_err = get_source().request_check_annotations(state, node)
+    if not loaded then
+      vim.notify(load_err or "Unable to load check annotations", vim.log.levels.ERROR)
+      return
+    end
+
+    cc.toggle_node(state)
+    return
+  end
+
+  if kind == "check_annotation" then
+    get_actions().open_check_annotation_location(node.extra)
+    return
+  end
+
+  if kind == "security_code_scanning" then
+    local loaded, load_err = get_source().request_security_code_scanning(state, node)
+    if not loaded then
+      vim.notify(load_err or "Unable to load code scanning findings", vim.log.levels.ERROR)
+      return
+    end
+
+    cc.toggle_node(state)
+    return
+  end
+
+  if kind == "security_dependency_review" then
+    local loaded, load_err = get_source().request_security_dependency_review(state, node)
+    if not loaded then
+      vim.notify(load_err or "Unable to load dependency review findings", vim.log.levels.ERROR)
+      return
+    end
+
+    cc.toggle_node(state)
+    return
+  end
+
+  if kind == "security_code_scanning_alert" then
+    get_actions().open_security_alert_location(node.extra)
+    return
+  end
+
+  if kind == "security_dependency_package" then
+    if node.extra and node.extra.has_vulnerabilities == true then
+      cc.toggle_node(state)
+      return
+    end
+    if node.extra and node.extra.file then
+      get_actions().open_diff(node.extra.file)
+    else
+      vim.notify("Unable to resolve manifest diff for selected dependency", vim.log.levels.WARN)
+    end
+    return
+  end
+
+  if kind == "security_dependency_vulnerability" then
+    local advisory_url = type(node.extra) == "table" and node.extra.advisory_url or nil
+    if type(advisory_url) == "string" and advisory_url ~= "" then
+      get_url_open().open(advisory_url, {
+        notify_error = true,
+        context = "Unable to open dependency advisory",
+      })
+    end
+    return
+  end
+
+  if kind == "check_details_link" and type(node.extra.check_url) == "string" and node.extra.check_url ~= "" then
     get_url_open().open(node.extra.check_url, {
       notify_error = true,
       context = "Unable to open check URL",
@@ -677,6 +803,22 @@ M.open_pr_browser = function(state)
   end
 
   apply_context(node)
+  local extra = type(node.extra) == "table" and node.extra or {}
+  local contextual_url = nil
+  if type(extra.alert_url) == "string" and extra.alert_url ~= "" then
+    contextual_url = extra.alert_url
+  elseif type(extra.advisory_url) == "string" and extra.advisory_url ~= "" then
+    contextual_url = extra.advisory_url
+  elseif type(extra.check_url) == "string" and extra.check_url ~= "" then
+    contextual_url = extra.check_url
+  end
+  if type(contextual_url) == "string" and contextual_url ~= "" then
+    get_url_open().open(contextual_url, {
+      notify_error = true,
+      context = "Unable to open URL",
+    })
+    return
+  end
   local pr = node.extra and node.extra.pr or nil
   get_actions().open_overview_url(pr and pr.number or nil)
 end
@@ -786,6 +928,163 @@ end
 
 M.collapse_comments_global = function(state)
   collapse_subtree(state, comments_global_node(state))
+end
+
+M.filter_files_by_path = function(state)
+  local filters = current_file_filters(state)
+  vim.ui.input({
+    prompt = "Filter PR files by path substring:",
+    default = type(filters.path_query) == "string" and filters.path_query or "",
+  }, function(input)
+    if input == nil then
+      return
+    end
+
+    local query = vim.trim(type(input) == "string" and input or "")
+    local ok = select(1, update_file_filters(state, {
+      path_query = query,
+    }))
+    if ok then
+      if query == "" then
+        vim.notify("PR Review file path filter cleared", vim.log.levels.INFO)
+      else
+        vim.notify("PR Review file path filter: " .. query, vim.log.levels.INFO)
+      end
+    end
+  end)
+end
+
+M.clear_file_path_filter = function(state)
+  local ok = select(1, update_file_filters(state, {
+    path_query = "",
+  }))
+  if ok then
+    vim.notify("PR Review file path filter cleared", vim.log.levels.INFO)
+  end
+end
+
+M.select_file_status_filter = function(state)
+  local filters = current_file_filters(state)
+  vim.ui.select(STATUS_FILTER_CHOICES, {
+    prompt = "PR Review file status filter:",
+    format_item = function(item)
+      local label = type(item) == "table" and item.label or tostring(item)
+      local value = type(item) == "table" and item.value or ""
+      if value ~= "" and value == filters.status then
+        return label .. " (current)"
+      end
+      return label
+    end,
+  }, function(choice)
+    if type(choice) ~= "table" then
+      return
+    end
+
+    local ok, next_filters = update_file_filters(state, {
+      status = choice.value,
+    })
+    if ok then
+      vim.notify("PR Review file status filter: " .. (next_filters.status or "all"), vim.log.levels.INFO)
+    end
+  end)
+end
+
+M.filter_files_by_extension = function(state)
+  local filters = current_file_filters(state)
+  vim.ui.input({
+    prompt = "Filter PR files by extension:",
+    default = type(filters.extension) == "string" and filters.extension or "",
+  }, function(input)
+    if input == nil then
+      return
+    end
+
+    local extension = vim.trim(type(input) == "string" and input or ""):lower():gsub("^%.+", "")
+    local ok = select(1, update_file_filters(state, {
+      extension = extension,
+    }))
+    if ok then
+      if extension == "" then
+        vim.notify("PR Review file extension filter cleared", vim.log.levels.INFO)
+      else
+        vim.notify("PR Review file extension filter: " .. extension, vim.log.levels.INFO)
+      end
+    end
+  end)
+end
+
+M.toggle_no_extension_filter = function(state)
+  local filters = current_file_filters(state)
+  local ok, next_filters = update_file_filters(state, {
+    no_extension = not (filters.no_extension == true),
+  })
+  if ok then
+    vim.notify("PR Review no-extension filter: " .. ((next_filters.no_extension == true) and "on" or "off"), vim.log.levels.INFO)
+  end
+end
+
+M.toggle_dotfiles_filter = function(state)
+  local filters = current_file_filters(state)
+  local ok, next_filters = update_file_filters(state, {
+    dotfiles = not (filters.dotfiles == true),
+  })
+  if ok then
+    vim.notify("PR Review dotfiles filter: " .. ((next_filters.dotfiles == true) and "on" or "off"), vim.log.levels.INFO)
+  end
+end
+
+M.toggle_unviewed_only_filter = function(state)
+  local filters = current_file_filters(state)
+  local next_value = filters.viewed_state == "unviewed" and "all" or "unviewed"
+  local ok, next_filters = update_file_filters(state, {
+    viewed_state = next_value,
+  })
+  if ok then
+    vim.notify("PR Review viewed filter: " .. (next_filters.viewed_state or "all"), vim.log.levels.INFO)
+  end
+end
+
+M.toggle_viewed_only_filter = function(state)
+  local filters = current_file_filters(state)
+  local next_value = filters.viewed_state == "viewed" and "all" or "viewed"
+  local ok, next_filters = update_file_filters(state, {
+    viewed_state = next_value,
+  })
+  if ok then
+    vim.notify("PR Review viewed filter: " .. (next_filters.viewed_state or "all"), vim.log.levels.INFO)
+  end
+end
+
+M.toggle_hide_viewed_filter = function(state)
+  local filters = current_file_filters(state)
+  local configured_hide_viewed = ((get_config().get() or {}).hide_viewed_files == true)
+  local effective_hide_viewed = type(filters.hide_viewed) == "boolean" and filters.hide_viewed or configured_hide_viewed
+  local ok, next_filters = update_file_filters(state, {
+    hide_viewed = not effective_hide_viewed,
+  })
+  if ok then
+    vim.notify(
+      "PR Review hide viewed: " .. ((next_filters.hide_viewed == true) and "on" or "off"),
+      vim.log.levels.INFO
+    )
+  end
+end
+
+M.toggle_hide_deleted_filter = function(state)
+  local filters = current_file_filters(state)
+  local ok, next_filters = update_file_filters(state, {
+    hide_deleted = not (filters.hide_deleted == true),
+  })
+  if ok then
+    vim.notify(
+      "PR Review hide deleted: " .. ((next_filters.hide_deleted == true) and "on" or "off"),
+      vim.log.levels.INFO
+    )
+  end
+end
+
+M.reset_file_filters = function(state)
+  reset_file_filters(state)
 end
 
 M.toggle_files_flat_mode = function()

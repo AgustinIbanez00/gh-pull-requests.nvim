@@ -104,6 +104,9 @@ local function normalize_thread_comment(raw_comment, index, fallback)
     url = url,
     state = state,
     outdated = raw_comment.outdated == true,
+    is_pending = raw_comment.isPending == true or raw_comment.is_pending == true,
+    viewer_did_author = raw_comment.viewerDidAuthor == true or raw_comment.viewer_did_author == true,
+    reaction_groups = vim.deepcopy(type(raw_comment.reactionGroups) == "table" and raw_comment.reactionGroups or (type(raw_comment.reaction_groups) == "table" and raw_comment.reaction_groups or {})),
     path = path,
     line = line,
     original_line = original_line,
@@ -393,6 +396,9 @@ local function normalize_thread_entry(raw_thread, index, pr, details)
       url = comment.url,
       state = comment.state,
       outdated = comment.outdated,
+      is_pending = comment.is_pending == true,
+      viewer_did_author = comment.viewer_did_author == true,
+      reaction_groups = vim.deepcopy(type(comment.reaction_groups) == "table" and comment.reaction_groups or {}),
     }
   end
 

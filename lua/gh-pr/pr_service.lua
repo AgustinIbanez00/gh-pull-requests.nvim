@@ -3,9 +3,13 @@ local M = {}
 local config = require("gh-pr.config")
 local gh = require("gh-pr.gh")
 local repo = require("gh-pr.repo")
+local pr_check_annotations = require("gh-pr.core.pr_service.check_annotations")
+local pr_code_scanning = require("gh-pr.core.pr_service.code_scanning")
+local pr_dependency_review = require("gh-pr.core.pr_service.dependency_review")
 local pr_threads = require("gh-pr.core.pr_service.threads")
 local pr_timeline = require("gh-pr.core.pr_service.timeline")
 local pr_overview_model = require("gh-pr.core.pr_service.overview_model")
+local pr_viewed_files = require("gh-pr.core.pr_service.viewed_files")
 
 local user_cache = {
   login = nil,
@@ -38,6 +42,7 @@ local detail_fields = table.concat({
   "latestReviews",
   "url",
   "headRefName",
+  "headRefOid",
   "baseRefName",
   "headRepository",
   "headRepositoryOwner",
@@ -432,6 +437,22 @@ local function normalize_reviews(reviews)
   return normalized
 end
 
+local function normalize_reaction_groups(groups)
+  local normalized = {}
+  for _, group in ipairs(type(groups) == "table" and groups or {}) do
+    local content = normalize_string(group.content, "")
+    if content ~= "" then
+      local users = type(group.users) == "table" and group.users or {}
+      normalized[#normalized + 1] = {
+        content = content,
+        total_count = tonumber(users.totalCount) or tonumber(group.totalCount) or 0,
+        viewer_has_reacted = group.viewerHasReacted == true,
+      }
+    end
+  end
+  return normalized
+end
+
 local function normalize_checks(checks)
   local normalized = {}
   for _, check in ipairs(type(checks) == "table" and checks or {}) do
@@ -449,6 +470,11 @@ local function normalize_checks(checks)
       conclusion = normalize_string(check.conclusion, ""),
       workflow = normalize_string(check.workflowName, ""),
       url = normalize_string(check.detailsUrl, check.targetUrl or check.url or ""),
+      details_url = normalize_string(check.detailsUrl, ""),
+      target_url = normalize_string(check.targetUrl, ""),
+      check_run_id = tonumber(check.checkRunId) or tonumber(check.check_run_id) or tonumber(check.databaseId),
+      database_id = tonumber(check.databaseId),
+      head_sha = normalize_string(check.headSha, ""),
     }
   end
   return normalized
@@ -469,11 +495,14 @@ local function normalize_threads(threads)
         commit_oid = normalize_string(type(comment.commit) == "table" and comment.commit.oid or "", ""),
         original_commit_oid = normalize_string(type(comment.originalCommit) == "table" and comment.originalCommit.oid or "", ""),
         author = normalize_login(comment.author, "unknown"),
+        viewer_did_author = comment.viewerDidAuthor == true or comment.viewer_did_author == true,
         body = normalize_string(comment.body, ""),
         created_at = normalize_string(comment.createdAt, ""),
         state = normalize_string(comment.state, ""),
         outdated = comment.outdated == true,
         url = normalize_string(comment.url, ""),
+        reaction_groups = normalize_reaction_groups(comment.reactionGroups or comment.reaction_groups),
+        is_pending = comment.isPending == true or comment.is_pending == true or normalize_string(comment.state, ""):upper() == "PENDING",
       }
     end
 
@@ -915,6 +944,44 @@ function M.fetch_review_threads_async(number, opts, callback)
   return pr_threads.fetch_review_threads_async(number, opts, callback, threads_service_context())
 end
 
+function M.fetch_review_threads_with_pending(number, opts)
+  local threads, thread_err = M.fetch_review_threads(number, opts)
+  if not threads then
+    return nil, thread_err
+  end
+
+  local pending_payload, pending_err = M.fetch_pending_review_comments(number)
+  if pending_payload and type(M.merge_pending_review_comments) == "function" then
+    threads = M.merge_pending_review_comments(threads, pending_payload)
+  end
+
+  return threads, pending_err
+end
+
+function M.fetch_review_threads_with_pending_async(number, opts, callback)
+  callback = callback or function() end
+
+  M.fetch_review_threads_async(number, opts, function(threads, thread_err)
+    if not threads then
+      callback(nil, thread_err)
+      return
+    end
+
+    if type(M.fetch_pending_review_comments_async) ~= "function" then
+      callback(threads, nil)
+      return
+    end
+
+    M.fetch_pending_review_comments_async(number, function(pending_payload, pending_err)
+      if pending_payload and type(M.merge_pending_review_comments) == "function" then
+        threads = M.merge_pending_review_comments(threads, pending_payload)
+      end
+
+      callback(threads, pending_err)
+    end)
+  end)
+end
+
 function M.build_line_comment_index(threads, opts)
   return pr_threads.build_line_comment_index(threads, opts, threads_service_context())
 end
@@ -1325,12 +1392,87 @@ local function timeline_service_context()
   }
 end
 
+local function viewed_files_service_context()
+  return {
+    clamp_positive = clamp_positive,
+    resolve_repository = M.resolve_repository,
+    run_graphql = run_graphql,
+    run_graphql_async = run_graphql_async,
+  }
+end
+
+local function check_annotations_service_context()
+  return {
+    gh = gh,
+    clamp_positive = clamp_positive,
+    normalize_string = normalize_string,
+    resolve_repository = M.resolve_repository,
+    normalize_repository_from_input = normalize_repository_from_input,
+  }
+end
+
+local function code_scanning_service_context()
+  return {
+    gh = gh,
+    clamp_positive = clamp_positive,
+    normalize_string = normalize_string,
+    resolve_repository = M.resolve_repository,
+    normalize_repository_from_input = normalize_repository_from_input,
+  }
+end
+
+local function dependency_review_service_context()
+  return {
+    gh = gh,
+    clamp_positive = clamp_positive,
+    normalize_string = normalize_string,
+    resolve_repository = M.resolve_repository,
+    normalize_repository_from_input = normalize_repository_from_input,
+  }
+end
+
 function M.fetch_pr_change_events(number, opts)
   return pr_timeline.fetch_pr_change_events(number, opts, timeline_service_context())
 end
 
 function M.fetch_pr_change_events_async(number, opts, callback)
   return pr_timeline.fetch_pr_change_events_async(number, opts, callback, timeline_service_context())
+end
+
+function M.fetch_viewed_files(number, opts)
+  return pr_viewed_files.fetch_viewed_files(number, opts, viewed_files_service_context())
+end
+
+function M.fetch_viewed_files_async(number, opts, callback)
+  return pr_viewed_files.fetch_viewed_files_async(number, opts, callback, viewed_files_service_context())
+end
+
+function M.fetch_check_annotations(number, check, opts)
+  return pr_check_annotations.fetch_check_annotations(number, check, opts, check_annotations_service_context())
+end
+
+function M.fetch_check_annotations_async(number, check, opts, callback)
+  return pr_check_annotations.fetch_check_annotations_async(number, check, opts, callback, check_annotations_service_context())
+end
+
+function M.fetch_code_scanning_alerts(number, opts)
+  return pr_code_scanning.fetch_code_scanning_alerts(number, opts, code_scanning_service_context())
+end
+
+function M.fetch_code_scanning_alerts_async(number, opts, callback)
+  return pr_code_scanning.fetch_code_scanning_alerts_async(number, opts, callback, code_scanning_service_context())
+end
+
+function M.fetch_dependency_review(number, opts)
+  return pr_dependency_review.fetch_dependency_review(number, opts, dependency_review_service_context())
+end
+
+function M.fetch_dependency_review_async(number, opts, callback)
+  return pr_dependency_review.fetch_dependency_review_async(number, opts, callback, dependency_review_service_context())
+end
+
+function M.set_files_viewed(number, paths, viewed, opts)
+  return pr_viewed_files.set_files_viewed(number, paths, viewed, opts, viewed_files_service_context())
 end
 local function fetch_review_context(number)
   local repository, repo_err = M.resolve_repository()
@@ -1349,6 +1491,43 @@ query($owner:String!, $name:String!, $number:Int!) {
           state
           body
           author { login }
+          comments(first:100) {
+            nodes {
+              id
+              path
+              line
+              originalLine
+              diffHunk
+              diffSide
+              body
+              createdAt
+              state
+              outdated
+              url
+              author { login }
+              commit { oid }
+              originalCommit { oid }
+              replyTo { id }
+              reactionGroups {
+                content
+                viewerHasReacted
+                users {
+                  totalCount
+                }
+              }
+              pullRequestReviewThread {
+                id
+                isResolved
+                isOutdated
+                path
+                line
+                originalLine
+                startLine
+                originalStartLine
+                diffSide
+              }
+            }
+          }
         }
       }
     }
@@ -1375,11 +1554,48 @@ query($owner:String!, $name:String!, $number:Int!) {
   local pending_reviews = {}
   local reviews_nodes = type(pr_node.reviews) == "table" and pr_node.reviews.nodes or {}
   for _, item in ipairs(type(reviews_nodes) == "table" and reviews_nodes or {}) do
+    local comments = {}
+    local comment_nodes = type(item.comments) == "table" and item.comments.nodes or {}
+    for _, comment in ipairs(type(comment_nodes) == "table" and comment_nodes or {}) do
+      local thread = type(comment.pullRequestReviewThread) == "table" and comment.pullRequestReviewThread or {}
+      comments[#comments + 1] = {
+        id = normalize_string(comment.id, ""),
+        path = normalize_string(comment.path, normalize_string(thread.path, "")),
+        line = tonumber(comment.line) or tonumber(thread.line) or 0,
+        original_line = tonumber(comment.originalLine) or tonumber(thread.originalLine) or 0,
+        start_line = tonumber(thread.startLine) or 0,
+        original_start_line = tonumber(thread.originalStartLine) or 0,
+        diff_hunk = normalize_string(comment.diffHunk, ""),
+        diff_side = normalize_string(comment.diffSide, normalize_string(thread.diffSide, "")),
+        body = normalize_string(comment.body, ""),
+        created_at = normalize_string(comment.createdAt, ""),
+        state = normalize_string(comment.state, "PENDING"),
+        outdated = comment.outdated == true,
+        url = normalize_string(comment.url, ""),
+        author = normalize_login(comment.author, "unknown"),
+        commit_oid = normalize_string(type(comment.commit) == "table" and comment.commit.oid or "", ""),
+        original_commit_oid = normalize_string(type(comment.originalCommit) == "table" and comment.originalCommit.oid or "", ""),
+        thread_id = normalize_string(thread.id, ""),
+        thread_is_resolved = thread.isResolved == true,
+        thread_is_outdated = thread.isOutdated == true,
+        thread_path = normalize_string(thread.path, ""),
+        thread_line = tonumber(thread.line) or 0,
+        thread_original_line = tonumber(thread.originalLine) or 0,
+        thread_start_line = tonumber(thread.startLine) or 0,
+        thread_original_start_line = tonumber(thread.originalStartLine) or 0,
+        thread_diff_side = normalize_string(thread.diffSide, ""),
+        reply_to_id = normalize_string(type(comment.replyTo) == "table" and comment.replyTo.id or "", ""),
+        reaction_groups = normalize_reaction_groups(comment.reactionGroups),
+        is_pending = true,
+      }
+    end
+
     pending_reviews[#pending_reviews + 1] = {
       id = normalize_string(item.id, ""),
       state = normalize_string(item.state, ""),
       body = normalize_string(item.body, ""),
       author = normalize_login(item.author, "unknown"),
+      comments = comments,
     }
   end
 
@@ -1388,6 +1604,144 @@ query($owner:String!, $name:String!, $number:Int!) {
     pull_request_id = pr_node.id,
     pending_reviews = pending_reviews,
   }, nil
+end
+
+local function fetch_review_context_async(number, callback)
+  callback = callback or function() end
+
+  local repository, repo_err = M.resolve_repository()
+  if not repository then
+    callback(nil, repo_err)
+    return
+  end
+
+  local query = [[
+query($owner:String!, $name:String!, $number:Int!) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      id
+      reviews(first:50, states:[PENDING]) {
+        nodes {
+          id
+          state
+          body
+          author { login }
+          comments(first:100) {
+            nodes {
+              id
+              path
+              line
+              originalLine
+              diffHunk
+              diffSide
+              body
+              createdAt
+              state
+              outdated
+              url
+              author { login }
+              commit { oid }
+              originalCommit { oid }
+              replyTo { id }
+              reactionGroups {
+                content
+                viewerHasReacted
+                users {
+                  totalCount
+                }
+              }
+              pullRequestReviewThread {
+                id
+                isResolved
+                isOutdated
+                path
+                line
+                originalLine
+                startLine
+                originalStartLine
+                diffSide
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+]]
+
+  run_graphql_async(query, {
+    { flag = "-f", key = "owner", value = repository.owner },
+    { flag = "-f", key = "name", value = repository.name },
+    { flag = "-F", key = "number", value = tonumber(number) or number },
+  }, function(response, err)
+    if not response then
+      callback(nil, err)
+      return
+    end
+
+    local data = response.data
+    local repo_node = type(data) == "table" and data.repository or nil
+    local pr_node = type(repo_node) == "table" and repo_node.pullRequest or nil
+    if type(pr_node) ~= "table" or type(pr_node.id) ~= "string" or pr_node.id == "" then
+      callback(nil, "Unable to resolve pull request GraphQL id")
+      return
+    end
+
+    local pending_reviews = {}
+    local reviews_nodes = type(pr_node.reviews) == "table" and pr_node.reviews.nodes or {}
+    for _, item in ipairs(type(reviews_nodes) == "table" and reviews_nodes or {}) do
+      local comments = {}
+      local comment_nodes = type(item.comments) == "table" and item.comments.nodes or {}
+      for _, comment in ipairs(type(comment_nodes) == "table" and comment_nodes or {}) do
+        local thread = type(comment.pullRequestReviewThread) == "table" and comment.pullRequestReviewThread or {}
+        comments[#comments + 1] = {
+          id = normalize_string(comment.id, ""),
+          path = normalize_string(comment.path, normalize_string(thread.path, "")),
+          line = tonumber(comment.line) or tonumber(thread.line) or 0,
+          original_line = tonumber(comment.originalLine) or tonumber(thread.originalLine) or 0,
+          start_line = tonumber(thread.startLine) or 0,
+          original_start_line = tonumber(thread.originalStartLine) or 0,
+          diff_hunk = normalize_string(comment.diffHunk, ""),
+          diff_side = normalize_string(comment.diffSide, normalize_string(thread.diffSide, "")),
+          body = normalize_string(comment.body, ""),
+          created_at = normalize_string(comment.createdAt, ""),
+          state = normalize_string(comment.state, "PENDING"),
+          outdated = comment.outdated == true,
+          url = normalize_string(comment.url, ""),
+          author = normalize_login(comment.author, "unknown"),
+          commit_oid = normalize_string(type(comment.commit) == "table" and comment.commit.oid or "", ""),
+          original_commit_oid = normalize_string(type(comment.originalCommit) == "table" and comment.originalCommit.oid or "", ""),
+          thread_id = normalize_string(thread.id, ""),
+          thread_is_resolved = thread.isResolved == true,
+          thread_is_outdated = thread.isOutdated == true,
+          thread_path = normalize_string(thread.path, ""),
+          thread_line = tonumber(thread.line) or 0,
+          thread_original_line = tonumber(thread.originalLine) or 0,
+          thread_start_line = tonumber(thread.startLine) or 0,
+          thread_original_start_line = tonumber(thread.originalStartLine) or 0,
+          thread_diff_side = normalize_string(thread.diffSide, ""),
+          reply_to_id = normalize_string(type(comment.replyTo) == "table" and comment.replyTo.id or "", ""),
+          reaction_groups = normalize_reaction_groups(comment.reactionGroups),
+          is_pending = true,
+        }
+      end
+
+      pending_reviews[#pending_reviews + 1] = {
+        id = normalize_string(item.id, ""),
+        state = normalize_string(item.state, ""),
+        body = normalize_string(item.body, ""),
+        author = normalize_login(item.author, "unknown"),
+        comments = comments,
+      }
+    end
+
+    callback({
+      repository = repository,
+      pull_request_id = pr_node.id,
+      pending_reviews = pending_reviews,
+    }, nil)
+  end)
 end
 
 local function pending_review_for_login(context, login)
@@ -1457,6 +1811,77 @@ function M.find_pending_review(number)
   return pending, nil
 end
 
+function M.find_pending_review_async(number, callback)
+  callback = callback or function() end
+
+  fetch_review_context_async(number, function(context, context_err)
+    if not context then
+      callback(nil, context_err)
+      return
+    end
+
+    get_user_login_async(function(login, login_err)
+      if not login then
+        callback(nil, login_err)
+        return
+      end
+
+      local pending = pending_review_for_login(context, login)
+      if not pending then
+        callback(nil, nil)
+        return
+      end
+
+      pending.pull_request_id = context.pull_request_id
+      pending.created = false
+      callback(pending, nil)
+    end)
+  end)
+end
+
+function M.fetch_pending_review_comments(number)
+  local pending, pending_err = M.find_pending_review(number)
+  if pending_err then
+    return nil, pending_err
+  end
+
+  if not pending then
+    return {
+      review = nil,
+      comments = {},
+    }, nil
+  end
+
+  return {
+    review = pending,
+    comments = vim.deepcopy(type(pending.comments) == "table" and pending.comments or {}),
+  }, nil
+end
+
+function M.fetch_pending_review_comments_async(number, callback)
+  callback = callback or function() end
+
+  M.find_pending_review_async(number, function(pending, pending_err)
+    if pending_err then
+      callback(nil, pending_err)
+      return
+    end
+
+    if not pending then
+      callback({
+        review = nil,
+        comments = {},
+      }, nil)
+      return
+    end
+
+    callback({
+      review = pending,
+      comments = vim.deepcopy(type(pending.comments) == "table" and pending.comments or {}),
+    }, nil)
+  end)
+end
+
 function M.ensure_pending_review(number)
   local context, context_err = fetch_review_context(number)
   if not context then
@@ -1482,6 +1907,99 @@ function M.ensure_pending_review(number)
 
   created.pull_request_id = context.pull_request_id
   return created, nil
+end
+
+local function merge_pending_review_comments(threads, pending_payload)
+  local merged = normalize_threads(threads)
+  local by_thread_id = {}
+  local fallback_threads = {}
+
+  for _, thread in ipairs(merged) do
+    local thread_id = normalize_string(thread.id, "")
+    if thread_id ~= "" then
+      by_thread_id[thread_id] = thread
+    end
+  end
+
+  local comments = type(pending_payload) == "table" and type(pending_payload.comments) == "table" and pending_payload.comments or {}
+  for _, comment in ipairs(comments) do
+    local path = normalize_string(comment.path, normalize_string(comment.thread_path, ""))
+    local thread_id = normalize_string(comment.thread_id, "")
+    local target = thread_id ~= "" and by_thread_id[thread_id] or nil
+
+    if not target then
+      local fallback_key = thread_id
+      if fallback_key == "" then
+        fallback_key = table.concat({
+          path,
+          tostring(tonumber(comment.line) or tonumber(comment.thread_line) or 0),
+          tostring(tonumber(comment.original_line) or tonumber(comment.thread_original_line) or 0),
+        }, ":")
+      end
+
+      target = fallback_threads[fallback_key]
+      if not target then
+        target = {
+          id = thread_id ~= "" and thread_id or ("pending:" .. normalize_string(comment.id, fallback_key)),
+          path = path,
+          line = tonumber(comment.thread_line) or tonumber(comment.line) or 0,
+          original_line = tonumber(comment.thread_original_line) or tonumber(comment.original_line) or 0,
+          start_line = tonumber(comment.thread_start_line) or tonumber(comment.line) or 0,
+          original_start_line = tonumber(comment.thread_original_start_line) or tonumber(comment.original_line) or 0,
+          diff_side = normalize_string(comment.thread_diff_side, normalize_string(comment.diff_side, "")),
+          is_resolved = comment.thread_is_resolved == true,
+          is_outdated = comment.thread_is_outdated == true,
+          comments = {},
+        }
+        fallback_threads[fallback_key] = target
+        merged[#merged + 1] = target
+        if thread_id ~= "" then
+          by_thread_id[thread_id] = target
+        end
+      end
+    end
+
+    local exists = false
+    for _, existing in ipairs(type(target.comments) == "table" and target.comments or {}) do
+      if normalize_string(existing.id, "") == normalize_string(comment.id, "") then
+        exists = true
+        break
+      end
+    end
+
+    if not exists then
+      target.comments[#target.comments + 1] = {
+        id = normalize_string(comment.id, ""),
+        path = path,
+        line = tonumber(comment.line) or 0,
+        original_line = tonumber(comment.original_line) or 0,
+        diff_hunk = normalize_string(comment.diff_hunk, ""),
+        diff_side = normalize_string(comment.diff_side, normalize_string(comment.thread_diff_side, "")),
+        commit_oid = normalize_string(comment.commit_oid, ""),
+        original_commit_oid = normalize_string(comment.original_commit_oid, ""),
+        author = normalize_login(comment.author, "unknown"),
+        body = normalize_string(comment.body, ""),
+        created_at = normalize_string(comment.created_at, ""),
+        state = normalize_string(comment.state, "PENDING"),
+        outdated = comment.outdated == true,
+        url = normalize_string(comment.url, ""),
+        reaction_groups = normalize_reaction_groups(comment.reaction_groups),
+        is_pending = true,
+      }
+    end
+
+    table.sort(target.comments, function(left, right)
+      local left_key = normalize_string(left.created_at, "") .. ":" .. normalize_string(left.id, "")
+      local right_key = normalize_string(right.created_at, "") .. ":" .. normalize_string(right.id, "")
+      return left_key < right_key
+    end)
+  end
+
+  return merged
+end
+
+function M.merge_pending_review_comments(threads, pending_payload)
+  return merge_pending_review_comments(threads, pending_payload)
 end
 
 local function normalize_line_number(value)
@@ -1688,6 +2206,227 @@ mutation($pullRequestReviewId:ID!, $body:String!) {
   end
 
   return true, nil
+end
+
+function M.reply_to_review_thread(number, opts)
+  opts = type(opts) == "table" and opts or {}
+
+  local thread_id = normalize_string(opts.thread_id, "")
+  if thread_id == "" then
+    return false, "Missing review thread id"
+  end
+
+  local body = type(opts.body) == "string" and vim.trim(opts.body) or ""
+  if body == "" then
+    return false, "Thread reply message cannot be empty"
+  end
+
+  local pending, pending_err = M.ensure_pending_review(number)
+  if not pending then
+    return false, pending_err
+  end
+
+  local review_id = normalize_string(pending.id, "")
+  if review_id == "" then
+    return false, "Missing pending review id"
+  end
+
+  local mutation = [[
+mutation($pullRequestReviewId:ID!, $pullRequestReviewThreadId:ID!, $body:String!) {
+  addPullRequestReviewThreadReply(input:{
+    pullRequestReviewId:$pullRequestReviewId,
+    pullRequestReviewThreadId:$pullRequestReviewThreadId,
+    body:$body
+  }) {
+    comment {
+      id
+      body
+    }
+  }
+}
+]]
+
+  local response, err = run_graphql(mutation, {
+    { flag = "-f", key = "pullRequestReviewId", value = review_id },
+    { flag = "-f", key = "pullRequestReviewThreadId", value = thread_id },
+    { flag = "-f", key = "body", value = body },
+  })
+  if not response then
+    return false, err
+  end
+
+  local data = response.data
+  local mutation_node = type(data) == "table" and data.addPullRequestReviewThreadReply or nil
+  local comment = type(mutation_node) == "table" and mutation_node.comment or nil
+  if type(comment) ~= "table" or type(comment.id) ~= "string" or comment.id == "" then
+    return false, "Unable to add reply to review thread"
+  end
+
+  return true, nil
+end
+
+function M.update_review_comment(comment_id, body)
+  comment_id = normalize_string(comment_id, "")
+  local message = type(body) == "string" and vim.trim(body) or ""
+  if comment_id == "" then
+    return false, "Missing review comment id"
+  end
+  if message == "" then
+    return false, "Review comment message cannot be empty"
+  end
+
+  local mutation = [[
+mutation($pullRequestReviewCommentId:ID!, $body:String!) {
+  updatePullRequestReviewComment(input:{
+    pullRequestReviewCommentId:$pullRequestReviewCommentId,
+    body:$body
+  }) {
+    pullRequestReviewComment {
+      id
+      body
+    }
+  }
+}
+]]
+
+  local response, err = run_graphql(mutation, {
+    { flag = "-f", key = "pullRequestReviewCommentId", value = comment_id },
+    { flag = "-f", key = "body", value = message },
+  })
+  if not response then
+    return false, err
+  end
+
+  local data = response.data
+  local mutation_node = type(data) == "table" and data.updatePullRequestReviewComment or nil
+  local comment = type(mutation_node) == "table" and mutation_node.pullRequestReviewComment or nil
+  if type(comment) ~= "table" or normalize_string(comment.id, "") == "" then
+    return false, "Unable to update review comment"
+  end
+
+  return true, nil
+end
+
+function M.delete_review_comment(comment_id)
+  comment_id = normalize_string(comment_id, "")
+  if comment_id == "" then
+    return false, "Missing review comment id"
+  end
+
+  local mutation = [[
+mutation($pullRequestReviewCommentId:ID!) {
+  deletePullRequestReviewComment(input:{
+    pullRequestReviewCommentId:$pullRequestReviewCommentId
+  }) {
+    pullRequestReviewComment {
+      id
+    }
+  }
+}
+]]
+
+  local response, err = run_graphql(mutation, {
+    { flag = "-f", key = "pullRequestReviewCommentId", value = comment_id },
+  })
+  if not response then
+    return false, err
+  end
+
+  local data = response.data
+  local mutation_node = type(data) == "table" and data.deletePullRequestReviewComment or nil
+  local comment = type(mutation_node) == "table" and mutation_node.pullRequestReviewComment or nil
+  if type(comment) ~= "table" or normalize_string(comment.id, "") == "" then
+    return false, "Unable to delete review comment"
+  end
+
+  return true, nil
+end
+
+function M.set_review_comment_reaction(comment_id, content, enabled)
+  comment_id = normalize_string(comment_id, "")
+  content = normalize_string(content, ""):upper()
+  if comment_id == "" then
+    return false, "Missing review comment id"
+  end
+  if content == "" then
+    return false, "Missing reaction content"
+  end
+
+  local mutation_name = enabled == false and "removeReaction" or "addReaction"
+  local mutation = string.format([[
+mutation($subjectId:ID!, $content:ReactionContent!) {
+  %s(input:{
+    subjectId:$subjectId,
+    content:$content
+  }) {
+    subject {
+      id
+    }
+  }
+}
+]], mutation_name)
+
+  local response, err = run_graphql(mutation, {
+    { flag = "-f", key = "subjectId", value = comment_id },
+    { flag = "-F", key = "content", value = content },
+  })
+  if not response then
+    return false, err
+  end
+
+  local data = response.data
+  local mutation_node = type(data) == "table" and data[mutation_name] or nil
+  local subject = type(mutation_node) == "table" and mutation_node.subject or nil
+  if type(subject) ~= "table" or normalize_string(subject.id, "") == "" then
+    return false, enabled == false and "Unable to remove reaction" or "Unable to add reaction"
+  end
+
+  return true, nil
+end
+
+local function mutate_review_thread_resolution(thread_id, resolved)
+  thread_id = normalize_string(thread_id, "")
+  if thread_id == "" then
+    return false, "Missing review thread id"
+  end
+
+  local mutation_name = resolved == true and "resolveReviewThread" or "unresolveReviewThread"
+  local mutation = string.format([[
+mutation($threadId:ID!) {
+  %s(input:{ threadId:$threadId }) {
+    thread {
+      id
+      isResolved
+    }
+  }
+}
+]], mutation_name)
+
+  local response, err = run_graphql(mutation, {
+    { flag = "-f", key = "threadId", value = thread_id },
+  })
+  if not response then
+    return false, err
+  end
+
+  local data = response.data
+  local mutation_node = type(data) == "table" and data[mutation_name] or nil
+  local thread = type(mutation_node) == "table" and mutation_node.thread or nil
+  if type(thread) ~= "table" or type(thread.id) ~= "string" or thread.id == "" then
+    return false, resolved == true
+        and "Unable to resolve review thread"
+      or "Unable to unresolve review thread"
+  end
+
+  return true, nil
+end
+
+function M.resolve_review_thread(thread_id)
+  return mutate_review_thread_resolution(thread_id, true)
+end
+
+function M.unresolve_review_thread(thread_id)
+  return mutate_review_thread_resolution(thread_id, false)
 end
 
 local function normalize_pending_event(event)

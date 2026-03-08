@@ -7,6 +7,7 @@ local state = {
     file = nil,
   },
   viewed = {},
+  viewed_remote = {},
   reviews = {},
   prefs = {
     diff_view = {
@@ -124,6 +125,48 @@ local function ensure_pr_bucket(repo_full_name, pr_number)
   return state.viewed[repo_full_name][tostring(pr_number)]
 end
 
+local function get_remote_pr_bucket(repo_full_name, pr_number)
+  if type(repo_full_name) ~= "string" or repo_full_name == "" then
+    return nil
+  end
+
+  if type(pr_number) ~= "number" then
+    return nil
+  end
+
+  local repo_bucket = state.viewed_remote[repo_full_name]
+  if type(repo_bucket) ~= "table" then
+    return nil
+  end
+
+  local pr_bucket = repo_bucket[tostring(pr_number)]
+  if type(pr_bucket) ~= "table" then
+    return nil
+  end
+
+  return pr_bucket
+end
+
+local function ensure_remote_pr_bucket(repo_full_name, pr_number)
+  if type(repo_full_name) ~= "string" or repo_full_name == "" then
+    return nil
+  end
+
+  if type(pr_number) ~= "number" then
+    return nil
+  end
+
+  state.viewed_remote[repo_full_name] = state.viewed_remote[repo_full_name] or {}
+  state.viewed_remote[repo_full_name][tostring(pr_number)] = state.viewed_remote[repo_full_name][tostring(pr_number)] or {
+    loaded = false,
+    files = {},
+  }
+  local bucket = state.viewed_remote[repo_full_name][tostring(pr_number)]
+  bucket.files = type(bucket.files) == "table" and bucket.files or {}
+  bucket.loaded = bucket.loaded == true
+  return bucket
+end
+
 local function normalize_path(path)
   if type(path) ~= "string" then
     return ""
@@ -232,6 +275,12 @@ function M.is_viewed(repo_full_name, pr_number, path)
     return false
   end
 
+  local remote_bucket = get_remote_pr_bucket(repo_full_name, pr_number)
+  if type(remote_bucket) == "table" and remote_bucket.loaded == true then
+    local files = type(remote_bucket.files) == "table" and remote_bucket.files or {}
+    return files[path] == true
+  end
+
   local pr_bucket = get_pr_bucket(repo_full_name, pr_number)
   if not pr_bucket then
     return false
@@ -279,6 +328,70 @@ function M.reset_pr_viewed(repo_full_name, pr_number)
 
   state.viewed[repo_full_name][tostring(pr_number)] = {}
   save_persisted_state()
+  return true
+end
+
+function M.has_remote_viewed_state(repo_full_name, pr_number)
+  local bucket = get_remote_pr_bucket(repo_full_name, pr_number)
+  return type(bucket) == "table" and bucket.loaded == true
+end
+
+function M.replace_remote_viewed(repo_full_name, pr_number, viewed_map)
+  local bucket = ensure_remote_pr_bucket(repo_full_name, pr_number)
+  if not bucket then
+    return false
+  end
+
+  bucket.files = {}
+  for path, viewed in pairs(type(viewed_map) == "table" and viewed_map or {}) do
+    local normalized = normalize_path(path)
+    if normalized ~= "" and viewed == true then
+      bucket.files[normalized] = true
+    end
+  end
+  bucket.loaded = true
+  return true
+end
+
+function M.set_remote_viewed(repo_full_name, pr_number, path, viewed)
+  path = normalize_path(path)
+  if path == "" then
+    return false
+  end
+
+  local bucket = ensure_remote_pr_bucket(repo_full_name, pr_number)
+  if not bucket then
+    return false
+  end
+
+  if viewed == true then
+    bucket.files[path] = true
+  else
+    bucket.files[path] = nil
+  end
+  bucket.loaded = true
+  return true
+end
+
+function M.clear_remote_viewed(repo_full_name, pr_number)
+  if type(repo_full_name) ~= "string" or repo_full_name == "" then
+    return false
+  end
+
+  local repo_bucket = state.viewed_remote[repo_full_name]
+  if type(repo_bucket) ~= "table" then
+    return false
+  end
+
+  if type(pr_number) == "number" then
+    if repo_bucket[tostring(pr_number)] == nil then
+      return false
+    end
+    repo_bucket[tostring(pr_number)] = nil
+    return true
+  end
+
+  state.viewed_remote[repo_full_name] = nil
   return true
 end
 
