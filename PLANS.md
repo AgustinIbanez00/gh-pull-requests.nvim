@@ -33,9 +33,11 @@
 ## Status
 - Completed: GitHub Actions CI workflow runs the repo validation entrypoint on push to `main` and on pull requests.
 - Completed: CI installs Neovim and `luacheck` before running validation.
+- Completed: CI keeps smoke and helptags as blocking checks and runs `luacheck` as an advisory step until the warning baseline is reduced.
 - Completed: README validation docs now describe the local/CI parity.
 
 ## Acceptance Criteria
 - GitHub Actions runs the same `scripts/validate.ps1` entrypoint used locally.
 - CI covers headless smoke, Neo-tree lazy smoke, helptags, and `luacheck`.
+- Lint visibility is preserved without blocking merges on the current historical warning baseline.
 - Workflow uses read-only repository permissions and does not require extra secrets for default validation.

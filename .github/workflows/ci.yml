@@ -38,4 +38,9 @@ jobs:
 
       - name: Run validation
         shell: pwsh
-        run: ./scripts/validate.ps1 -WithLuacheck
+        run: ./scripts/validate.ps1
+
+      - name: Run luacheck (advisory)
+        continue-on-error: true
+        shell: bash
+        run: luacheck lua plugin

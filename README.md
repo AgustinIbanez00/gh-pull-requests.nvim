@@ -98,7 +98,7 @@ pwsh -File scripts/validate.ps1
 ```
 
 This command runs headless smoke checks and helptags generation in one step.
-The same entrypoint is used by GitHub Actions CI on every push to `main` and on pull requests.
+GitHub Actions CI uses the same validation entrypoint on every push to `main` and on pull requests, and runs `luacheck` as a separate advisory step while the repo still carries a historical warning baseline.
 It now includes:
 
 - command and entrypoint smoke (`scripts/headless_smoke.ps1`)
@@ -114,7 +114,7 @@ pwsh -File scripts/validate.ps1 -WithLuacheck -WithCheckHealth
 Validation prerequisites:
 
 - `pwsh` and `nvim` available in `PATH`
-- `luacheck` only when `-WithLuacheck` is used locally or in CI
+- `luacheck` only when `-WithLuacheck` is used locally; CI runs it separately as an advisory step
 - `gh auth login` recommended when `-WithCheckHealth` is used
 
 ## Installation
