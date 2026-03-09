@@ -335,6 +335,7 @@ local function normalize_thread_comment(comment, fallback_index)
 
   return {
     id = type(comment.id) == "string" and comment.id ~= "" and comment.id or tostring(fallback_index),
+    database_id = tonumber(comment.databaseId) or tonumber(comment.database_id),
     author = author,
     body = type(comment.body) == "string" and comment.body or "",
     created_at = type(comment.createdAt) == "string" and comment.createdAt

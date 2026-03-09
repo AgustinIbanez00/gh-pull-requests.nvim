@@ -200,6 +200,12 @@ local function resolve_image_options()
     external_command = { "magick", "identify", "-format", "%w %h", "{file}" }
   end
 
+  local fallback_open_local = type(images.fallback_open_local) == "string" and images.fallback_open_local:lower()
+    or "disabled"
+  if fallback_open_local ~= "disabled" and fallback_open_local ~= "reveal_only" and fallback_open_local ~= "system" then
+    fallback_open_local = "disabled"
+  end
+
   return {
     enabled = images.enabled ~= false,
     backend = type(images.backend) == "string" and images.backend:lower() or "snacks",
@@ -211,7 +217,7 @@ local function resolve_image_options()
         and images.fallback_default_action:lower()
       or "metadata",
     fallback_menu_keymap = type(images.fallback_menu_keymap) == "string" and images.fallback_menu_keymap or "gf",
-    fallback_open_local = type(images.fallback_open_local) == "string" and images.fallback_open_local:lower() or "system",
+    fallback_open_local = fallback_open_local,
     fallback_github_target = type(images.fallback_github_target) == "string"
         and images.fallback_github_target:lower()
       or "pr_files",

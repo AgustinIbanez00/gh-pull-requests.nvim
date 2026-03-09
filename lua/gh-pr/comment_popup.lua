@@ -1,4 +1,6 @@
 local M = {}
+local config = require("gh-pr.config")
+local reactions = require("gh-pr.reactions")
 
 local active_popups = {
   by_origin = {},
@@ -9,6 +11,18 @@ local function safe_string(value, fallback)
     return value
   end
   return fallback or ""
+end
+
+local function positive_integer(value, fallback)
+  local number = tonumber(value)
+  if not number then
+    return fallback
+  end
+  number = math.floor(number)
+  if number < 1 then
+    return fallback
+  end
+  return number
 end
 
 local function valid_buf(bufnr)
@@ -32,6 +46,56 @@ end
 
 local function clamp(value, minimum, maximum)
   return math.max(minimum, math.min(maximum, value))
+end
+
+local function normalize_footer_lines(value)
+  if type(value) == "string" and value ~= "" then
+    return { value }
+  end
+  if type(value) ~= "table" or vim.tbl_isempty(value) then
+    return {}
+  end
+
+  local lines = {}
+  for _, line in ipairs(value) do
+    if line ~= nil then
+      lines[#lines + 1] = type(line) == "string" and line or tostring(line)
+    end
+  end
+  return lines
+end
+
+local function resolve_footer_lines(opts, item, popup_ctx)
+  if type(opts.footer_provider) == "function" then
+    local ok, result = pcall(opts.footer_provider, item, popup_ctx or {})
+    if ok then
+      local lines = normalize_footer_lines(result)
+      if not vim.tbl_isempty(lines) then
+        return lines
+      end
+    else
+      vim.schedule(function()
+        vim.notify("Unable to render comment popup footer: " .. tostring(result), vim.log.levels.WARN)
+      end)
+    end
+  end
+  return normalize_footer_lines(opts.footer_lines)
+end
+
+local function append_footer_lines(lines, footer_lines)
+  footer_lines = normalize_footer_lines(footer_lines)
+  if vim.tbl_isempty(footer_lines) then
+    return lines, false
+  end
+
+  if #lines > 0 and lines[#lines] ~= "" then
+    lines[#lines + 1] = ""
+  end
+  for _, line in ipairs(footer_lines) do
+    lines[#lines + 1] = line
+  end
+
+  return lines, true
 end
 
 local function tag_key(tag)
@@ -117,24 +181,20 @@ function M.close_for_origin(origin_bufnr, tag)
   active_popups.by_origin[origin_bufnr] = nil
 end
 
-local function build_lines(opts)
+local function build_lines(opts, selected_item_index)
   if type(opts.lines) == "table" and not vim.tbl_isempty(opts.lines) then
     local lines = vim.deepcopy(opts.lines)
-    local footer_lines = type(opts.footer_lines) == "table" and opts.footer_lines or {}
-    if not vim.tbl_isempty(footer_lines) then
-      if #lines > 0 and lines[#lines] ~= "" then
-        lines[#lines + 1] = ""
-      end
-      for _, line in ipairs(footer_lines) do
-        lines[#lines + 1] = type(line) == "string" and line or tostring(line)
-      end
-    end
-    return lines, {}, {}
+    append_footer_lines(lines, resolve_footer_lines(opts, nil, {}))
+    return lines, {}, {}, {
+      first_item_line = nil,
+      selected_item_index = nil,
+    }
   end
 
   local lines = {}
   local line_items = {}
   local normalized_items = {}
+  local first_item_line = nil
   lines[#lines + 1] = safe_string(opts.title, "PR comments")
 
   local location = safe_string(opts.location, "")
@@ -153,14 +213,11 @@ local function build_lines(opts)
   local items = type(opts.items) == "table" and opts.items or {}
   if vim.tbl_isempty(items) then
     lines[#lines + 1] = "(no comments)"
-    local footer_lines = type(opts.footer_lines) == "table" and opts.footer_lines or {}
-    if not vim.tbl_isempty(footer_lines) then
-      lines[#lines + 1] = ""
-      for _, line in ipairs(footer_lines) do
-        lines[#lines + 1] = type(line) == "string" and line or tostring(line)
-      end
-    end
-    return lines, line_items, normalized_items
+    append_footer_lines(lines, resolve_footer_lines(opts, nil, {}))
+    return lines, line_items, normalized_items, {
+      first_item_line = nil,
+      selected_item_index = nil,
+    }
   end
 
   for index, item in ipairs(items) do
@@ -181,6 +238,9 @@ local function build_lines(opts)
     local author = normalized.author
     local created_at = normalized.created_at
     local first_line = #lines + 1
+    if not first_item_line then
+      first_item_line = first_line
+    end
     lines[#lines + 1] = string.format("%s[%s] @%s - %s", marker, state, author, created_at)
 
     local body = normalized.body
@@ -194,17 +254,14 @@ local function build_lines(opts)
 
     local reaction_groups = type(normalized.meta) == "table" and normalized.meta.reaction_groups or nil
     if type(reaction_groups) == "table" and not vim.tbl_isempty(reaction_groups) then
-      local reaction_parts = {}
-      for _, group in ipairs(reaction_groups) do
-        local content = safe_string(type(group) == "table" and group.content or "", "")
-        local total_count = tonumber(type(group) == "table" and group.total_count or 0) or 0
-        if content ~= "" and total_count > 0 then
-          local suffix = type(group) == "table" and group.viewer_has_reacted == true and "*" or ""
-          reaction_parts[#reaction_parts + 1] = string.format("%s:%d%s", content, total_count, suffix)
-        end
-      end
-      if not vim.tbl_isempty(reaction_parts) then
-        lines[#lines + 1] = "  Reactions: " .. table.concat(reaction_parts, "  ")
+      local line_comments = (config.get() or {}).line_comments or {}
+      local reaction_cfg = type(line_comments.reactions) == "table" and line_comments.reactions or {}
+      local summary = reactions.render_summary(reaction_groups, {
+        render = reaction_cfg.render,
+        viewer_marker = reaction_cfg.viewer_marker,
+      })
+      if summary ~= "" then
+        lines[#lines + 1] = "  Reactions: " .. summary
       end
     end
 
@@ -223,15 +280,19 @@ local function build_lines(opts)
     end
   end
 
-  local footer_lines = type(opts.footer_lines) == "table" and opts.footer_lines or {}
-  if not vim.tbl_isempty(footer_lines) then
-    lines[#lines + 1] = ""
-    for _, line in ipairs(footer_lines) do
-      lines[#lines + 1] = type(line) == "string" and line or tostring(line)
-    end
+  local resolved_item_index = positive_integer(selected_item_index)
+  if not resolved_item_index or not normalized_items[resolved_item_index] then
+    resolved_item_index = normalized_items[1] and 1 or nil
   end
+  local selected_item = resolved_item_index and normalized_items[resolved_item_index] or nil
+  append_footer_lines(lines, resolve_footer_lines(opts, selected_item, {
+    item_index = resolved_item_index,
+  }))
 
-  return lines, line_items, normalized_items
+  return lines, line_items, normalized_items, {
+    first_item_line = first_item_line,
+    selected_item_index = resolved_item_index,
+  }
 end
 
 local function wrapped_rows(lines, content_width)
@@ -325,19 +386,75 @@ local function popup_position(width, height, opts)
   }
 end
 
-local function current_item(popup_buf)
+local function current_item(popup_buf, popup_win)
   if not valid_buf(popup_buf) then
     return nil
   end
 
-  local line = vim.api.nvim_win_get_cursor(0)[1]
+  local line = valid_win(popup_win) and vim.api.nvim_win_get_cursor(popup_win)[1] or 1
   local line_items = vim.b[popup_buf].gh_pr_popup_line_items
   local item_index = type(line_items) == "table" and line_items[line] or nil
   local items = vim.b[popup_buf].gh_pr_popup_items
-  if type(items) ~= "table" or not item_index then
+  if type(items) ~= "table" then
     return nil
   end
-  return items[item_index]
+  if item_index and items[item_index] then
+    vim.b[popup_buf].gh_pr_popup_last_item_index = item_index
+    return items[item_index], item_index
+  end
+
+  local last_item_index = positive_integer(vim.b[popup_buf].gh_pr_popup_last_item_index)
+  if last_item_index and items[last_item_index] then
+    return items[last_item_index], last_item_index
+  end
+
+  return nil
+end
+
+local function render_popup_buffer(popup_buf, popup_win, opts, selected_item_index)
+  if not valid_buf(popup_buf) then
+    return nil
+  end
+
+  local lines, line_items, normalized_items, layout = build_lines(opts, selected_item_index)
+  vim.api.nvim_buf_set_option(popup_buf, "modifiable", true)
+  vim.api.nvim_buf_set_lines(popup_buf, 0, -1, false, lines)
+  vim.api.nvim_buf_set_option(popup_buf, "modifiable", false)
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = popup_buf })
+
+  vim.b[popup_buf].gh_pr_popup_items = normalized_items
+  vim.b[popup_buf].gh_pr_popup_line_items = line_items
+  vim.b[popup_buf].gh_pr_popup_last_item_index = layout.selected_item_index
+  vim.b[popup_buf].gh_pr_popup_first_item_line = layout.first_item_line
+
+  if valid_win(popup_win) then
+    local current_cursor = vim.api.nvim_win_get_cursor(popup_win)
+    local max_line = vim.api.nvim_buf_line_count(popup_buf)
+    local target_line = math.max(1, math.min(max_line, current_cursor[1]))
+    pcall(vim.api.nvim_win_set_cursor, popup_win, { target_line, current_cursor[2] })
+  end
+
+  return layout
+end
+
+local function refresh_context_footer(popup_buf, popup_win, opts)
+  if not valid_buf(popup_buf) or not valid_win(popup_win) then
+    return
+  end
+
+  local line = vim.api.nvim_win_get_cursor(popup_win)[1]
+  local line_items = vim.b[popup_buf].gh_pr_popup_line_items
+  local item_index = type(line_items) == "table" and line_items[line] or nil
+  if not item_index then
+    return
+  end
+
+  local last_item_index = positive_integer(vim.b[popup_buf].gh_pr_popup_last_item_index)
+  if item_index == last_item_index then
+    return
+  end
+
+  render_popup_buffer(popup_buf, popup_win, opts, item_index)
 end
 
 local function setup_keymaps(popup_buf, popup_win, origin_bufnr, tag, opts)
@@ -349,7 +466,7 @@ local function setup_keymaps(popup_buf, popup_win, origin_bufnr, tag, opts)
 
   local function with_item(callback)
     return function()
-      local item = current_item(popup_buf)
+      local item = current_item(popup_buf, popup_win)
       if not item then
         vim.notify("Move the cursor onto a comment first", vim.log.levels.INFO)
         return
@@ -444,7 +561,7 @@ function M.open(opts)
   local tag = tag_key(opts.tag)
   M.close_for_origin(origin_bufnr, tag)
 
-  local lines, line_items, normalized_items = build_lines(opts)
+  local lines, line_items, normalized_items, layout = build_lines(opts)
   local width, height = popup_size(lines, opts)
   local placement = popup_position(width, height, opts)
   local final_width = placement.width or width
@@ -481,7 +598,13 @@ function M.open(opts)
 
   vim.b[popup_buf].gh_pr_popup_items = normalized_items
   vim.b[popup_buf].gh_pr_popup_line_items = line_items
+  vim.b[popup_buf].gh_pr_popup_last_item_index = layout.selected_item_index
+  vim.b[popup_buf].gh_pr_popup_first_item_line = layout.first_item_line
   setup_keymaps(popup_buf, popup_win, origin_bufnr, tag, opts)
+
+  if enter_popup and type(layout.first_item_line) == "number" then
+    pcall(vim.api.nvim_win_set_cursor, popup_win, { layout.first_item_line, 0 })
+  end
 
   active_popups.by_origin[origin_bufnr] = active_popups.by_origin[origin_bufnr] or {}
   active_popups.by_origin[origin_bufnr][tag] = popup_win
@@ -516,6 +639,15 @@ function M.open(opts)
         end,
       })
     end
+  end
+
+  if type(opts.footer_provider) == "function" then
+    vim.api.nvim_create_autocmd("CursorMoved", {
+      buffer = popup_buf,
+      callback = function()
+        refresh_context_footer(popup_buf, popup_win, opts)
+      end,
+    })
   end
 
   return true, nil

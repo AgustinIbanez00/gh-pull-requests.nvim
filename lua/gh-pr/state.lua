@@ -1,4 +1,5 @@
 local M = {}
+local review_context = require("gh-pr.core.review_context")
 
 local state = {
   active = {
@@ -168,11 +169,7 @@ local function ensure_remote_pr_bucket(repo_full_name, pr_number)
 end
 
 local function normalize_path(path)
-  if type(path) ~= "string" then
-    return ""
-  end
-
-  return path:gsub("\\", "/")
+  return review_context.normalize_path(path)
 end
 
 local function normalize_diff_mode(mode)

@@ -8,6 +8,9 @@ local function normalize_url(url)
   if not value:match("^https?://") then
     return nil, "Only http/https URLs are supported"
   end
+  if value:find("[%c]") or value:find("%s") or value:find('"', 1, true) then
+    return nil, "URL contains unsupported whitespace or control characters"
+  end
   return value, nil
 end
 
@@ -53,7 +56,6 @@ local function try_system_open(url)
 
   if is_windows then
     commands = {
-      { "cmd.exe", "/c", "start", "", url },
       { "rundll32", "url.dll,FileProtocolHandler", url },
       { "explorer.exe", url },
     }
@@ -134,5 +136,7 @@ function M.open(url, opts)
   maybe_notify_error(final_err, opts)
   return false, final_err
 end
+
+M._normalize_url = normalize_url
 
 return M

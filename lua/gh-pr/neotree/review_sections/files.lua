@@ -1,5 +1,6 @@
 local config = require("gh-pr.config")
 local path_tree = require("gh-pr.path_tree")
+local review_context = require("gh-pr.core.review_context")
 local runtime_state = require("gh-pr.state")
 
 local M = {}
@@ -142,13 +143,7 @@ local function parent_path_of_file(path)
 end
 
 local function normalize_tree_path(path)
-  if type(path) ~= "string" then
-    return ""
-  end
-
-  local normalized = path:gsub("\\", "/"):gsub("/+", "/")
-  normalized = normalized:gsub("^/", ""):gsub("/$", "")
-  return normalized
+  return review_context.normalize_path(path)
 end
 
 local function directory_path_of_file(path)
@@ -214,15 +209,19 @@ local function resolve_comment_path(raw_comment, fallback_path)
   return type(fallback_path) == "string" and fallback_path or ""
 end
 
-local function build_file_comment_counts(raw_threads, pending_comments)
+local function build_file_comment_counts(raw_threads, pending_comments, file_lookup)
   local counts = {}
   local seen_comment_ids_by_path = {}
 
   for thread_index, raw_thread in ipairs(type(raw_threads) == "table" and raw_threads or {}) do
-    local normalized_thread_path = normalize_tree_path(resolve_thread_path(raw_thread))
+    local normalized_thread_path = review_context.resolve_canonical_file_path(nil, resolve_thread_path(raw_thread), {
+      lookup = file_lookup,
+    })
     local comments = type(raw_thread) == "table" and type(raw_thread.comments) == "table" and raw_thread.comments or {}
     for comment_index, raw_comment in ipairs(comments) do
-      local normalized_path = normalize_tree_path(resolve_comment_path(raw_comment, normalized_thread_path))
+      local normalized_path = review_context.resolve_canonical_file_path(nil, resolve_comment_path(raw_comment, normalized_thread_path), {
+        lookup = file_lookup,
+      })
       if normalized_path ~= "" then
         seen_comment_ids_by_path[normalized_path] = seen_comment_ids_by_path[normalized_path] or {}
         local path_seen_ids = seen_comment_ids_by_path[normalized_path]
@@ -238,9 +237,11 @@ local function build_file_comment_counts(raw_threads, pending_comments)
   end
 
   for index, raw_comment in ipairs(type(pending_comments) == "table" and pending_comments or {}) do
-    local normalized_path = normalize_tree_path(type(raw_comment) == "table"
+    local normalized_path = review_context.resolve_canonical_file_path(nil, type(raw_comment) == "table"
         and (raw_comment.path or raw_comment.thread_path)
-      or nil)
+      or nil, {
+      lookup = file_lookup,
+    })
     if normalized_path ~= "" then
       seen_comment_ids_by_path[normalized_path] = seen_comment_ids_by_path[normalized_path] or {}
       local path_seen_ids = seen_comment_ids_by_path[normalized_path]
@@ -281,12 +282,15 @@ function M.build_nodes(pr, details, repo_full_name, opts)
   local configured_hide_viewed = (config.get() or {}).hide_viewed_files == true
   local filters = sanitize_file_filters(type(opts) == "table" and opts.filters or nil)
   local hide_viewed = type(filters.hide_viewed) == "boolean" and filters.hide_viewed or configured_hide_viewed
+  local resolved_repo_full_name = review_context.resolve_repository_full_name(details, repo_full_name)
+  local file_lookup = review_context.build_file_lookup(details)
   local entries = {}
   local seen_paths = {}
   local directory_counts = {}
   local file_comment_counts = build_file_comment_counts(
     type(details) == "table" and details.review_threads or nil,
-    type(details) == "table" and details.pending_review_comments or nil
+    type(details) == "table" and details.pending_review_comments or nil,
+    file_lookup
   )
   local total_files = 0
   local viewed_files = 0
@@ -294,13 +298,14 @@ function M.build_nodes(pr, details, repo_full_name, opts)
   for _, file in ipairs(type(details.files) == "table" and details.files or {}) do
     local path = file.path or file.filename
     if type(path) == "string" and path ~= "" then
-      local normalized_path = normalize_tree_path(path)
+      local normalized_path = review_context.resolve_canonical_file_path(details, path, {
+        lookup = file_lookup,
+      })
       if normalized_path == "" or seen_paths[normalized_path] then
         goto continue
       end
-      seen_paths[path] = true
       seen_paths[normalized_path] = true
-      local viewed = runtime_state.is_viewed(repo_full_name, pr.number, normalized_path)
+      local viewed = runtime_state.is_viewed(resolved_repo_full_name, pr.number, normalized_path)
       add_directory_count(directory_counts, directory_path_of_file(normalized_path), viewed)
       total_files = total_files + 1
       if viewed then
@@ -384,7 +389,7 @@ function M.build_nodes(pr, details, repo_full_name, opts)
           file = file,
           pr = pr,
           details = details,
-          repo = repo_full_name,
+          repo = resolved_repo_full_name,
           path_render_mode = resolved_mode,
           parent_path = parent_path_of_file(path),
           file_status = type(metadata.file_status) == "string" and metadata.file_status or "modified",

@@ -487,6 +487,7 @@ local function normalize_threads(threads)
     for _, comment in ipairs(type(thread.comments) == "table" and thread.comments or {}) do
       thread_comments[#thread_comments + 1] = {
         id = normalize_string(comment.id, ""),
+        database_id = tonumber(comment.databaseId) or tonumber(comment.database_id),
         path = normalize_string(comment.path, normalize_string(thread.path, "")),
         line = tonumber(comment.line) or 0,
         original_line = tonumber(comment.originalLine) or 0,
@@ -1494,6 +1495,7 @@ query($owner:String!, $name:String!, $number:Int!) {
           comments(first:100) {
             nodes {
               id
+              databaseId
               path
               line
               originalLine
@@ -1505,6 +1507,7 @@ query($owner:String!, $name:String!, $number:Int!) {
               outdated
               url
               author { login }
+              viewerDidAuthor
               commit { oid }
               originalCommit { oid }
               replyTo { id }
@@ -1560,6 +1563,7 @@ query($owner:String!, $name:String!, $number:Int!) {
       local thread = type(comment.pullRequestReviewThread) == "table" and comment.pullRequestReviewThread or {}
       comments[#comments + 1] = {
         id = normalize_string(comment.id, ""),
+        database_id = tonumber(comment.databaseId) or tonumber(comment.database_id),
         path = normalize_string(comment.path, normalize_string(thread.path, "")),
         line = tonumber(comment.line) or tonumber(thread.line) or 0,
         original_line = tonumber(comment.originalLine) or tonumber(thread.originalLine) or 0,
@@ -1573,6 +1577,7 @@ query($owner:String!, $name:String!, $number:Int!) {
         outdated = comment.outdated == true,
         url = normalize_string(comment.url, ""),
         author = normalize_login(comment.author, "unknown"),
+        viewer_did_author = comment.viewerDidAuthor == true or comment.viewer_did_author == true,
         commit_oid = normalize_string(type(comment.commit) == "table" and comment.commit.oid or "", ""),
         original_commit_oid = normalize_string(type(comment.originalCommit) == "table" and comment.originalCommit.oid or "", ""),
         thread_id = normalize_string(thread.id, ""),
@@ -1629,6 +1634,7 @@ query($owner:String!, $name:String!, $number:Int!) {
           comments(first:100) {
             nodes {
               id
+              databaseId
               path
               line
               originalLine
@@ -1640,6 +1646,7 @@ query($owner:String!, $name:String!, $number:Int!) {
               outdated
               url
               author { login }
+              viewerDidAuthor
               commit { oid }
               originalCommit { oid }
               replyTo { id }
@@ -1697,6 +1704,7 @@ query($owner:String!, $name:String!, $number:Int!) {
         local thread = type(comment.pullRequestReviewThread) == "table" and comment.pullRequestReviewThread or {}
         comments[#comments + 1] = {
           id = normalize_string(comment.id, ""),
+          database_id = tonumber(comment.databaseId) or tonumber(comment.database_id),
           path = normalize_string(comment.path, normalize_string(thread.path, "")),
           line = tonumber(comment.line) or tonumber(thread.line) or 0,
           original_line = tonumber(comment.originalLine) or tonumber(thread.originalLine) or 0,
@@ -1710,6 +1718,7 @@ query($owner:String!, $name:String!, $number:Int!) {
           outdated = comment.outdated == true,
           url = normalize_string(comment.url, ""),
           author = normalize_login(comment.author, "unknown"),
+          viewer_did_author = comment.viewerDidAuthor == true or comment.viewer_did_author == true,
           commit_oid = normalize_string(type(comment.commit) == "table" and comment.commit.oid or "", ""),
           original_commit_oid = normalize_string(type(comment.originalCommit) == "table" and comment.originalCommit.oid or "", ""),
           thread_id = normalize_string(thread.id, ""),
@@ -1970,6 +1979,7 @@ local function merge_pending_review_comments(threads, pending_payload)
     if not exists then
       target.comments[#target.comments + 1] = {
         id = normalize_string(comment.id, ""),
+        database_id = tonumber(comment.database_id) or tonumber(comment.databaseId),
         path = path,
         line = tonumber(comment.line) or 0,
         original_line = tonumber(comment.original_line) or 0,
@@ -1983,6 +1993,7 @@ local function merge_pending_review_comments(threads, pending_payload)
         state = normalize_string(comment.state, "PENDING"),
         outdated = comment.outdated == true,
         url = normalize_string(comment.url, ""),
+        viewer_did_author = comment.viewer_did_author == true or comment.viewerDidAuthor == true,
         reaction_groups = normalize_reaction_groups(comment.reaction_groups),
         is_pending = true,
       }
@@ -2307,7 +2318,24 @@ mutation($pullRequestReviewCommentId:ID!, $body:String!) {
   return true, nil
 end
 
-function M.delete_review_comment(comment_id)
+local function normalize_review_comment_ref(comment)
+  if type(comment) == "table" then
+    return {
+      comment_id = normalize_string(comment.comment_id, normalize_string(comment.id, "")),
+      database_id = tonumber(comment.comment_database_id) or tonumber(comment.database_id) or tonumber(comment.id),
+      repository = normalize_repository_filter(comment.repository),
+    }
+  end
+
+  local numeric_id = tonumber(comment)
+  return {
+    comment_id = normalize_string(comment, ""),
+    database_id = numeric_id and math.floor(numeric_id) or nil,
+    repository = nil,
+  }
+end
+
+local function delete_review_comment_graphql(comment_id)
   comment_id = normalize_string(comment_id, "")
   if comment_id == "" then
     return false, "Missing review comment id"
@@ -2340,6 +2368,43 @@ mutation($pullRequestReviewCommentId:ID!) {
   end
 
   return true, nil
+end
+
+function M.delete_review_comment(comment)
+  local ref = normalize_review_comment_ref(comment)
+  if type(ref) ~= "table" then
+    return false, "Missing review comment id"
+  end
+
+  if type(ref.database_id) == "number" and ref.database_id > 0 then
+    local repository = ref.repository
+    if not repository then
+      local repo, repo_err = M.resolve_repository()
+      if not repo then
+        return false, repo_err
+      end
+      repository = normalize_repository_filter(repo)
+    end
+
+    if not repository then
+      return false, "Unable to resolve repository for review comment delete"
+    end
+
+    local endpoint = string.format(
+      "repos/%s/%s/pulls/comments/%d",
+      repository.owner,
+      repository.name,
+      ref.database_id
+    )
+    local _, err = gh.run({ "api", "-X", "DELETE", endpoint })
+    if err then
+      return false, "Unable to delete review comment: " .. tostring(err)
+    end
+
+    return true, nil
+  end
+
+  return delete_review_comment_graphql(ref.comment_id)
 end
 
 function M.set_review_comment_reaction(comment_id, content, enabled)

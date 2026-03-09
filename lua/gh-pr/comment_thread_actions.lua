@@ -1,18 +1,9 @@
 local comment_composer = require("gh-pr.comment_composer")
 local pr_service = require("gh-pr.pr_service")
+local reaction_picker = require("gh-pr.ui.reaction_picker")
+local reactions = require("gh-pr.reactions")
 
 local M = {}
-
-local REACTION_CHOICES = {
-  { value = "THUMBS_UP", label = "Thumbs up" },
-  { value = "THUMBS_DOWN", label = "Thumbs down" },
-  { value = "LAUGH", label = "Laugh" },
-  { value = "HOORAY", label = "Hooray" },
-  { value = "CONFUSED", label = "Confused" },
-  { value = "HEART", label = "Heart" },
-  { value = "ROCKET", label = "Rocket" },
-  { value = "EYES", label = "Eyes" },
-}
 
 local function safe_string(value, fallback)
   if type(value) == "string" and value ~= "" then
@@ -88,6 +79,10 @@ local function current_item_meta(item, ctx)
   if type(meta.comment_id) ~= "string" or meta.comment_id == "" then
     meta.comment_id = safe_string(type(item) == "table" and item.id or "", "")
   end
+  if meta.comment_database_id == nil then
+    meta.comment_database_id = tonumber(type(item) == "table" and item.database_id or nil)
+      or tonumber(type(item) == "table" and item.comment_database_id or nil)
+  end
   if type(meta.comment_author) ~= "string" or meta.comment_author == "" then
     meta.comment_author = safe_string(type(item) == "table" and item.author or "", "unknown")
   end
@@ -110,6 +105,37 @@ local function current_item_meta(item, ctx)
   meta.reaction_groups = type(meta.reaction_groups) == "table" and vim.deepcopy(meta.reaction_groups) or {}
 
   return meta
+end
+
+local function shortcut_footer_lines(meta)
+  local parts = {}
+
+  if type(meta) ~= "table" then
+    return {
+      "q close",
+    }
+  end
+
+  parts[#parts + 1] = "r reply"
+  parts[#parts + 1] = "R quote"
+
+  if safe_string(meta.thread_id, "") ~= "" then
+    parts[#parts + 1] = string.format("x %s", meta.thread_is_resolved == true and "unresolve" or "resolve")
+  end
+  if meta.viewer_did_author == true then
+    parts[#parts + 1] = "e edit"
+    if meta.comment_is_pending ~= true then
+      parts[#parts + 1] = "D delete"
+    end
+  end
+  if meta.comment_is_pending ~= true then
+    parts[#parts + 1] = "+/- reactions"
+  end
+  parts[#parts + 1] = "q close"
+
+  return {
+    table.concat(parts, "  "),
+  }
 end
 
 local function location_label(meta)
@@ -153,36 +179,6 @@ local function refresh_after_mutation(pr_number, details)
       force = true,
     })
   end
-end
-
-local function reaction_group_by_content(groups, content)
-  local normalized = safe_string(content, ""):upper()
-  for _, group in ipairs(type(groups) == "table" and groups or {}) do
-    if safe_string(group.content, ""):upper() == normalized then
-      return group
-    end
-  end
-  return nil
-end
-
-local function reaction_choice_labels(groups)
-  local options = {}
-  for _, choice in ipairs(REACTION_CHOICES) do
-    local group = reaction_group_by_content(groups, choice.value)
-    local count = tonumber(type(group) == "table" and group.total_count or 0) or 0
-    local viewer = type(group) == "table" and group.viewer_has_reacted == true
-    local suffix = ""
-    if count > 0 then
-      suffix = string.format(" (%d%s)", count, viewer and ", you" or "")
-    elseif viewer then
-      suffix = " (you)"
-    end
-    options[#options + 1] = {
-      value = choice.value,
-      label = choice.label .. suffix,
-    }
-  end
-  return options
 end
 
 local function open_reply_composer(ctx, meta, initial_lines)
@@ -344,6 +340,10 @@ local function delete_comment(ctx, meta)
     notify_error("Unable to resolve review comment id")
     return
   end
+  if meta.comment_is_pending == true then
+    notify_info("Draft review comments cannot be deleted yet")
+    return
+  end
   if meta.viewer_did_author ~= true then
     notify_info("Only your own review comments can be deleted")
     return
@@ -355,7 +355,10 @@ local function delete_comment(ctx, meta)
       return
     end
 
-    local ok, delete_err = pr_service.delete_review_comment(comment_id)
+    local ok, delete_err = pr_service.delete_review_comment({
+      comment_id = comment_id,
+      comment_database_id = meta.comment_database_id,
+    })
     if not ok then
       notify_error(delete_err)
       return
@@ -380,38 +383,47 @@ local function pick_reaction(ctx, meta, enabled)
     return
   end
 
-  local choices = reaction_choice_labels(meta.reaction_groups)
-  vim.ui.select(choices, {
-    prompt = enabled == false and "Remove reaction" or "Add reaction",
-    format_item = function(item)
-      return type(item) == "table" and safe_string(item.label, safe_string(item.value, "")) or tostring(item)
-    end,
-  }, function(choice)
-    local content = type(choice) == "table" and safe_string(choice.value, "") or ""
-    if content == "" then
-      return
-    end
-
-    if enabled == false then
-      local existing = reaction_group_by_content(meta.reaction_groups, content)
-      if type(existing) ~= "table" or existing.viewer_has_reacted ~= true then
-        notify_info("You do not have that reaction on this comment")
+  local open_ok, picker_or_err = reaction_picker.open({
+    origin_bufnr = type(ctx.popup_bufnr) == "number" and ctx.popup_bufnr or ctx.origin_bufnr,
+    anchor_win = type(ctx.popup_winid) == "number" and ctx.popup_winid or nil,
+    mode = enabled == false and "remove" or "add",
+    reaction_groups = meta.reaction_groups,
+    on_select = function(choice)
+      local content = type(choice) == "table" and safe_string(choice.content, "") or ""
+      if content == "" then
         return
       end
-    end
 
-    local ok, reaction_err = pr_service.set_review_comment_reaction(comment_id, content, enabled ~= false)
-    if not ok then
-      notify_error(reaction_err)
-      return
-    end
+      if enabled == false then
+        local existing = reactions.reaction_group_by_content(meta.reaction_groups, content)
+        if type(existing) ~= "table" or existing.viewer_has_reacted ~= true then
+          notify_info("You do not have that reaction on this comment")
+          return
+        end
+      end
 
-    notify_info(enabled == false and "Reaction removed" or "Reaction added")
-    if type(ctx.close_popup) == "function" then
-      ctx.close_popup()
+      local ok, reaction_err = pr_service.set_review_comment_reaction(comment_id, content, enabled ~= false)
+      if not ok then
+        notify_error(reaction_err)
+        return
+      end
+
+      notify_info(enabled == false and "Reaction removed" or "Reaction added")
+      if type(ctx.close_popup) == "function" then
+        ctx.close_popup()
+      end
+      refresh_after_mutation(tonumber(meta.pr_number or ctx.pr_number), ctx.details)
+    end,
+  })
+
+  if open_ok ~= true then
+    local message = type(picker_or_err) == "string" and picker_or_err or "Unable to open reaction picker"
+    if enabled == false and message == "You do not have any reactions on this comment" then
+      notify_info(message)
+    else
+      notify_error(message)
     end
-    refresh_after_mutation(tonumber(meta.pr_number or ctx.pr_number), ctx.details)
-  end)
+  end
 end
 
 function M.build_popup_actions(ctx)
@@ -454,6 +466,19 @@ function M.build_popup_actions(ctx)
       pick_reaction(merged, meta, false)
     end,
   }
+end
+
+function M.build_popup_footer_provider(ctx)
+  ctx = type(ctx) == "table" and ctx or {}
+
+  return function(item, popup_ctx)
+    if type(item) ~= "table" then
+      return shortcut_footer_lines(nil)
+    end
+    local merged = vim.tbl_extend("force", {}, ctx, popup_ctx or {})
+    local meta = current_item_meta(item, merged)
+    return shortcut_footer_lines(meta)
+  end
 end
 
 return M

@@ -235,6 +235,7 @@ local function normalize_thread_comment(comment, fallback_index)
 
   return {
     id = type(comment.id) == "string" and comment.id ~= "" and comment.id or tostring(fallback_index),
+    database_id = tonumber(comment.databaseId) or tonumber(comment.database_id),
     author = author,
     body = type(comment.body) == "string" and comment.body or "",
     created_at = type(comment.createdAt) == "string" and comment.createdAt or (type(comment.created_at) == "string" and comment.created_at or ""),
@@ -260,6 +261,7 @@ local function normalize_line_bucket_comments(comments)
   for index, comment in ipairs(type(comments) == "table" and comments or {}) do
     items[#items + 1] = {
       id = type(comment.id) == "string" and comment.id ~= "" and comment.id or tostring(index),
+      database_id = tonumber(comment.database_id) or tonumber(comment.comment_database_id) or tonumber(comment.databaseId),
       author = type(comment.author) == "string" and comment.author ~= "" and comment.author or "unknown",
       body = type(comment.body) == "string" and comment.body or "",
       created_at = type(comment.created_at) == "string" and comment.created_at or "",

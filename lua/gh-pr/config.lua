@@ -63,6 +63,17 @@ local defaults = {
         position = "cursor",
       },
     },
+    reactions = {
+      render = "emoji",
+      viewer_marker = "*",
+      picker = {
+        position = "cursor",
+        border = "rounded",
+        enter = true,
+        width = 56,
+        height = 10,
+      },
+    },
     signs = {
       open = "C>",
       resolved = "C=",
@@ -117,7 +128,7 @@ local defaults = {
       link_preview_disallowed_extensions = {
         "zip",
       },
-      link_preview_open_local = "system",
+      link_preview_open_local = "disabled",
     },
     thread_snippet = {
       context_before = 5,
@@ -260,7 +271,7 @@ local defaults = {
       fallback_mode = "menu",
       fallback_default_action = "metadata",
       fallback_menu_keymap = "gf",
-      fallback_open_local = "system",
+      fallback_open_local = "disabled",
       fallback_github_target = "pr_files",
       show_metadata = true,
       metadata_resolution_strategy = "hybrid",
@@ -472,6 +483,14 @@ local function sanitize_positive_integer(value, default_value)
   return rounded
 end
 
+local function sanitize_local_open_policy(value, default_value)
+  local policy = type(value) == "string" and value:lower() or default_value
+  if policy == "disabled" or policy == "reveal_only" or policy == "system" then
+    return policy
+  end
+  return default_value
+end
+
 local function sanitize_non_negative_integer(value, default_value)
   if type(value) ~= "number" then
     return default_value
@@ -677,9 +696,10 @@ local function sanitize_overview(overview)
     result.markdown.link_preview_disallowed_extensions,
     defaults.overview.markdown.link_preview_disallowed_extensions
   )
-  if result.markdown.link_preview_open_local ~= "system" then
-    result.markdown.link_preview_open_local = defaults.overview.markdown.link_preview_open_local
-  end
+  result.markdown.link_preview_open_local = sanitize_local_open_policy(
+    result.markdown.link_preview_open_local,
+    defaults.overview.markdown.link_preview_open_local
+  )
   if type(result.markdown.github_style) ~= "boolean" then
     result.markdown.github_style = defaults.overview.markdown.github_style
   end
@@ -1258,6 +1278,40 @@ local function sanitize_line_comments(line_comments)
     result.comments_tree.thread_popup.position = defaults.line_comments.comments_tree.thread_popup.position
   end
 
+  result.reactions = type(result.reactions) == "table" and result.reactions or {}
+  if result.reactions.render ~= "emoji" and result.reactions.render ~= "text" then
+    result.reactions.render = defaults.line_comments.reactions.render
+  end
+  if type(result.reactions.viewer_marker) ~= "string" or result.reactions.viewer_marker == "" then
+    result.reactions.viewer_marker = defaults.line_comments.reactions.viewer_marker
+  end
+
+  result.reactions.picker = type(result.reactions.picker) == "table" and result.reactions.picker or {}
+  if type(result.reactions.picker.enter) ~= "boolean" then
+    result.reactions.picker.enter = defaults.line_comments.reactions.picker.enter
+  end
+  if result.reactions.picker.position ~= "cursor"
+    and result.reactions.picker.position ~= "editor"
+    and result.reactions.picker.position ~= "preview_window" then
+    result.reactions.picker.position = defaults.line_comments.reactions.picker.position
+  end
+  if result.reactions.picker.border ~= "rounded"
+    and result.reactions.picker.border ~= "single"
+    and result.reactions.picker.border ~= "double"
+    and result.reactions.picker.border ~= "solid"
+    and result.reactions.picker.border ~= "shadow"
+    and result.reactions.picker.border ~= "none" then
+    result.reactions.picker.border = defaults.line_comments.reactions.picker.border
+  end
+  result.reactions.picker.width = math.max(
+    36,
+    sanitize_positive_integer(result.reactions.picker.width, defaults.line_comments.reactions.picker.width)
+  )
+  result.reactions.picker.height = math.max(
+    8,
+    sanitize_positive_integer(result.reactions.picker.height, defaults.line_comments.reactions.picker.height)
+  )
+
   return result
 end
 
@@ -1462,13 +1516,10 @@ local function sanitize_diff_view(diff_view)
     result.images.fallback_menu_keymap = defaults.diff_view.images.fallback_menu_keymap
   end
 
-  if type(result.images.fallback_open_local) ~= "string" or result.images.fallback_open_local == "" then
-    result.images.fallback_open_local = defaults.diff_view.images.fallback_open_local
-  end
-  result.images.fallback_open_local = result.images.fallback_open_local:lower()
-  if result.images.fallback_open_local ~= "system" then
-    result.images.fallback_open_local = defaults.diff_view.images.fallback_open_local
-  end
+  result.images.fallback_open_local = sanitize_local_open_policy(
+    result.images.fallback_open_local,
+    defaults.diff_view.images.fallback_open_local
+  )
 
   if type(result.images.fallback_github_target) ~= "string" or result.images.fallback_github_target == "" then
     result.images.fallback_github_target = defaults.diff_view.images.fallback_github_target

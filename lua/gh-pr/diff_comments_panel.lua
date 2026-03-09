@@ -315,6 +315,7 @@ local function build_comment_model(raw_threads, opts, pr_number, target_path, ta
 
         thread_comments[#thread_comments + 1] = {
           id = comment.id or tostring(j),
+          database_id = tonumber(comment.databaseId) or tonumber(comment.database_id),
           author = (type(comment.author) == "table" and comment.author.login) or comment.author or "unknown",
           body = comment.body or "",
           created_at = comment.createdAt or comment.created_at or "",

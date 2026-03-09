@@ -192,6 +192,17 @@ Validation prerequisites:
           position = "cursor", -- "cursor" | "editor"
         },
       },
+      reactions = {
+        render = "emoji", -- "emoji" | "text"
+        viewer_marker = "*", -- appended when the viewer already reacted
+        picker = {
+          position = "cursor", -- "cursor" | "editor" | "preview_window"
+          border = "rounded",
+          enter = true,
+          width = 56,
+          height = 10,
+        },
+      },
       signs = {
         open = "C>",
         resolved = "C=",
@@ -265,7 +276,7 @@ Validation prerequisites:
         link_preview_max_bytes = 10485760, -- 10 MiB
         link_preview_renderable_extensions = { "txt", "md", "markdown", "json", "yaml", "yml", "csv", "log" },
         link_preview_disallowed_extensions = { "zip" },
-        link_preview_open_local = "system",
+        link_preview_open_local = "disabled", -- "disabled" | "reveal_only" | "system"
       },
       thread_snippet = {
         context_before = 5, -- lines above focused comment line
@@ -404,7 +415,7 @@ Validation prerequisites:
         fallback_mode = "menu", -- "menu" | "metadata_only" | "auto_local" | "auto_github"
         fallback_default_action = "metadata", -- "metadata" | "open_local_current" | "open_local_both" | "open_github"
         fallback_menu_keymap = "gf", -- legacy hint used in some fallback messages
-        fallback_open_local = "system", -- currently only "system"
+        fallback_open_local = "disabled", -- "disabled" | "reveal_only" | "system"
         fallback_github_target = "pr_files", -- "pr_files" | "pr"
         show_metadata = true,
         metadata_resolution_strategy = "hybrid", -- "internal" | "external" | "hybrid"
@@ -753,6 +764,7 @@ Inside the overview buffer:
 - Markdown links in description can be previewed with `gp` or directly with `<CR>` on the link line.
 - `<CR>` priority in description: heading edits body; link lines preview/open links.
 - Link preview download is only used for GitHub attachments; non-attachment links prompt `open link` / `cancel` and open in browser when confirmed.
+- Local attachment opening is disabled by default. Use `overview.markdown.link_preview_open_local = "reveal_only"` to reveal cached files safely, or `"system"` to opt into opening non-dangerous local files with the OS handler.
 - If browser open fails for a description/check/commit URL action, gh-pr now shows an explicit error notification with the opener failure reason.
 - Renderable GitHub attachments open in a full-screen readonly preview tab (`q` / `<Esc>` closes).
 - Overview markdown normalizes CRLF/LF line endings to avoid `^M` artifacts on Windows.
@@ -796,7 +808,9 @@ Diff backend behavior:
 - When Neo-tree is available, `<localleader>dc` opens a temporary bottom comments tree scoped to the current diff file (`thread -> comment`) and isolated from the other Neo-tree sources; set `diff_view.comments_panel.position = "right"` if you prefer a side pane. Otherwise gh-pr falls back to the legacy bottom panel.
 - The diff comments UI renders lazily after codediff opens and only loads comments for the current file in the background.
 - In codediff buffers, pressing `<CR>` on a commented line opens the existing line comments popup for that line.
-- Inside line/thread comment popups, `r` opens a reply composer, `R` opens a quoted reply composer, `x` resolves/unresolves the selected thread, `e` edits your selected comment, `D` deletes it, and `+` / `-` add or remove reactions on published comments. Draft comments in the current pending review support edit/delete but not reactions yet. Replies are added to the current pending review.
+- Inside line/thread comment popups, `r` opens a reply composer, `R` opens a quoted reply composer, `x` resolves/unresolves the selected thread, `e` edits your selected comment, `D` deletes it, and `+` / `-` open the emoji reactions picker for published comments. Draft comments in the current pending review support edit/delete but not reactions yet. Replies are added to the current pending review.
+- Popup reaction summaries render emoji chips (`👍 2*`, `❤️ 1`, `🚀 3`) instead of raw GitHub enum names.
+- The reactions picker opens as a dedicated two-row grid: quick reactions first, then the remaining reactions, with `h/j/k/l`, arrows, `<Tab>` / `<S-Tab>`, `<CR>`, `q`, and `<Esc>` support.
 - `<localleader>dc` reports explicit errors when diff comments panel cannot be opened/refreshed.
 - Line comment virtual text can show compact comment authors (`💬 @user1, @user2 +N`) in both codediff and virtual fallback buffers.
 - Multiline review comments now mark the full line range (`startLine -> line`) in diff indicators.
@@ -855,7 +869,7 @@ Image rendering options (`diff_view.images`):
 - `fallback_mode` (`"menu"`, also `"metadata_only"` / `"auto_local"` / `"auto_github"`)
 - `fallback_default_action` (`"metadata"`, also `"open_local_current"` / `"open_local_both"` / `"open_github"`)
 - `fallback_menu_keymap` (`"gf"`)
-- `fallback_open_local` (`"system"`)
+- `fallback_open_local` (`"disabled"`, also `"reveal_only"` / `"system"`)
 - `fallback_github_target` (`"pr_files"`, also `"pr"`)
 - `show_metadata` (`true`)
 - `metadata_resolution_strategy` (`"hybrid"`, also `"internal"` / `"external"`)

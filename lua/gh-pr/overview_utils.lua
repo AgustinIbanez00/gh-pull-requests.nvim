@@ -371,6 +371,11 @@ function M.sanitize_markdown_opts(input)
     diff_gutter = "none"
   end
 
+  local link_preview_open_local = M.safe_string(source.link_preview_open_local, "disabled"):lower()
+  if link_preview_open_local ~= "disabled" and link_preview_open_local ~= "reveal_only" and link_preview_open_local ~= "system" then
+    link_preview_open_local = "disabled"
+  end
+
   return {
     enabled = M.bool_or_default(source.enabled, true),
     mode = mode,
@@ -381,7 +386,7 @@ function M.sanitize_markdown_opts(input)
     link_preview_max_bytes = link_preview_max_bytes,
     link_preview_renderable_extensions = link_preview_renderable_extensions,
     link_preview_disallowed_extensions = link_preview_disallowed_extensions,
-    link_preview_open_local = source.link_preview_open_local == "system" and "system" or "system",
+    link_preview_open_local = link_preview_open_local,
     github_style = M.bool_or_default(source.github_style, true),
     github_style_separators = github_style_separators,
     diff_gutter = diff_gutter,

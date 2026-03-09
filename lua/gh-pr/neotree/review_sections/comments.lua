@@ -98,6 +98,7 @@ local function normalize_thread_comment(raw_comment, index, fallback)
 
   return {
     id = id,
+    database_id = tonumber(raw_comment.databaseId) or tonumber(raw_comment.database_id),
     author = normalize_actor_login(raw_comment.author),
     created_at = created_at,
     body = body,

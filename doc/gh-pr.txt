@@ -253,6 +253,10 @@ Overview buffer keymaps:
     Link preview download is only used for GitHub attachments.
     Non-attachment links prompt `open link`/`cancel` and open in browser
     only after confirmation.
+    Local attachment opening is disabled by default. Set
+    `overview.markdown.link_preview_open_local = "reveal_only"` to reveal
+    cached files safely, or `"system"` to opt into opening
+    non-dangerous local files with the OS handler.
     URL open failures (description/check/commit URL actions) emit explicit
     error notifications with opener failure details.
     Renderable GitHub attachments open in full-screen readonly preview tab
@@ -377,8 +381,13 @@ Overview panes keymaps:
     a quoted reply composer, and `x` resolves/unresolves the selected thread.
     Replies are added to the current pending review. `e` edits the selected
     comment when it belongs to the viewer, `D` deletes it, and `+` / `-`
-    add or remove reactions on published comments. Draft comments in the
-    current pending review support edit/delete but not reactions yet.
+    open the emoji reactions picker for published comments. Draft comments
+    in the current pending review support edit/delete but not reactions yet.
+    Reaction summaries render emoji chips such as `👍 2*` and `❤️ 1`
+    instead of raw GitHub enum names.
+    The reactions picker opens as a dedicated two-row grid: quick reactions
+    first, then the remaining reactions, with `h/j/k/l`, arrows,
+    `<Tab>` / `<S-Tab>`, `<CR>`, `q`, and `<Esc>` support.
     On first open per diff buffer, gh-pr shows a one-time hint with close shortcuts.
     Additional virtual-buffer shortcuts (legacy fallback backend only):
       `<localleader>dr` refresh current diff from GitHub
@@ -580,6 +589,12 @@ Call `require("gh-pr").setup({ ... })` with:
 - `line_comments.comments_tree.thread_popup.wrap` (`true`)
 - `line_comments.comments_tree.thread_popup.enter` (`true`)
 - `line_comments.comments_tree.thread_popup.position` (`"cursor"`, or `"editor"`)
+- `line_comments.reactions.render` (`"emoji"`, or `"text"`)
+- `line_comments.reactions.viewer_marker` (`"*"`; appended to counts when the viewer reacted)
+- `line_comments.reactions.picker.position` (`"cursor"`, or `"editor"` / `"preview_window"`)
+- `line_comments.reactions.picker.border` (`"rounded"`)
+- `line_comments.reactions.picker.enter` (`true`)
+- `line_comments.reactions.picker.width|height` (`56|10`)
 - `overview.ui` (`"snacks"`)
 - `overview.layout` (`"tabs"`)
 - `overview.tabs` (`summary/checks/commits/files`; legacy `timeline/comments/reviews/threads` map to `summary`)
@@ -622,7 +637,7 @@ Call `require("gh-pr").setup({ ... })` with:
 - `overview.markdown.link_preview_max_bytes` (`10485760`, 10 MiB)
 - `overview.markdown.link_preview_renderable_extensions` (`txt/md/markdown/json/yaml/yml/csv/log`)
 - `overview.markdown.link_preview_disallowed_extensions` (`zip`)
-- `overview.markdown.link_preview_open_local` (`"system"`)
+- `overview.markdown.link_preview_open_local` (`"disabled"`, also `"reveal_only"` / `"system"`)
 - `overview.thread_snippet.context_before` (`5`)
 - `overview.thread_snippet.context_after` (`5`)
 - `overview.thread_fix_diff.enabled` (`true`)
@@ -721,7 +736,7 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.images.fallback_mode` (`"menu"`, also `"metadata_only"` / `"auto_local"` / `"auto_github"`)
 - `diff_view.images.fallback_default_action` (`"metadata"`, also `"open_local_current"` / `"open_local_both"` / `"open_github"`)
 - `diff_view.images.fallback_menu_keymap` (`"gf"`, legacy hint in fallback messages)
-- `diff_view.images.fallback_open_local` (`"system"`)
+- `diff_view.images.fallback_open_local` (`"disabled"`, also `"reveal_only"` / `"system"`)
 - `diff_view.images.fallback_github_target` (`"pr_files"`, also `"pr"`)
 - `diff_view.images.show_metadata` (`true`)
 - `diff_view.images.metadata_resolution_strategy` (`"hybrid"`, also `"internal"` / `"external"`)

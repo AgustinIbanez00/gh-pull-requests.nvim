@@ -126,6 +126,7 @@ function M.open(thread, open_opts)
         line = tonumber(comment.line) or tonumber(thread.line),
         original_line = tonumber(comment.original_line) or tonumber(thread.original_line),
         comment_id = comment.id,
+        comment_database_id = tonumber(comment.database_id) or tonumber(comment.comment_database_id),
         comment_author = comment.author,
         comment_body = comment.body,
         comment_state = item_state,
@@ -141,7 +142,7 @@ function M.open(thread, open_opts)
   local origin_bufnr = type(open_opts.origin_bufnr) == "number" and open_opts.origin_bufnr or vim.api.nvim_get_current_buf()
   local enter_popup = type(open_opts.enter) == "boolean" and open_opts.enter or opts.enter
   local title = string.format("PR Thread [%s] (%d)", state, #items)
-  local popup_actions = comment_thread_actions.build_popup_actions({
+  local popup_context = {
     pr_number = tonumber(thread.pr_number),
     details = type(thread.details) == "table" and thread.details or nil,
     thread_id = safe_string(thread.thread_id, ""),
@@ -150,7 +151,8 @@ function M.open(thread, open_opts)
     original_line = tonumber(thread.original_line),
     thread_is_resolved = thread.is_resolved == true,
     thread_is_outdated = thread.is_outdated == true,
-  })
+  }
+  local popup_actions = comment_thread_actions.build_popup_actions(popup_context)
 
   return comment_popup.open({
     origin_bufnr = origin_bufnr,
@@ -160,9 +162,7 @@ function M.open(thread, open_opts)
     subtitle = "Thread: " .. safe_string(thread.thread_id, "-"),
     items = items,
     actions = popup_actions,
-    footer_lines = {
-      "r reply  R quote  x resolve  e edit  D delete  +/- reactions  q close",
-    },
+    footer_provider = comment_thread_actions.build_popup_footer_provider(popup_context),
     mode = safe_string(open_opts.mode, "open"),
     anchor_win = open_opts.anchor_win,
     enter = enter_popup,

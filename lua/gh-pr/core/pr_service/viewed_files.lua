@@ -1,4 +1,5 @@
 local M = {}
+local review_context = require("gh-pr.core.review_context")
 
 local VIEWED_FILES_QUERY = [[
 query($owner:String!, $name:String!, $number:Int!, $first:Int!, $after:String) {
@@ -21,11 +22,7 @@ query($owner:String!, $name:String!, $number:Int!, $first:Int!, $after:String) {
 ]]
 
 local function normalize_path(path)
-  if type(path) ~= "string" then
-    return ""
-  end
-
-  return path:gsub("\\", "/"):gsub("/+", "/"):gsub("^/", ""):gsub("/$", "")
+  return review_context.normalize_path(path)
 end
 
 local function viewed_files_variables(repository, number, first, after)

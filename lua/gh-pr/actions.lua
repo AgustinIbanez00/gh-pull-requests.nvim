@@ -13,6 +13,7 @@ local gh = require("gh-pr.gh")
 local image_metadata = require("gh-pr.image_metadata")
 local line_comments = require("gh-pr.line_comments")
 local pr_service = require("gh-pr.pr_service")
+local review_context = require("gh-pr.core.review_context")
 local state = require("gh-pr.state")
 local thread_popup = require("gh-pr.thread_popup")
 local url_open = require("gh-pr.url_open")
@@ -30,31 +31,9 @@ local non_text_preview = {
 }
 
 local function normalize_repository(details)
-  local repository = details.baseRepository or details.headRepository
-  if not repository then
-    local resolved, _ = pr_service.resolve_repository()
-    return resolved and resolved.full_name or nil
-  end
-
-  if type(repository.nameWithOwner) == "string" then
-    return repository.nameWithOwner
-  end
-
-  local owner
-  if type(repository.owner) == "table" then
-    owner = repository.owner.login
-  else
-    owner = repository.owner
-  end
-
-  local name = repository.name
-  if not name and type(repository.nameWithOwner) == "string" then
-    local _, parsed = repository.nameWithOwner:match("^([^/]+)/(.+)$")
-    name = parsed
-  end
-
-  if type(owner) == "string" and type(name) == "string" then
-    return owner .. "/" .. name
+  local repository = review_context.resolve_repository_full_name(details)
+  if repository ~= "" then
+    return repository
   end
 
   local resolved, _ = pr_service.resolve_repository()
@@ -80,6 +59,96 @@ local function safe_string(value, fallback)
     return value
   end
   return fallback or ""
+end
+
+local local_open_policy_values = {
+  disabled = true,
+  reveal_only = true,
+  system = true,
+}
+
+local dangerous_local_open_extensions = {
+  app = true,
+  bat = true,
+  cmd = true,
+  com = true,
+  command = true,
+  cpl = true,
+  desktop = true,
+  exe = true,
+  hta = true,
+  inf = true,
+  ins = true,
+  isp = true,
+  jar = true,
+  js = true,
+  jse = true,
+  lnk = true,
+  msc = true,
+  msi = true,
+  msp = true,
+  mst = true,
+  pif = true,
+  ps1 = true,
+  ps1xml = true,
+  psd1 = true,
+  psm1 = true,
+  reg = true,
+  scf = true,
+  scr = true,
+  sh = true,
+  url = true,
+  vb = true,
+  vbe = true,
+  vbs = true,
+  wsf = true,
+  wsh = true,
+}
+
+local function normalize_local_open_policy(value, fallback)
+  local policy = type(value) == "string" and value:lower() or fallback or "disabled"
+  if local_open_policy_values[policy] then
+    return policy
+  end
+  return fallback or "disabled"
+end
+
+local function target_extension(target)
+  local ext = type(target) == "string" and target:match("%.([^.\\/]+)$") or nil
+  if type(ext) ~= "string" then
+    return ""
+  end
+  return ext:lower()
+end
+
+local function effective_local_open_policy(policy, target)
+  local normalized = normalize_local_open_policy(policy, "disabled")
+  if normalized ~= "system" then
+    return normalized
+  end
+
+  local ext = target_extension(target)
+  if ext ~= "" and dangerous_local_open_extensions[ext] then
+    return "reveal_only"
+  end
+
+  return normalized
+end
+
+local function local_open_action_label(policy, target)
+  local effective = effective_local_open_policy(policy, target)
+  if effective == "reveal_only" then
+    return "reveal local"
+  end
+  return "open local"
+end
+
+local function local_open_action_phrase(policy, target)
+  local effective = effective_local_open_policy(policy, target)
+  if effective == "reveal_only" then
+    return "reveal locally"
+  end
+  return "open locally"
 end
 
 local function codediff_debug_failures_enabled()
@@ -412,38 +481,11 @@ local function persist_diff_view_preferences(prefs)
 end
 
 local function normalize_path(path)
-  if type(path) ~= "string" then
-    return ""
-  end
-
-  return path:gsub("\\", "/")
+  return review_context.normalize_path(path)
 end
 
 local function find_file_in_details(details, path)
-  if not details or type(details.files) ~= "table" then
-    return nil
-  end
-
-  local normalized_path = normalize_path(path)
-  if normalized_path == "" then
-    return nil
-  end
-
-  for _, file in ipairs(details.files) do
-    local candidates = {
-      file.path,
-      file.filename,
-      file.previousFilename,
-      file.previous_filename,
-    }
-    for _, candidate in ipairs(candidates) do
-      if normalize_path(candidate) == normalized_path then
-        return file
-      end
-    end
-  end
-
-  return nil
+  return review_context.find_file(details, path)
 end
 
 local function resolve_file_in_details(details, ...)
@@ -503,32 +545,7 @@ local function resolve_current_diff_file(details, bufnr)
 end
 
 local function resolve_canonical_file_path(details, path)
-  local normalized = normalize_path(path)
-  if normalized == "" then
-    return ""
-  end
-
-  if type(details) ~= "table" or type(details.files) ~= "table" then
-    return normalized
-  end
-
-  for _, file in ipairs(details.files) do
-    local canonical = normalize_path(file.path or file.filename)
-    local candidates = {
-      file.path,
-      file.filename,
-      file.previousFilename,
-      file.previous_filename,
-    }
-
-    for _, candidate in ipairs(candidates) do
-      if normalize_path(candidate) == normalized then
-        return canonical ~= "" and canonical or normalized
-      end
-    end
-  end
-
-  return normalized
+  return review_context.resolve_canonical_file_path(details, path)
 end
 
 local function resolve_file(file)
@@ -626,6 +643,11 @@ non_text_preview.action_labels = {
   open_github = "Open GitHub PR file view",
 }
 
+non_text_preview.reveal_action_labels = {
+  open_local_current = "Reveal current revision locally",
+  open_local_both = "Reveal both revisions locally",
+}
+
 non_text_preview.action_order = {
   "open_local_current",
   "open_local_both",
@@ -649,8 +671,21 @@ function non_text_preview.normalize_image_action(action, fallback)
   return "metadata"
 end
 
-function non_text_preview.action_label(action)
+function non_text_preview.action_label(action, opts)
   local normalized = non_text_preview.normalize_image_action(action, "metadata")
+  if normalized == "open_local_current" or normalized == "open_local_both" then
+    local policy = nil
+    if type(opts) == "table" then
+      policy = opts.fallback_open_local or opts.open_local
+    end
+    local normalized_policy = normalize_local_open_policy(policy, "disabled")
+    if normalized_policy == "disabled" then
+      return (non_text_preview.action_labels[normalized] or normalized) .. " (disabled)"
+    end
+    if normalized_policy == "reveal_only" then
+      return non_text_preview.reveal_action_labels[normalized] or non_text_preview.action_labels[normalized] or normalized
+    end
+  end
   return non_text_preview.action_labels[normalized] or normalized
 end
 
@@ -671,7 +706,7 @@ function non_text_preview.image_diff_options()
     fallback_mode = type(images.fallback_mode) == "string" and images.fallback_mode:lower() or "menu",
     fallback_default_action = non_text_preview.normalize_image_action(images.fallback_default_action, "metadata"),
     fallback_menu_keymap = type(images.fallback_menu_keymap) == "string" and images.fallback_menu_keymap or "gf",
-    fallback_open_local = type(images.fallback_open_local) == "string" and images.fallback_open_local:lower() or "system",
+    fallback_open_local = normalize_local_open_policy(images.fallback_open_local, "disabled"),
     fallback_github_target = type(images.fallback_github_target) == "string"
         and images.fallback_github_target:lower()
       or "pr_files",
@@ -700,6 +735,10 @@ function non_text_preview.resolve_default_action(images_cfg)
     if type(prefs) == "table" then
       action = non_text_preview.normalize_image_action(prefs.fallback_default_action, action)
     end
+  end
+  if (action == "open_local_current" or action == "open_local_both")
+    and normalize_local_open_policy(type(images_cfg) == "table" and images_cfg.fallback_open_local or nil, "disabled") == "disabled" then
+    return "metadata"
   end
   return action
 end
@@ -1374,18 +1413,36 @@ function non_text_preview.ensure_side_asset(ctx, side, images_cfg)
   return non_text_preview.ensure_binary_side_asset(ctx, side)
 end
 
-local function ensure_open_target(target, label)
+local function try_detached_command(command)
+  local executable = type(command) == "table" and command[1] or nil
+  if type(executable) ~= "string" or executable == "" then
+    return false, "invalid command"
+  end
+  if vim.fn.executable(executable) ~= 1 then
+    return false, executable .. " is unavailable"
+  end
+
+  local ok_job, jobid = pcall(vim.fn.jobstart, command, { detach = true })
+  if ok_job and type(jobid) == "number" and jobid > 0 then
+    return true, nil
+  end
+  return false, executable .. " failed to start"
+end
+
+local function local_target_directory(target)
   if type(target) ~= "string" or target == "" then
-    return false, string.format("Missing %s target", label)
+    return ""
   end
-
-  local is_url = target:match("^https?://") ~= nil
-  if is_url then
-    return url_open.open(target, {
-      notify_error = false,
-    })
+  if vim.fn.isdirectory(target) == 1 then
+    return target
   end
+  if vim.fs and type(vim.fs.dirname) == "function" then
+    return vim.fs.dirname(target) or ""
+  end
+  return target:match("^(.*)[/\\][^/\\]+$") or ""
+end
 
+local function try_local_system_open(target)
   local ui_err = nil
   if vim.ui and type(vim.ui.open) == "function" then
     local ok, open_result, open_err = pcall(vim.ui.open, target)
@@ -1405,10 +1462,7 @@ local function ensure_open_target(target, label)
   local is_mac = vim.fn.has("mac") == 1 or vim.fn.has("macunix") == 1
   local commands = {}
   if is_windows then
-    local escaped_target = target:gsub('"', '""')
-    local quoted_target = '"' .. escaped_target .. '"'
     commands = {
-      { "cmd.exe", "/c", "start", "", quoted_target },
       { "rundll32", "url.dll,FileProtocolHandler", target },
       { "explorer.exe", target },
     }
@@ -1422,26 +1476,96 @@ local function ensure_open_target(target, label)
     }
   end
 
+  local errors = {}
   for _, command in ipairs(commands) do
-    local executable = command[1]
-    if type(executable) == "string" and executable ~= "" and vim.fn.executable(executable) == 1 then
-      local ok_job, jobid = pcall(vim.fn.jobstart, command, {
-        detach = true,
-      })
-      if ok_job and type(jobid) == "number" and jobid > 0 then
-        return true, nil
-      end
+    local ok_open, open_err = try_detached_command(command)
+    if ok_open then
+      return true, nil
+    end
+    if type(open_err) == "string" and open_err ~= "" then
+      errors[#errors + 1] = open_err
     end
   end
 
-  local errors = {}
   if type(ui_err) == "string" and ui_err ~= "" then
-    errors[#errors + 1] = "vim.ui.open failed: " .. ui_err
+    table.insert(errors, 1, "vim.ui.open failed: " .. ui_err)
   end
   if vim.tbl_isempty(errors) then
     return false, "Unable to open target using system opener"
   end
   return false, table.concat(errors, " | ")
+end
+
+local function try_reveal_local_target(target)
+  local is_windows = vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
+  local is_mac = vim.fn.has("mac") == 1 or vim.fn.has("macunix") == 1
+  local directory = local_target_directory(target)
+  local commands = {}
+
+  if is_windows then
+    commands = {
+      { "explorer.exe", "/select," .. target },
+    }
+    if directory ~= "" and directory ~= target then
+      commands[#commands + 1] = { "explorer.exe", directory }
+    end
+  elseif is_mac then
+    commands = {
+      { "open", "-R", target },
+    }
+    if directory ~= "" and directory ~= target then
+      commands[#commands + 1] = { "open", directory }
+    end
+  elseif directory ~= "" then
+    commands = {
+      { "xdg-open", directory },
+    }
+  else
+    commands = {
+      { "xdg-open", target },
+    }
+  end
+
+  local errors = {}
+  for _, command in ipairs(commands) do
+    local ok_reveal, reveal_err = try_detached_command(command)
+    if ok_reveal then
+      return true, nil
+    end
+    if type(reveal_err) == "string" and reveal_err ~= "" then
+      errors[#errors + 1] = reveal_err
+    end
+  end
+
+  if vim.tbl_isempty(errors) then
+    return false, "Unable to reveal local target"
+  end
+  return false, table.concat(errors, " | ")
+end
+
+local function ensure_open_target(target, label, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(target) ~= "string" or target == "" then
+    return false, string.format("Missing %s target", label)
+  end
+
+  local is_url = target:match("^https?://") ~= nil
+  if is_url then
+    return url_open.open(target, {
+      notify_error = false,
+    })
+  end
+
+  local policy = normalize_local_open_policy(opts.open_local, "disabled")
+  local effective_policy = effective_local_open_policy(policy, target)
+  local policy_key = safe_string(opts.open_local_key, "local opener policy")
+  if effective_policy == "disabled" then
+    return false, string.format("Opening local targets is disabled by `%s`", policy_key)
+  end
+  if effective_policy == "reveal_only" then
+    return try_reveal_local_target(target)
+  end
+  return try_local_system_open(target)
 end
 
 local function joinpath(...)
@@ -1575,7 +1699,29 @@ local function filename_from_url(url)
   end
   local path = url:match("^https?://[^/]+(/[^?#]*)") or ""
   local name = path:match("([^/]+)$") or ""
+  if name == "" then
+    return ""
+  end
   return sanitize_filename(name)
+end
+
+local function resolve_attachment_filename(url, label, allowed_fallback_extensions)
+  local filename = filename_from_url(url)
+  if filename ~= "" then
+    return filename
+  end
+
+  local fallback = sanitize_filename(type(label) == "string" and label or "")
+  if fallback == "" then
+    return "attachment.bin"
+  end
+
+  local ext = extension_from_name(fallback)
+  if ext ~= "" and type(allowed_fallback_extensions) == "table" and allowed_fallback_extensions[ext] then
+    return fallback
+  end
+
+  return "attachment.bin"
 end
 
 local function list_to_set(list)
@@ -1623,7 +1769,7 @@ local function overview_markdown_link_preview_options()
   return {
     keymap = type(markdown.link_preview_keymap) == "string" and markdown.link_preview_keymap or "gp",
     max_bytes = max_bytes,
-    open_local = markdown.link_preview_open_local == "system" and "system" or "system",
+    open_local = normalize_local_open_policy(markdown.link_preview_open_local, "disabled"),
     renderable_extensions = renderable,
     disallowed_extensions = disallowed,
     renderable_set = list_to_set(renderable),
@@ -2031,28 +2177,46 @@ local function download_link_to_path_async(url, output_path, callback)
   end)
 end
 
-local function prompt_open_downloaded_file(path, filename, reason)
-  local prompt = string.format(
-    "Preview unavailable for '%s' (%s). Open downloaded file locally?",
+local function notify_local_open_unavailable(filename, reason, config_key, path)
+  local location = type(path) == "string" and path ~= "" and ("\nCached at: " .. path) or ""
+  notify_warn(string.format(
+    "Preview unavailable for '%s' (%s). Local open is disabled by `%s`.%s",
     filename,
-    reason
+    reason,
+    config_key,
+    location
+  ))
+end
+
+local function prompt_open_downloaded_file(path, filename, reason, open_local, open_local_key)
+  local confirm_label = local_open_action_label(open_local, path)
+  local prompt = string.format(
+    "Preview unavailable for '%s' (%s). %s downloaded file locally?",
+    filename,
+    reason,
+    confirm_label:gsub("^%l", string.upper)
   )
   select_open_local(prompt, function(should_open)
     if not should_open then
       return
     end
-    local ok_open, open_err = ensure_open_target(path, "downloaded file")
+    local ok_open, open_err = ensure_open_target(path, "downloaded file", {
+      open_local = open_local,
+      open_local_key = open_local_key,
+    })
     if not ok_open then
       notify_error("Unable to open downloaded file: " .. tostring(open_err))
     end
-  end)
+  end, confirm_label)
 end
 
-local function prompt_download_and_open_local(url, filename, reason)
+local function prompt_download_and_open_local(url, filename, reason, open_local, open_local_key)
+  local confirm_label = local_open_action_label(open_local, filename)
   local prompt = string.format(
-    "Cannot preview '%s' (%s). Download and open locally?",
+    "Cannot preview '%s' (%s). Download and %s?",
     filename,
-    reason
+    reason,
+    local_open_action_phrase(open_local, filename)
   )
   select_open_local(prompt, function(should_open)
     if not should_open then
@@ -2065,18 +2229,21 @@ local function prompt_download_and_open_local(url, filename, reason)
       return
     end
 
-    notify_info("Downloading link attachment to open locally...")
+    notify_info("Downloading link attachment for local access...")
     download_link_to_path_async(url, target_path, function(downloaded_path, download_err)
       if not downloaded_path then
         notify_error("Unable to download link: " .. tostring(download_err))
         return
       end
-      local ok_open, open_err = ensure_open_target(downloaded_path, "downloaded file")
+      local ok_open, open_err = ensure_open_target(downloaded_path, "downloaded file", {
+        open_local = open_local,
+        open_local_key = open_local_key,
+      })
       if not ok_open then
         notify_error("Unable to open downloaded file: " .. tostring(open_err))
       end
     end)
-  end)
+  end, confirm_label)
 end
 
 function M.overview_preview_markdown_link(action)
@@ -2107,21 +2274,43 @@ function M.overview_preview_markdown_link(action)
 
   local options = overview_markdown_link_preview_options()
   local action_label = type(action) == "table" and type(action.label) == "string" and action.label or ""
-  local filename = filename_from_url(url)
-  if filename == "" and action_label ~= "" then
-    filename = sanitize_filename(action_label)
-  end
-  if filename == "" then
-    filename = "attachment"
-  end
+  local filename = resolve_attachment_filename(url, action_label, options.renderable_set)
 
   local extension = extension_from_name(filename)
   if extension ~= "" and options.disallowed_set[extension] then
-    prompt_download_and_open_local(url, filename, "extension ." .. extension .. " is not previewable")
+    if options.open_local == "disabled" then
+      notify_local_open_unavailable(
+        filename,
+        "extension ." .. extension .. " is not previewable",
+        "overview.markdown.link_preview_open_local"
+      )
+      return
+    end
+    prompt_download_and_open_local(
+      url,
+      filename,
+      "extension ." .. extension .. " is not previewable",
+      options.open_local,
+      "overview.markdown.link_preview_open_local"
+    )
     return
   end
   if extension ~= "" and not options.renderable_set[extension] then
-    prompt_download_and_open_local(url, filename, "extension ." .. extension .. " is not configured as renderable")
+    if options.open_local == "disabled" then
+      notify_local_open_unavailable(
+        filename,
+        "extension ." .. extension .. " is not configured as renderable",
+        "overview.markdown.link_preview_open_local"
+      )
+      return
+    end
+    prompt_download_and_open_local(
+      url,
+      filename,
+      "extension ." .. extension .. " is not configured as renderable",
+      options.open_local,
+      "overview.markdown.link_preview_open_local"
+    )
     return
   end
 
@@ -2140,10 +2329,21 @@ function M.overview_preview_markdown_link(action)
     local stat = uv.fs_stat(downloaded_path)
     local size = tonumber(stat and stat.size) or 0
     if size > options.max_bytes then
+      if options.open_local == "disabled" then
+        notify_local_open_unavailable(
+          filename,
+          string.format("file exceeds preview limit (%d > %d bytes)", size, options.max_bytes),
+          "overview.markdown.link_preview_open_local",
+          downloaded_path
+        )
+        return
+      end
       prompt_open_downloaded_file(
         downloaded_path,
         filename,
-        string.format("file exceeds preview limit (%d > %d bytes)", size, options.max_bytes)
+        string.format("file exceeds preview limit (%d > %d bytes)", size, options.max_bytes),
+        options.open_local,
+        "overview.markdown.link_preview_open_local"
       )
       return
     end
@@ -2155,7 +2355,22 @@ function M.overview_preview_markdown_link(action)
     end
 
     if is_probably_binary(bytes) then
-      prompt_open_downloaded_file(downloaded_path, filename, "binary content is not renderable")
+      if options.open_local == "disabled" then
+        notify_local_open_unavailable(
+          filename,
+          "binary content is not renderable",
+          "overview.markdown.link_preview_open_local",
+          downloaded_path
+        )
+        return
+      end
+      prompt_open_downloaded_file(
+        downloaded_path,
+        filename,
+        "binary content is not renderable",
+        options.open_local,
+        "overview.markdown.link_preview_open_local"
+      )
       return
     end
 
@@ -2309,7 +2524,11 @@ local function render_image_metadata_diff(bufnr, reason_override)
     "",
     string.format("path: %s", display_path ~= "" and display_path or "(unknown)"),
     string.format("status: %s", ctx.status ~= "" and ctx.status or "unknown"),
-    string.format("default action (%s): %s", default_key ~= "" and default_key or "<localleader>io", non_text_preview.action_label(default_action)),
+    string.format(
+      "default action (%s): %s",
+      default_key ~= "" and default_key or "<localleader>io",
+      non_text_preview.action_label(default_action, images_cfg)
+    ),
     string.format("fallback menu (%s): image actions", fallback_key ~= "" and fallback_key or "<localleader>im"),
   }
   if reason ~= "" then
@@ -2372,7 +2591,10 @@ local function run_image_fallback_action(action, bufnr, opts)
     if not file_readable(asset.cache_path) then
       return false, "Unable to resolve a local asset file to open"
     end
-    return ensure_open_target(asset.cache_path, "local asset")
+    return ensure_open_target(asset.cache_path, "local asset", {
+      open_local = images_cfg.fallback_open_local,
+      open_local_key = "diff_view.images.fallback_open_local",
+    })
   end
 
   if requested == "open_local_both" then
@@ -2385,7 +2607,10 @@ local function run_image_fallback_action(action, bufnr, opts)
         errors[#errors + 1] = string.format("%s: %s", side, tostring(asset_err))
       elseif asset.present and file_readable(asset.cache_path) then
         if not opened_paths[asset.cache_path] then
-          local ok_open, open_err = ensure_open_target(asset.cache_path, side .. " asset")
+          local ok_open, open_err = ensure_open_target(asset.cache_path, side .. " asset", {
+            open_local = images_cfg.fallback_open_local,
+            open_local_key = "diff_view.images.fallback_open_local",
+          })
           if ok_open then
             opened_paths[asset.cache_path] = true
             opened_count = opened_count + 1
@@ -2470,7 +2695,7 @@ local function run_menu_action(state_value, action, set_default)
   local action_id = non_text_preview.normalize_image_action(action, non_text_preview.resolve_default_action(non_text_preview.image_diff_options()))
   if set_default == true then
     non_text_preview.persist_default_action(action_id)
-    notify_info("Non-text preview default action set to: " .. non_text_preview.action_label(action_id))
+    notify_info("Non-text preview default action set to: " .. non_text_preview.action_label(action_id, non_text_preview.image_diff_options()))
   end
 
   local origin_winid = state_value.origin_winid
@@ -2513,7 +2738,11 @@ function M.open_image_fallback_menu()
     string.rep("=", 74),
     string.format("file: %s", ctx.file_path ~= "" and ctx.file_path or ctx.path),
     string.format("status: %s", ctx.status ~= "" and ctx.status or "unknown"),
-    string.format("default (%s): %s", default_key ~= "" and default_key or "<localleader>io", non_text_preview.action_label(default_action)),
+    string.format(
+      "default (%s): %s",
+      default_key ~= "" and default_key or "<localleader>io",
+      non_text_preview.action_label(default_action, images_cfg)
+    ),
     string.format("menu keymap: %s", fallback_key ~= "" and fallback_key or "<localleader>im"),
   }
   if reason ~= "" then
@@ -2524,7 +2753,7 @@ function M.open_image_fallback_menu()
   local line_actions = {}
   for index, action in ipairs(non_text_preview.action_order) do
     local marker = action == default_action and "*" or " "
-    lines[#lines + 1] = string.format("%d. [%s] %s", index, marker, non_text_preview.action_label(action))
+    lines[#lines + 1] = string.format("%d. [%s] %s", index, marker, non_text_preview.action_label(action, images_cfg))
     line_actions[#lines] = action
   end
 
@@ -2597,7 +2826,7 @@ function M.open_image_fallback_menu()
     local action = current_menu_action(active)
     if action then
       non_text_preview.persist_default_action(action)
-      notify_info("Non-text preview default action set to: " .. non_text_preview.action_label(action))
+      notify_info("Non-text preview default action set to: " .. non_text_preview.action_label(action, non_text_preview.image_diff_options()))
       local origin_winid = active.origin_winid
       close_image_fallback_menu()
       if is_valid_win(origin_winid) then
@@ -2692,6 +2921,9 @@ function M.on_image_render_fallback(bufnr, reason)
   local mode = images_cfg.fallback_mode
   if mode ~= "menu" and mode ~= "metadata_only" and mode ~= "auto_local" and mode ~= "auto_github" then
     mode = "menu"
+  end
+  if mode == "auto_local" and normalize_local_open_policy(images_cfg.fallback_open_local, "disabled") == "disabled" then
+    mode = "metadata_only"
   end
 
   if type(reason) == "string" and reason ~= "" then
@@ -7415,7 +7647,11 @@ local function diff_shortcut_lines(bufnr)
   if is_non_text then
     lines[#lines + 1] = ""
     lines[#lines + 1] = "Non-text preview"
-    add_shortcut(lines, shortcuts.image_default_action, string.format("Run default preview action (%s)", non_text_preview.action_label(image_default_action)))
+    add_shortcut(
+      lines,
+      shortcuts.image_default_action,
+      string.format("Run default preview action (%s)", non_text_preview.action_label(image_default_action, image_opts))
+    )
     add_shortcut(lines, shortcuts.image_fallback_menu, "Open preview actions menu")
     lines[#lines + 1] = shortcut_line("<CR>", "Run action under cursor when focused on an action row")
     lines[#lines + 1] = shortcut_line("-", "Menu allows setting default action (`d`/`s`)")
@@ -7529,6 +7765,13 @@ function M.current_viewed_state()
 
   return false
 end
+
+M._open_target_helpers = {
+  dangerous_local_open_extensions = vim.deepcopy(dangerous_local_open_extensions),
+  effective_local_open_policy = effective_local_open_policy,
+  normalize_local_open_policy = normalize_local_open_policy,
+  resolve_attachment_filename = resolve_attachment_filename,
+}
 
 return M
 

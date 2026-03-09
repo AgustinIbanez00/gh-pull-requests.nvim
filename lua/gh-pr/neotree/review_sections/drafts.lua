@@ -89,6 +89,7 @@ local function build_target(pr, details, thread, selected_comment_id)
   for _, comment in ipairs(thread.comments) do
     popup_comments[#popup_comments + 1] = {
       id = comment.id,
+      database_id = tonumber(comment.database_id) or tonumber(comment.databaseId),
       author = comment.author,
       created_at = comment.created_at,
       body = comment.body,
@@ -158,6 +159,7 @@ local function normalize_threads(raw_comments)
 
       local comment = {
         id = safe_string(raw_comment.id, tostring(index)),
+        database_id = tonumber(raw_comment.database_id) or tonumber(raw_comment.databaseId),
         author = safe_string(raw_comment.author, "unknown"),
         body = safe_string(raw_comment.body, ""),
         created_at = safe_string(raw_comment.created_at, ""),

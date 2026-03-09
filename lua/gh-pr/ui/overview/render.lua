@@ -545,6 +545,7 @@ local function build_thread_popup_comments(thread)
     if type(comment) == "table" then
       result[#result + 1] = {
         id = utils.safe_string(comment.id, tostring(index)),
+        database_id = tonumber(comment.database_id) or tonumber(comment.databaseId),
         author = utils.safe_string(comment.author, "unknown"),
         created_at = utils.safe_string(comment.created_at, ""),
         body = utils.safe_string(comment.body, ""),

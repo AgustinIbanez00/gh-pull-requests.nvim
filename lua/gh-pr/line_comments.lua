@@ -331,6 +331,7 @@ local function line_popup_items(entries, meta)
         line = tonumber(entry.line) or tonumber(meta.line),
         original_line = tonumber(entry.original_line) or tonumber(meta.original_line),
         comment_id = safe_string(entry.comment_id, ""),
+        comment_database_id = tonumber(entry.comment_database_id) or tonumber(entry.database_id),
         comment_author = safe_string(entry.author, "unknown"),
         comment_body = safe_string(entry.body, ""),
         comment_state = safe_string(entry.state, ""),
@@ -390,11 +391,12 @@ function M.show_at_line(bufnr, line, opts)
   local popup_cfg = popup_options(bufnr, lc_config)
   local path = safe_string(vim.b[bufnr].gh_pr_path, "?")
   local anchor_win = vim.api.nvim_get_current_win()
-  local popup_actions = comment_thread_actions.build_popup_actions({
+  local popup_context = {
     pr_number = tonumber(vim.b[bufnr].gh_pr_number),
     path = path,
     line = tonumber(line),
-  })
+  }
+  local popup_actions = comment_thread_actions.build_popup_actions(popup_context)
 
   local ok, err = comment_popup.open({
     origin_bufnr = bufnr,
@@ -407,9 +409,7 @@ function M.show_at_line(bufnr, line, opts)
       line = tonumber(line),
     }),
     actions = popup_actions,
-    footer_lines = {
-      "r reply  R quote  x resolve  e edit  D delete  +/- reactions  q close",
-    },
+    footer_provider = comment_thread_actions.build_popup_footer_provider(popup_context),
     mode = popup_cfg.enter and "open" or "preview",
     anchor_win = anchor_win,
     enter = popup_cfg.enter,

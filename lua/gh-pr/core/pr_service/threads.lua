@@ -21,6 +21,7 @@ query($owner:String!, $name:String!, $number:Int!, $threadsFirst:Int!, $comments
           comments(first:$commentsFirst) {
             nodes {
               id
+              databaseId
               path
               line
               originalLine
@@ -353,6 +354,7 @@ function M.build_line_comment_index(threads, opts, ctx)
       local entry = {
         thread_id = thread.id,
         comment_id = comment.id,
+        comment_database_id = tonumber(comment.database_id),
         path = path,
         author = comment.author,
         body = comment.body,

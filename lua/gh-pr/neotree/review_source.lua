@@ -9,6 +9,7 @@ local config = require("gh-pr.config")
 local follow = require("gh-pr.neotree.follow")
 local highlights = require("gh-pr.highlights")
 local review_prefetch = require("gh-pr.core.review_prefetch")
+local review_context = require("gh-pr.core.review_context")
 local review_checks_section = require("gh-pr.neotree.review_sections.checks")
 local review_comments_section = require("gh-pr.neotree.review_sections.comments")
 local review_drafts_section = require("gh-pr.neotree.review_sections.drafts")
@@ -592,32 +593,12 @@ local function remember_revealed_node(session, node_id, context)
 end
 
 local function repository_full_name(details)
-  local repository = type(details) == "table" and (details.baseRepository or details.headRepository) or nil
-  if type(repository) ~= "table" then
-    return ""
-  end
-
-  if type(repository.nameWithOwner) == "string" and repository.nameWithOwner ~= "" then
-    return repository.nameWithOwner
-  end
-
-  local owner
-  if type(repository.owner) == "table" then
-    owner = repository.owner.login
-  else
-    owner = repository.owner
-  end
-
-  local name = repository.name
-  if type(owner) ~= "string" or owner == "" or type(name) ~= "string" or name == "" then
-    return ""
-  end
-
-  return owner .. "/" .. name
+  return review_context.resolve_repository_full_name(details)
 end
 
 local function build_file_nodes(pr, details, repo_full_name, session)
-  return review_files_section.build_nodes(pr, details, repo_full_name, {
+  local resolved_repo_full_name = review_context.resolve_repository_full_name(details, repo_full_name)
+  return review_files_section.build_nodes(pr, details, resolved_repo_full_name, {
     filters = type(session) == "table" and session.file_filters or nil,
   })
 end
