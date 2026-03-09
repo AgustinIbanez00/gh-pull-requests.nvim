@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y neovim lua5.1 luarocks
+          sudo luarocks install luacheck
+
+      - name: Show tool versions
+        shell: bash
+        run: |
+          pwsh -NoLogo -Command '$PSVersionTable.PSVersion.ToString()'
+          nvim --version | head -n 1
+          luacheck --version
+
+      - name: Run validation
+        shell: pwsh
+        run: ./scripts/validate.ps1 -WithLuacheck

@@ -5,6 +5,7 @@ A GitHub Pull Request workflow for Neovim (VSCode-like), powered by the GitHub C
 [![Neovim](https://img.shields.io/badge/Neovim-0.9%2B-57A143?logo=neovim&logoColor=white)](#requirements)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Release](https://img.shields.io/github/v/release/agustinibanez/gh-pull-requests.nvim)](https://github.com/agustinibanez/gh-pull-requests.nvim/releases)
+[![CI](https://github.com/AgustinIbanez00/gh-pull-requests.nvim/actions/workflows/ci.yml/badge.svg)](https://github.com/AgustinIbanez00/gh-pull-requests.nvim/actions/workflows/ci.yml)
 [![Last Commit](https://img.shields.io/github/last-commit/agustinibanez/gh-pull-requests.nvim)](https://github.com/agustinibanez/gh-pull-requests.nvim/commits/main)
 [![Stars](https://img.shields.io/github/stars/agustinibanez/gh-pull-requests.nvim?style=social)](https://github.com/agustinibanez/gh-pull-requests.nvim/stargazers)
 [![Validation](https://img.shields.io/badge/Validation-scripts%2Fvalidate.ps1-blue)](#validation)
@@ -97,6 +98,7 @@ pwsh -File scripts/validate.ps1
 ```
 
 This command runs headless smoke checks and helptags generation in one step.
+The same entrypoint is used by GitHub Actions CI on every push to `main` and on pull requests.
 It now includes:
 
 - command and entrypoint smoke (`scripts/headless_smoke.ps1`)
@@ -112,7 +114,7 @@ pwsh -File scripts/validate.ps1 -WithLuacheck -WithCheckHealth
 Validation prerequisites:
 
 - `pwsh` and `nvim` available in `PATH`
-- `luacheck` only when `-WithLuacheck` is used
+- `luacheck` only when `-WithLuacheck` is used locally or in CI
 - `gh auth login` recommended when `-WithCheckHealth` is used
 
 ## Installation

@@ -18,8 +18,8 @@
 ## Status
 - Completed: shared review-context helper for canonical repo/path resolution.
 - Completed: `PR Review -> Files` canonicalization for comments and viewed badges, including rename handling.
+- Completed: targeted smoke coverage for rename, repo-key mismatch, and path normalization.
 - Completed: repo validation passes: headless smoke, Neo-tree lazy smoke, and helptags.
-- Pending: targeted smoke coverage for rename, repo-key mismatch, and path normalization.
 
 ## Acceptance Criteria
 - `PR Review -> Files` keeps the existing `M/A/D/R/C` badge behavior.
@@ -27,3 +27,15 @@
 - Viewed badges use the repository key resolved from PR details, with the local repo only as fallback.
 - Path normalization is consistent across `files.lua`, `actions.lua`, `state.lua`, and viewed-state syncing.
 - Repo validation passes: headless smoke, Neo-tree lazy smoke, and helptags.
+
+# Tooling / CI Wave
+
+## Status
+- Completed: GitHub Actions CI workflow runs the repo validation entrypoint on push to `main` and on pull requests.
+- Completed: CI installs Neovim and `luacheck` before running validation.
+- Completed: README validation docs now describe the local/CI parity.
+
+## Acceptance Criteria
+- GitHub Actions runs the same `scripts/validate.ps1` entrypoint used locally.
+- CI covers headless smoke, Neo-tree lazy smoke, helptags, and `luacheck`.
+- Workflow uses read-only repository permissions and does not require extra secrets for default validation.
