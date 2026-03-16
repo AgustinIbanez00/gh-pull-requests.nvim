@@ -1,11 +1,9 @@
 local M = {}
 
-local function safe_string(value)
-  if type(value) == "string" and value ~= "" then
-    return value
-  end
-  return ""
-end
+local coerce = require("gh-pr.core.coerce")
+local repository = require("gh-pr.core.repository")
+
+local safe_string = coerce.safe_string
 
 function M.normalize_path(path)
   if type(path) ~= "string" then
@@ -17,21 +15,8 @@ function M.normalize_path(path)
   return normalized
 end
 
-local function repository_name_with_owner(repository)
-  repository = type(repository) == "table" and repository or {}
-
-  local full_name = safe_string(repository.nameWithOwner)
-  if full_name ~= "" then
-    return full_name
-  end
-
-  local owner = type(repository.owner) == "table" and safe_string(repository.owner.login) or safe_string(repository.owner)
-  local name = safe_string(repository.name)
-  if owner ~= "" and name ~= "" then
-    return owner .. "/" .. name
-  end
-
-  return ""
+local function repository_name_with_owner(repo)
+  return repository.name_with_owner(repo)
 end
 
 function M.resolve_repository_full_name(details, fallback_repo)
@@ -55,18 +40,18 @@ function M.file_candidates(file)
 
   local candidates = {}
   local seen = {}
-  for _, candidate in ipairs({
-    file.path,
-    file.filename,
-    file.previousFilename,
-    file.previous_filename,
-  }) do
+  local function add_candidate(candidate)
     local normalized = M.normalize_path(candidate)
     if normalized ~= "" and not seen[normalized] then
       seen[normalized] = true
       candidates[#candidates + 1] = normalized
     end
   end
+
+  add_candidate(file.path)
+  add_candidate(file.filename)
+  add_candidate(file.previousFilename)
+  add_candidate(file.previous_filename)
 
   return candidates
 end

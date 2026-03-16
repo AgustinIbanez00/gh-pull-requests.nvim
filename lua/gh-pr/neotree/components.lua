@@ -160,6 +160,162 @@ local function check_state_for_pr(node)
   return "none"
 end
 
+local function review_decision_for_pr(node)
+  local pr, details = resolve_pr_context(node)
+  local source = type(details) == "table" and details or pr
+  local value = uppercase(type(source) == "table" and source.reviewDecision or "")
+  if value == "CHANGES_REQUESTED" then
+    return "CHANGES_REQUESTED"
+  end
+  if value == "APPROVED" then
+    return "APPROVED"
+  end
+  if value == "REVIEW_REQUIRED" then
+    return "REVIEW_REQUIRED"
+  end
+  return ""
+end
+
+local function approval_count_for_pr(node)
+  local _, details = resolve_pr_context(node)
+  if type(details) ~= "table" then
+    return 0
+  end
+
+  local latest_reviews = type(details.latestReviews) == "table" and details.latestReviews or nil
+  local reviews = type(latest_reviews) == "table" and not vim.tbl_isempty(latest_reviews) and latest_reviews or details.reviews
+  local latest_state_by_author = {}
+
+  for _, review in ipairs(type(reviews) == "table" and reviews or {}) do
+    local author = normalize_login(type(review) == "table" and review.author or review)
+    if author then
+      latest_state_by_author[author] = uppercase(type(review) == "table" and review.state or "")
+    end
+  end
+
+  local approvals = 0
+  for _, state in pairs(latest_state_by_author) do
+    if state == "APPROVED" then
+      approvals = approvals + 1
+    end
+  end
+
+  return approvals
+end
+
+local function mergeability_for_pr(node)
+  local pr, details = resolve_pr_context(node)
+  local source = type(details) == "table" and details or pr
+  if type(source) ~= "table" then
+    return "", ""
+  end
+
+  return uppercase(tostring(source.mergeable or "")), uppercase(source.mergeStateStatus)
+end
+
+local function pr_has_conflicts(node)
+  local mergeable, merge_state = mergeability_for_pr(node)
+  return mergeable == "CONFLICTING" or merge_state == "DIRTY"
+end
+
+local function author_badge_for_pr(node)
+  local pr, details = resolve_pr_context(node)
+  local author = normalize_login(type(pr) == "table" and pr.author or nil)
+    or normalize_login(type(details) == "table" and details.author or nil)
+  if not author then
+    return nil
+  end
+
+  local login = author:gsub("^@", "")
+  if login == "" then
+    return nil
+  end
+
+  return {
+    text = " @" .. login,
+    highlight = "GhPrPrAuthor",
+  }
+end
+
+local function draft_badge_for_pr(node)
+  local pr, details = resolve_pr_context(node)
+  local is_draft = (type(pr) == "table" and pr.isDraft == true) or (type(details) == "table" and details.isDraft == true)
+  if not is_draft then
+    return nil
+  end
+
+  return {
+    text = " DRAFT",
+    highlight = "GhPrPrDraft",
+  }
+end
+
+local function checks_badge_for_pr(node)
+  local state = check_state_for_pr(node)
+  if state == "running" then
+    return {
+      text = " RUN",
+      highlight = "GhPrCheckRunning",
+    }
+  end
+  if state == "success" then
+    return {
+      text = " OK",
+      highlight = "GhPrCheckSuccess",
+    }
+  end
+  if state == "failed" then
+    return {
+      text = " FAIL",
+      highlight = "GhPrCheckFailed",
+    }
+  end
+  return nil
+end
+
+local function conflict_badge_for_pr(node)
+  if not pr_has_conflicts(node) then
+    return nil
+  end
+
+  return {
+    text = " CONFLICT",
+    highlight = "GhPrPrConflict",
+  }
+end
+
+local function review_badges_for_pr(node)
+  local decision = review_decision_for_pr(node)
+  local approvals = approval_count_for_pr(node)
+  local badges = {}
+
+  if decision == "CHANGES_REQUESTED" then
+    badges[#badges + 1] = {
+      text = " REQ",
+      highlight = "GhPrPrReviewChanges",
+    }
+  elseif decision == "REVIEW_REQUIRED" then
+    badges[#badges + 1] = {
+      text = " PEND",
+      highlight = "GhPrPrReviewPending",
+    }
+  elseif decision == "APPROVED" and approvals < 1 then
+    badges[#badges + 1] = {
+      text = " APP",
+      highlight = "GhPrPrReviewApproved",
+    }
+  end
+
+  if approvals > 0 then
+    badges[#badges + 1] = {
+      text = string.format(" APP%d", approvals),
+      highlight = "GhPrPrReviewApproved",
+    }
+  end
+
+  return badges
+end
+
 local function normalize_hex_color(value)
   if type(value) ~= "string" then
     return nil
@@ -585,6 +741,43 @@ M.pr_checks_badge = function(_, node, _)
     text = "",
     highlight = "GhPrCheckRunning",
   }
+end
+
+M.pr_meta_badges = function(_, node, _)
+  local badges = {}
+
+  local author_badge = author_badge_for_pr(node)
+  if author_badge then
+    badges[#badges + 1] = author_badge
+  end
+
+  local draft_badge = draft_badge_for_pr(node)
+  if draft_badge then
+    badges[#badges + 1] = draft_badge
+  end
+
+  local checks_badge = checks_badge_for_pr(node)
+  if checks_badge then
+    badges[#badges + 1] = checks_badge
+  end
+
+  local conflict_badge = conflict_badge_for_pr(node)
+  if conflict_badge then
+    badges[#badges + 1] = conflict_badge
+  end
+
+  for _, badge in ipairs(review_badges_for_pr(node)) do
+    badges[#badges + 1] = badge
+  end
+
+  if vim.tbl_isempty(badges) then
+    return {
+      text = "",
+      highlight = "GhPrPrAuthor",
+    }
+  end
+
+  return badges
 end
 
 M.viewed_badge = function(_, node, _)

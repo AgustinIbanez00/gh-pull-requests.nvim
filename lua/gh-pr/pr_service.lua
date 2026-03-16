@@ -1,6 +1,7 @@
 local M = {}
 
 local config = require("gh-pr.config")
+local repository = require("gh-pr.core.repository")
 local gh = require("gh-pr.gh")
 local repo = require("gh-pr.repo")
 local pr_check_annotations = require("gh-pr.core.pr_service.check_annotations")
@@ -211,54 +212,15 @@ function M.resolve_repository()
 end
 
 local function normalize_repository_filter(input)
-  if type(input) == "table" then
-    if type(input.owner) == "string" and input.owner ~= "" and type(input.name) == "string" and input.name ~= "" then
-      input.full_name = input.full_name or (input.owner .. "/" .. input.name)
-      return input
-    end
-
-    if type(input.full_name) == "string" and input.full_name ~= "" then
-      local owner, name = input.full_name:match("^([^/]+)/(.+)$")
-      if owner and name then
-        return {
-          owner = owner,
-          name = name,
-          full_name = input.full_name,
-        }
-      end
-    end
+  local parsed = repository.parse(input)
+  if parsed then
+    return parsed
   end
-
-  if type(input) == "string" and input ~= "" then
-    local owner, name = input:match("^([^/]+)/(.+)$")
-    if owner and name then
-      return {
-        owner = owner,
-        name = name,
-        full_name = input,
-      }
-    end
-  end
-
   return nil
 end
 
 local function normalize_repo(owner, name)
-  if type(owner) ~= "string" or owner == "" then
-    return nil
-  end
-
-  if type(name) ~= "string" or name == "" then
-    return nil
-  end
-
-  return {
-    owner = {
-      login = owner,
-    },
-    name = name,
-    nameWithOwner = owner .. "/" .. name,
-  }
+  return repository.to_api_object(owner, name)
 end
 
 local function enrich_details_with_repositories(details)
@@ -991,39 +953,7 @@ function M.build_overview_model(details, threads, limits, opts)
   return pr_overview_model.build(details, threads, limits, opts, overview_model_context())
 end
 local function normalize_repository_from_input(input)
-  if type(input) == "string" and input ~= "" then
-    local owner, name = input:match("^([^/]+)/(.+)$")
-    if owner and name then
-      return {
-        owner = owner,
-        name = name,
-        full_name = owner .. "/" .. name,
-      }
-    end
-  end
-
-  if type(input) == "table" then
-    if type(input.full_name) == "string" and input.full_name ~= "" then
-      local owner, name = input.full_name:match("^([^/]+)/(.+)$")
-      if owner and name then
-        return {
-          owner = owner,
-          name = name,
-          full_name = input.full_name,
-        }
-      end
-    end
-
-    if type(input.owner) == "string" and input.owner ~= "" and type(input.name) == "string" and input.name ~= "" then
-      return {
-        owner = input.owner,
-        name = input.name,
-        full_name = input.owner .. "/" .. input.name,
-      }
-    end
-  end
-
-  return nil
+  return repository.parse(input)
 end
 
 function M.fetch_commit_details(pr_number, oid, opts)

@@ -73,6 +73,38 @@ local function find_first_node_matching(nodes, predicate)
   return nil
 end
 
+local function review_file_badge_parts(node)
+  local components = require("gh-pr.neotree.components")
+  return components.file_review_badges({}, node, {})
+end
+
+local function review_file_badge_text(node)
+  local rendered = review_file_badge_parts(node)
+  local parts = {}
+  for _, item in ipairs(type(rendered) == "table" and rendered or {}) do
+    parts[#parts + 1] = type(item) == "table" and (item.text or "") or ""
+  end
+  return table.concat(parts, "")
+end
+
+local function pr_meta_badge_parts(node)
+  local components = require("gh-pr.neotree.components")
+  return components.pr_meta_badges({}, node, {})
+end
+
+local function pr_meta_badge_text(node)
+  local rendered = pr_meta_badge_parts(node)
+  if type(rendered) == "table" and type(rendered.text) == "string" then
+    return rendered.text
+  end
+
+  local parts = {}
+  for _, item in ipairs(type(rendered) == "table" and rendered or {}) do
+    parts[#parts + 1] = type(item) == "table" and (item.text or "") or ""
+  end
+  return table.concat(parts, "")
+end
+
 local function contains_source(items, source_name)
   for _, item in ipairs(type(items) == "table" and items or {}) do
     if item == source_name then
@@ -158,6 +190,21 @@ local function install_neotree_stubs(state)
 
     function manager.refresh(source_name)
       table.insert(state.manager_refreshes, source_name)
+    end
+
+    function manager.dispose_invalid_tabs()
+      state.dispose_invalid_tabs_calls = (state.dispose_invalid_tabs_calls or 0) + 1
+    end
+
+    function manager._for_each_state(source_name, action)
+      state.for_each_state_calls = (state.for_each_state_calls or 0) + 1
+      manager.dispose_invalid_tabs()
+      if type(action) == "function" then
+        action({
+          name = source_name,
+          tabid = vim.api.nvim_get_current_tabpage(),
+        })
+      end
     end
 
     return manager
@@ -934,6 +981,72 @@ local function case_manual_gate_skips_auto_registration()
   assert_false(contains_source(state.neo_tree.config.sources, "gh_pr"), "gate=manual must not auto-add gh_pr")
 end
 
+local function case_neotree_manager_fast_events_are_scheduled()
+  reset_ghpr_modules()
+  local state = {
+    manager_setups = {},
+    manager_refreshes = {},
+    command_calls = {},
+    redraws = 0,
+    modules_by_source = {},
+    window_states = {},
+  }
+  install_neotree_stubs(state)
+
+  local gh = require("gh-pr")
+  gh.setup({
+    ui = {
+      use_neotree = true,
+      telescope_fallback = false,
+      neotree_sources = {
+        pr = {
+          auto_register = true,
+          gate = "manual",
+          workspace = "cwd",
+        },
+      },
+    },
+  })
+
+  require("neo-tree")
+  require("gh-pr.integrations.neotree").handle_neotree_filetype({})
+
+  local manager = require("neo-tree.sources.manager")
+  local original_in_fast_event = vim.in_fast_event
+  local fast_event = true
+  local action_calls = 0
+
+  vim.in_fast_event = function()
+    return fast_event
+  end
+
+  manager._for_each_state("filesystem", function()
+    action_calls = action_calls + 1
+  end)
+
+  assert_equals(state.dispose_invalid_tabs_calls or 0, 0,
+    "dispose_invalid_tabs should not run inline during fast-event traversal")
+  assert_equals(state.for_each_state_calls or 0, 0,
+    "_for_each_state should be deferred when called from fast-event")
+  assert_equals(action_calls, 0, "fast-event traversal should defer callbacks to the main loop")
+
+  fast_event = false
+  local completed = vim.wait(200, function()
+    return (state.dispose_invalid_tabs_calls or 0) == 1
+      and (state.for_each_state_calls or 0) == 1
+      and action_calls == 1
+  end, 10)
+
+  vim.in_fast_event = original_in_fast_event
+
+  assert_true(completed, "scheduled Neo-tree manager traversal should complete on the main loop")
+  assert_equals(state.dispose_invalid_tabs_calls, 1,
+    "dispose_invalid_tabs should run once after leaving fast-event")
+  assert_equals(state.for_each_state_calls, 1,
+    "_for_each_state should execute once after leaving fast-event")
+  assert_equals(action_calls, 1, "deferred traversal should execute its callback once")
+end
+
 local function case_review_tree_keeps_toggle()
   reset_ghpr_modules()
   local state = {
@@ -1220,6 +1333,286 @@ local function case_review_files_filters_apply()
   assert_equals(file_node.path, "lua/gh-pr/actions.lua", "review files filters should keep matching modified unviewed file")
 end
 
+local function case_review_file_badges_follow_canonical_paths()
+  reset_ghpr_modules()
+  install_neotree_stubs({
+    manager_setups = {},
+    manager_refreshes = {},
+    command_calls = {},
+    redraws = 0,
+    modules_by_source = {},
+    window_states = {},
+  })
+
+  package.preload["gh-pr.config"] = function()
+    return {
+      get = function()
+        return {
+          hide_viewed_files = false,
+          pr_review = {
+            files = {
+              flat = false,
+            },
+          },
+        }
+      end,
+      get_path_render = function()
+        return {
+          mode = "tree",
+          separator = "/",
+          show_status_prefix = true,
+        }
+      end,
+    }
+  end
+
+  package.preload["gh-pr.path_tree"] = function()
+    return {
+      build_nodes = function(entries, opts)
+        local nodes = {}
+        for _, entry in ipairs(entries or {}) do
+          nodes[#nodes + 1] = opts.create_file_node(entry)
+        end
+        return nodes
+      end,
+    }
+  end
+
+  package.preload["gh-pr.state"] = function()
+    return {
+      is_viewed = function()
+        return false
+      end,
+      get_pr_review_files_flat_pref = function()
+        return false
+      end,
+    }
+  end
+
+  local files_section = require("gh-pr.neotree.review_sections.files")
+  local nodes = files_section.build_nodes({
+    number = 42,
+  }, {
+    files = {
+      {
+        path = "lua/gh-pr/new_name.lua",
+        previousFilename = "lua/gh-pr/old_name.lua",
+        status = "renamed",
+      },
+    },
+    review_threads = {
+      {
+        id = "thread-1",
+        path = "lua/gh-pr/old_name.lua",
+        comments = {
+          {
+            id = "comment-1",
+            path = "lua/gh-pr/old_name.lua",
+          },
+        },
+      },
+    },
+    pending_review_comments = {
+      {
+        id = "pending-1",
+        path = "lua/gh-pr/old_name.lua",
+      },
+    },
+  }, "owner/repo", {
+    filters = {},
+  })
+
+  local file_node = find_first_file_node(nodes)
+  assert_true(file_node ~= nil, "review file badges should render a file node for renamed files")
+  assert_equals(file_node.path, "lua/gh-pr/new_name.lua", "review file badges should keep the canonical current path")
+  assert_equals(file_node.extra.file_comment_count, 2, "review file badges should count comments from renamed paths")
+  assert_true(review_file_badge_text(file_node):find("x2", 1, true) ~= nil, "review file badges should show comment count on canonical file row")
+end
+
+local function case_review_file_badges_use_detail_repository_for_viewed_state()
+  reset_ghpr_modules()
+  install_neotree_stubs({
+    manager_setups = {},
+    manager_refreshes = {},
+    command_calls = {},
+    redraws = 0,
+    modules_by_source = {},
+    window_states = {},
+  })
+
+  package.preload["gh-pr.config"] = function()
+    return {
+      get = function()
+        return {
+          hide_viewed_files = false,
+          pr_review = {
+            files = {
+              flat = false,
+            },
+          },
+        }
+      end,
+      get_path_render = function()
+        return {
+          mode = "tree",
+          separator = "/",
+          show_status_prefix = true,
+        }
+      end,
+    }
+  end
+
+  package.preload["gh-pr.path_tree"] = function()
+    return {
+      build_nodes = function(entries, opts)
+        local nodes = {}
+        for _, entry in ipairs(entries or {}) do
+          nodes[#nodes + 1] = opts.create_file_node(entry)
+        end
+        return nodes
+      end,
+    }
+  end
+
+  package.preload["gh-pr.state"] = function()
+    return {
+      is_viewed = function(repo, _, path)
+        return repo == "detail-owner/detail-repo" and path == "lua/gh-pr/viewed.lua"
+      end,
+      get_pr_review_files_flat_pref = function()
+        return false
+      end,
+    }
+  end
+
+  local files_section = require("gh-pr.neotree.review_sections.files")
+  local nodes = files_section.build_nodes({
+    number = 42,
+  }, {
+    baseRepository = {
+      nameWithOwner = "detail-owner/detail-repo",
+    },
+    files = {
+      {
+        path = "lua/gh-pr/viewed.lua",
+        status = "modified",
+      },
+    },
+    review_threads = {},
+  }, "local-owner/local-repo", {
+    filters = {},
+  })
+
+  local file_node = find_first_file_node(nodes)
+  assert_true(file_node ~= nil, "review file badges should render a viewed file node")
+  assert_equals(file_node.extra.repo, "detail-owner/detail-repo", "review file badges should prefer repository from PR details")
+  local badge_parts = review_file_badge_parts(file_node)
+  assert_true(type(badge_parts[2]) == "table", "review file badges should include the viewed badge slot")
+  assert_true(vim.trim(badge_parts[2].text or "") ~= "", "review file badges should show viewed icon when details repository matches state")
+end
+
+local function case_review_file_badges_normalize_paths_consistently()
+  reset_ghpr_modules()
+  install_neotree_stubs({
+    manager_setups = {},
+    manager_refreshes = {},
+    command_calls = {},
+    redraws = 0,
+    modules_by_source = {},
+    window_states = {},
+  })
+
+  package.preload["gh-pr.config"] = function()
+    return {
+      get = function()
+        return {
+          hide_viewed_files = false,
+          pr_review = {
+            files = {
+              flat = false,
+            },
+          },
+        }
+      end,
+      get_path_render = function()
+        return {
+          mode = "tree",
+          separator = "/",
+          show_status_prefix = true,
+        }
+      end,
+    }
+  end
+
+  package.preload["gh-pr.path_tree"] = function()
+    return {
+      build_nodes = function(entries, opts)
+        local nodes = {}
+        for _, entry in ipairs(entries or {}) do
+          nodes[#nodes + 1] = opts.create_file_node(entry)
+        end
+        return nodes
+      end,
+    }
+  end
+
+  package.preload["gh-pr.state"] = function()
+    return {
+      is_viewed = function(repo, _, path)
+        return repo == "owner/repo" and path == "lua/gh-pr/normalized.lua"
+      end,
+      get_pr_review_files_flat_pref = function()
+        return false
+      end,
+    }
+  end
+
+  local files_section = require("gh-pr.neotree.review_sections.files")
+  local nodes, viewed_files, total_files = files_section.build_nodes({
+    number = 42,
+  }, {
+    baseRepository = {
+      nameWithOwner = "owner/repo",
+    },
+    files = {
+      {
+        path = "//lua\\gh-pr//normalized.lua/",
+        status = "modified",
+      },
+    },
+    review_threads = {
+      {
+        id = "thread-1",
+        path = "lua/gh-pr/normalized.lua",
+        comments = {
+          {
+            id = "comment-1",
+            path = "lua/gh-pr/normalized.lua",
+          },
+        },
+      },
+    },
+    pending_review_comments = {
+      {
+        id = "pending-1",
+        path = "\\lua\\gh-pr\\normalized.lua\\",
+      },
+    },
+  }, "owner/repo", {
+    filters = {},
+  })
+
+  local file_node = find_first_file_node(nodes)
+  assert_true(file_node ~= nil, "review file badges should render normalized file nodes")
+  assert_equals(total_files, 1, "review file badges should not duplicate normalized file paths")
+  assert_equals(viewed_files, 1, "review file badges should resolve viewed state across normalized paths")
+  assert_equals(file_node.path, "lua/gh-pr/normalized.lua", "review file badges should normalize file paths consistently")
+  assert_equals(file_node.extra.file_comment_count, 2, "review file badges should merge comments across normalized path variants")
+  local badge_parts = review_file_badge_parts(file_node)
+  assert_true(vim.trim(badge_parts[2].text or "") ~= "", "review file badges should keep viewed icon after path normalization")
+  assert_true(review_file_badge_text(file_node):find("x2", 1, true) ~= nil, "review file badges should keep comment badge after path normalization")
+end
+
 local function case_review_checks_load_annotations_lazily()
   reset_ghpr_modules()
   local state = {
@@ -1319,6 +1712,217 @@ local function case_review_checks_load_annotations_lazily()
   if vim.api.nvim_win_is_valid(source_win) then
     vim.api.nvim_win_close(source_win, true)
   end
+end
+
+local function case_review_commit_nodes_are_actionable()
+  reset_ghpr_modules()
+  local state = {
+    show_nodes_calls = 0,
+    synced_buffers = 0,
+    window_states = {},
+    set_active_pr_calls = 0,
+    set_active_review_calls = 0,
+  }
+  install_review_source_runtime_stubs(state)
+  package.preload["gh-pr.neotree.review_sections.overview"] = function()
+    return {
+      build_root_nodes = function(_, _, sections)
+        local nodes = {}
+        if type(sections) == "table" then
+          local files = type(sections.files) == "table" and sections.files.children or {}
+          local commits = type(sections.commits) == "table" and sections.commits.children or {}
+          local checks = type(sections.checks) == "table" and sections.checks.children or {}
+          local security = type(sections.security) == "table" and sections.security.children or {}
+          for _, node in ipairs(type(files) == "table" and files or {}) do
+            nodes[#nodes + 1] = node
+          end
+          for _, node in ipairs(type(commits) == "table" and commits or {}) do
+            nodes[#nodes + 1] = node
+          end
+          for _, node in ipairs(type(checks) == "table" and checks or {}) do
+            nodes[#nodes + 1] = node
+          end
+          for _, node in ipairs(type(security) == "table" and security or {}) do
+            nodes[#nodes + 1] = node
+          end
+        end
+        return nodes
+      end,
+      files_title = function()
+        return "Files"
+      end,
+      reviewers_title = function()
+        return "Reviewers"
+      end,
+      commits_title = function()
+        return "Commits"
+      end,
+      checks_title = function()
+        return "Checks"
+      end,
+      security_title = function()
+        return "Security"
+      end,
+      count_commit_entries = function()
+        return 0
+      end,
+    }
+  end
+
+  local source = require("gh-pr.neotree.review_source")
+  local source_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_option_value("filetype", "neo-tree", { buf = source_buf })
+  vim.b[source_buf].neo_tree_source = "gh_pr_review"
+
+  local current_win = vim.api.nvim_get_current_win()
+  vim.cmd("vsplit")
+  local source_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(source_win, source_buf)
+  local tree_state = {
+    winid = source_win,
+    path = vim.fn.getcwd(),
+    gh_pr_review_repo_key = "owner/repo::" .. vim.fn.getcwd(),
+  }
+  state.window_states[source_win] = tree_state
+  vim.api.nvim_set_current_win(current_win)
+
+  source.navigate(tree_state, vim.fn.getcwd())
+  assert_true(type(state.fetch_details_callback) == "function", "review navigate should request details before rendering commits")
+
+  state.fetch_details_callback({
+    number = 42,
+    state = "OPEN",
+    isDraft = false,
+    reviewDecision = "REVIEW_REQUIRED",
+    mergeStateStatus = "CLEAN",
+    mergeable = "MERGEABLE",
+    updatedAt = "2026-03-07T15:00:00Z",
+    changedFiles = 1,
+    baseRepository = {
+      nameWithOwner = "owner/repo",
+    },
+    headRepository = {
+      nameWithOwner = "owner/repo",
+    },
+    files = {
+      {
+        path = "lua/gh-pr/actions.lua",
+        filename = "lua/gh-pr/actions.lua",
+        status = "modified",
+      },
+    },
+    commits = {
+      {
+        oid = "abc123def456",
+        messageHeadline = "Refactor commit opener",
+        messageBody = "Commit body",
+        url = "https://example.test/commit/abc123def456",
+        author = {
+          login = "octocat",
+        },
+      },
+    },
+    labels = {},
+  }, nil)
+
+  assert_true(type(state.fetch_threads_callback) == "function", "details refresh should still request review threads")
+  state.fetch_threads_callback({}, nil)
+
+  local commit_node = find_first_node_by_kind(state.last_nodes, "commit")
+  assert_true(commit_node ~= nil, "review tree should render a commit node")
+  assert_equals(commit_node.type, "commit", "commit node should be actionable, not a directory")
+  assert_true(type(commit_node.children) ~= "table" or vim.tbl_isempty(commit_node.children),
+    "commit node should not expose child file nodes")
+
+  if vim.api.nvim_win_is_valid(source_win) then
+    vim.api.nvim_win_close(source_win, true)
+  end
+end
+
+local function case_review_commit_commands_open_commit_diff()
+  reset_ghpr_modules()
+  local state = {
+    manager_setups = {},
+    manager_refreshes = {},
+    command_calls = {},
+    redraws = 0,
+    modules_by_source = {},
+    window_states = {},
+    open_commit_diff_calls = 0,
+    ensure_commit_files_calls = 0,
+    toggle_node_calls = 0,
+    set_active_pr_calls = 0,
+  }
+  install_neotree_stubs(state)
+
+  package.preload["gh-pr.actions"] = function()
+    return {
+      set_active_pr = function(...)
+        state.set_active_pr_calls = state.set_active_pr_calls + 1
+      end,
+      open_commit_diff = function(commit)
+        state.open_commit_diff_calls = state.open_commit_diff_calls + 1
+        state.last_opened_commit = vim.deepcopy(commit)
+      end,
+    }
+  end
+
+  package.preload["gh-pr.neotree.review_source"] = function()
+    return {
+      ensure_commit_files = function(...)
+        state.ensure_commit_files_calls = state.ensure_commit_files_calls + 1
+        return true
+      end,
+    }
+  end
+
+  package.preload["neo-tree.sources.common.commands"] = function()
+    return {
+      _add_common_commands = function(_) end,
+      toggle_node = function(_)
+        state.toggle_node_calls = state.toggle_node_calls + 1
+      end,
+      expand_all_nodes = function(...) end,
+      close_all_nodes = function(...) end,
+    }
+  end
+
+  local commands = require("gh-pr.neotree.review_commands")
+  local commit_node = {
+    extra = {
+      kind = "commit",
+      pr = {
+        number = 42,
+      },
+      details = {
+        number = 42,
+      },
+      commit = {
+        oid = "abc123def456",
+        headline = "Refactor commit opener",
+      },
+    },
+  }
+  local tree_state = {
+    tree = {
+      get_node = function()
+        return commit_node
+      end,
+    },
+  }
+
+  commands.gh_pr_review_open(tree_state)
+  assert_equals(state.open_commit_diff_calls, 1, "review open should route commit nodes to open_commit_diff")
+  assert_equals(state.ensure_commit_files_calls, 0, "review open should not try to load commit child nodes")
+  assert_equals(state.toggle_node_calls, 0, "review open should not toggle commit nodes")
+  assert_equals((state.last_opened_commit or {}).oid, "abc123def456", "review open should pass the selected commit")
+
+  commands.open_diff(tree_state)
+  assert_equals(state.open_commit_diff_calls, 2, "review open_diff should reuse open_commit_diff for commit nodes")
+
+  package.preload["gh-pr.neotree.review_source"] = nil
+  package.preload["gh-pr.actions"] = nil
+  package.preload["neo-tree.sources.common.commands"] = nil
 end
 
 local function case_review_security_loads_findings_lazily()
@@ -1464,16 +2068,151 @@ local function case_review_security_loads_findings_lazily()
   end
 end
 
+local function case_pr_row_badges_compact_summary()
+  reset_ghpr_modules()
+  local state = {
+    manager_setups = {},
+    manager_refreshes = {},
+    command_calls = {},
+    redraws = 0,
+    modules_by_source = {},
+    window_states = {},
+  }
+  install_neotree_stubs(state)
+
+  package.preload["gh-pr.state"] = function()
+    return {
+      get_active_pr = function()
+        return nil, nil
+      end,
+      is_viewed = function()
+        return false
+      end,
+    }
+  end
+
+  local components = require("gh-pr.neotree.components")
+  local node = {
+    type = "pr",
+    name = "#42 Improve badges",
+    extra = {
+      kind = "pr",
+      pr = {
+        number = 42,
+        title = "Improve badges",
+        author = {
+          login = "octocat",
+        },
+        reviewDecision = "CHANGES_REQUESTED",
+      },
+      details = {
+        number = 42,
+        title = "Improve badges",
+        author = {
+          login = "octocat",
+        },
+        isDraft = true,
+        mergeable = "CONFLICTING",
+        mergeStateStatus = "DIRTY",
+        reviewDecision = "CHANGES_REQUESTED",
+        latestReviews = {
+          {
+            author = {
+              login = "reviewer-a",
+            },
+            state = "APPROVED",
+          },
+          {
+            author = {
+              login = "reviewer-b",
+            },
+            state = "APPROVED",
+          },
+          {
+            author = {
+              login = "reviewer-c",
+            },
+            state = "CHANGES_REQUESTED",
+          },
+        },
+        statusCheckRollup = {
+          {
+            status = "COMPLETED",
+            conclusion = "SUCCESS",
+          },
+        },
+      },
+    },
+  }
+
+  assert_equals(components.pr_title({}, node, {}).text, "#42 Improve badges",
+    "PR title renderer should only include number and title")
+  assert_equals(pr_meta_badge_text(node), " @octocat DRAFT OK CONFLICT REQ APP2",
+    "PR meta badges should summarize author, draft, checks, conflicts, review state, and approvals")
+end
+
+local function case_pr_row_badges_hide_unknowns()
+  reset_ghpr_modules()
+  local state = {
+    manager_setups = {},
+    manager_refreshes = {},
+    command_calls = {},
+    redraws = 0,
+    modules_by_source = {},
+    window_states = {},
+  }
+  install_neotree_stubs(state)
+
+  package.preload["gh-pr.state"] = function()
+    return {
+      get_active_pr = function()
+        return nil, nil
+      end,
+      is_viewed = function()
+        return false
+      end,
+    }
+  end
+
+  local node = {
+    type = "pr",
+    name = "#7 Pending query result",
+    extra = {
+      kind = "pr",
+      pr = {
+        number = 7,
+        title = "Pending query result",
+        author = {
+          login = "hubot",
+        },
+        reviewDecision = "REVIEW_REQUIRED",
+      },
+      details = nil,
+    },
+  }
+
+  assert_equals(pr_meta_badge_text(node), " @hubot PEND",
+    "PR meta badges should keep query-level author/review decision and hide detail-only badges until details load")
+end
+
 case_eager_entry_module()
 case_external_source_contract()
 case_open_pending_and_idempotent()
 case_github_gate_hides_source()
 case_manual_gate_skips_auto_registration()
+case_neotree_manager_fast_events_are_scheduled()
 case_review_tree_keeps_toggle()
 case_diff_comments_tree_opens_bottom()
 case_refresh_outside_focus_avoids_render()
 case_initial_navigate_renders_without_live_state()
 case_review_refresh_outside_focus_rerenders_badges()
 case_review_files_filters_apply()
+case_review_file_badges_follow_canonical_paths()
+case_review_file_badges_use_detail_repository_for_viewed_state()
+case_review_file_badges_normalize_paths_consistently()
 case_review_checks_load_annotations_lazily()
+case_review_commit_nodes_are_actionable()
+case_review_commit_commands_open_commit_diff()
 case_review_security_loads_findings_lazily()
+case_pr_row_badges_compact_summary()
+case_pr_row_badges_hide_unknowns()

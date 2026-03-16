@@ -3,6 +3,10 @@ local M = {}
 local baseline_links = {
   { "GhPrPrDraft", "DiagnosticWarn" },
   { "GhPrPrAuthor", "Comment" },
+  { "GhPrPrConflict", "DiagnosticError" },
+  { "GhPrPrReviewPending", "DiagnosticWarn" },
+  { "GhPrPrReviewApproved", "DiagnosticOk" },
+  { "GhPrPrReviewChanges", "DiagnosticError" },
   { "GhPrCheckRunning", "DiagnosticWarn" },
   { "GhPrCheckSuccess", "DiagnosticOk" },
   { "GhPrCheckFailed", "DiagnosticError" },

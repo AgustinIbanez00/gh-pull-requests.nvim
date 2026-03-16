@@ -567,12 +567,7 @@ M.gh_pr_review_open = function(state)
   end
 
   if kind == "commit" and type(node.extra.commit) == "table" then
-    local loaded, load_err = get_source().ensure_commit_files(state, node)
-    if not loaded then
-      vim.notify(load_err or "Unable to load commit files", vim.log.levels.ERROR)
-      return
-    end
-    cc.toggle_node(state)
+    get_actions().open_commit_diff(node.extra.commit)
     return
   end
 
@@ -673,6 +668,8 @@ M.open_diff = function(state)
   local kind = node_kind(node)
   if kind == "file" then
     get_actions().open_diff(node.extra and node.extra.file or nil)
+  elseif kind == "commit" then
+    get_actions().open_commit_diff(node.extra and node.extra.commit or nil)
   elseif kind == "commit_file" then
     get_actions().open_commit_file_diff(node.extra and node.extra.commit or nil, node.extra and node.extra.file or nil)
   end

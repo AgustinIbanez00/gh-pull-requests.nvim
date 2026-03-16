@@ -99,9 +99,8 @@ Commands
     Commits, Checks, Security, Comments, Drafts.
     `Drafts` groups pending-review comments as `file -> thread -> draft
     comment` and opens the diff location for draft items.
-    In `Commits`, `<CR>` expands selected commit and lists changed files.
-    In commit file nodes, `<CR>` opens diff scoped to selected commit
-    (`parent[1] -> commit`).
+    In `Commits`, `<CR>` opens the full commit diff in codediff,
+    matching Overview.
     In `Checks`, `<CR>` lazy-loads annotations and expands
     `check -> file -> annotation`.
     In annotation nodes, `<CR>` opens the PR diff on the modified side at
@@ -224,7 +223,7 @@ Overview buffer keymaps:
     `<CR>` on description line with multiple links opens selector menu
     state row uses direct toggle (`open`/`closed`) with confirmation
     draft row uses direct toggle (`ready`/`draft`) with confirmation
-    `<CR>` on `Commits` opens commit diff details in codediff
+    `<CR>` on `Commits` opens the full commit diff in codediff
     `<CR>` on `Summary > Activity` thread headers opens compare diff for
     the thread file (comment commit -> latest file)
     `gp` preview markdown link under cursor in PR description
@@ -307,13 +306,23 @@ Overview panes keymaps:
     Runs `gh pr checkout` for the active PR or provided number.
 
 :GhPrOpenDiff
-    Opens active file in codediff for text files, or in dedicated gh-pr
+    Opens active file in codediff for text files when
+    `diff_view.mode = "vertical"` or `"unified"` and
+    `diff_view.ignore_whitespace_mode = "none"` or `"trim"` (or legacy
+    `diff_view.ignore_whitespace = v:false|v:true` mapped to
+    `"none"|"trim"`), or in dedicated gh-pr
     non-text preview for image/binary assets.
     gh-pr downloads base/head content directly from GitHub (no git fetch
     required for file diffs).
     If review prefetch is enabled, textual files may already be cached from
     `:GhPrStartReview` / review refresh and open without re-downloading.
-    Layout is forced side-by-side for standard diff flows.
+    `vertical + none|trim` opens codediff side-by-side, `unified + none|trim`
+    opens codediff inline, and `horizontal` or whitespace modes `eol` /
+    `blank_lines` use gh-pr's virtual diff backend instead.
+    Persisted/configured `ignore_whitespace_mode = "all"` is coerced to
+    `"trim"` on load for backward compatibility.
+    `render_whitespace` / `render_endlines` markers remain virtual-backend
+    only and are unavailable in codediff buffers.
     gh-pr forces codediff temp buffers to readonly/non-modifiable
     (`nomodified`, `noswapfile`) to avoid save prompts when exiting.
     gh-pr also keeps read-only `ghpr://...` buffers `nomodified`
@@ -330,7 +339,10 @@ Overview panes keymaps:
     notifications with failure reason, fallback decisions, and review
     prefetch start/result events.
     In codediff file diffs, inline comments/suggestions and diff comments panel
-    are available (inline actions on head side).
+    are available; codediff inline/unified uses the modified side for inline
+    actions.
+    Line comment indicators/authors are rendered in codediff side-by-side,
+    codediff inline, and gh-pr virtual unified text diffs.
     Multiline review comments mark the full range (`startLine -> line`) for
     line indicators; if a range exceeds 200 lines, gh-pr marks first 100 and
     last 100 lines.
@@ -358,15 +370,15 @@ Overview panes keymaps:
     Virtual fallback file content normalizes CRLF/LF/CR endings to avoid `^M` artifacts.
     Diff actions are namespaced under `<localleader>` to avoid overriding
     native Neovim default keys.
-    In virtual PR buffers, `<localleader>dk` opens a modal floating window with comments
+    In virtual PR buffers, `<localleader>k` opens a modal floating window with comments
     for the current line.
-    Press `<localleader>dr` to refresh current diff buffer from GitHub.
-    Press `<localleader>d?` to open a floating shortcuts help dialog for this buffer.
-    Press `<localleader>dq` for quick close:
+    Press `<localleader>R` to refresh current diff buffer from GitHub.
+    Press `<localleader>?` to open a floating shortcuts help dialog for this buffer.
+    Press `<localleader>q` for quick close:
       - in 2-way diff closes head/modified window and keeps base/original
       - in single-buffer views closes current buffer and opens PR Review
-    Press `<localleader>dQ` to close current diff view(s) and open/focus PR Review.
-    Press `<localleader>dc` to toggle diff comments in diff view.
+    Press `<localleader>Q` to close current diff view(s) and open/focus PR Review.
+    Press `<localleader>C` to toggle diff comments in diff view.
     If panel open/refresh fails, gh-pr shows an explicit error notification.
     When Neo-tree is available, gh-pr opens a temporary bottom comments tree
     for the current diff file (`thread -> comment`) without showing the other
@@ -375,8 +387,8 @@ Overview panes keymaps:
     bottom comments panel.
     The diff comments UI only lists comments for the current diff file and
     auto-opens lazily after diff render when the current file has comments.
-    In codediff buffers, `<CR>` on a commented line opens the line comments
-    popup for that line.
+    In codediff and virtual text diff buffers, `<CR>` on a commented line
+    opens the line comments popup for that line.
     Inside line/thread comment popups, `r` opens a reply composer, `R` opens
     a quoted reply composer, and `x` resolves/unresolves the selected thread.
     Replies are added to the current pending review. `e` edits the selected
@@ -389,33 +401,34 @@ Overview panes keymaps:
     first, then the remaining reactions, with `h/j/k/l`, arrows,
     `<Tab>` / `<S-Tab>`, `<CR>`, `q`, and `<Esc>` support.
     On first open per diff buffer, gh-pr shows a one-time hint with close shortcuts.
-    Additional virtual-buffer shortcuts (legacy fallback backend only):
-      `<localleader>dr` refresh current diff from GitHub
-      `<localleader>dq` quick close
-      `<localleader>dQ` close diff view(s) and open PR Review
-      `<localleader>dc` toggle diff comments panel
-      `<localleader>ic` add inline comment at cursor (`MODIFIED`/head or `unified`)
-      visual `<localleader>ic` add inline comment for selected range (`v`/`V`, head or `unified`)
-      `<localleader>is` add inline suggestion at cursor (`suggestion` template)
-      visual `<localleader>is` add inline suggestion for selected range (`v`/`V`)
-      non-text preview buffers disable `<localleader>dk`, `<localleader>ic`,
-      `<localleader>is`, `<localleader>dn`, `<localleader>dp`, check
+    Additional virtual-buffer shortcuts (when gh-pr opens the virtual diff
+    backend):
+      `<localleader>R` refresh current diff from GitHub
+      `<localleader>q` quick close
+      `<localleader>Q` close diff view(s) and open PR Review
+      `<localleader>C` toggle diff comments panel
+      `<localleader>c` add inline comment at cursor (`MODIFIED`/head or `unified`)
+      visual `<localleader>c` add inline comment for selected range (`v`/`V`, head or `unified`)
+      `<localleader>s` add inline suggestion at cursor (`suggestion` template)
+      visual `<localleader>s` add inline suggestion for selected range (`v`/`V`)
+      non-text preview buffers disable `<localleader>k`, `<localleader>c`,
+      `<localleader>s`, `<localleader>n`, `<localleader>p`, check
       annotation overlays, and comments-tree auto-open
       non-text preview buffers: `<localleader>io` runs default preview
       action, `<localleader>im` opens preview actions menu, `<CR>` runs the
       action under cursor in metadata cards
       for `ADDED` files, opens single MODIFIED buffer (no split/unified layout)
-      in `ADDED` single mode, `<localleader>ic` is allowed on any line/range
+      in `ADDED` single mode, `<localleader>c` is allowed on any line/range
       inline comments are validated before opening composer:
       - head: only inside diff hunks
       - unified: only on added (`+`) lines
       composer: `<C-s>` submit draft, `q`/`<Esc>` cancel
-      `<localleader>dn` next change
-      `<localleader>dp` previous change
-      `<localleader>df` next file
-      `<localleader>dF` previous file
-      `<localleader>dv` next reviewed file
-      `<localleader>dV` previous reviewed file
+      `<localleader>n` next change
+      `<localleader>p` previous change
+      `<localleader>f` next file
+      `<localleader>F` previous file
+      `<localleader>v` next reviewed file
+      `<localleader>V` previous reviewed file
       file navigation always reopens full diff view using current render mode
       (`vertical`/`horizontal`/`unified`)
       `<localleader>rc` submit pending review as comment
@@ -423,16 +436,26 @@ Overview panes keymaps:
       `<localleader>rr` submit pending review as request changes
       `<localleader>rd` discard pending review
       `<localleader>rx` toggle PR Review source
-    Legacy layout/render toggle shortcuts are removed from defaults
-    (`diff_view.shortcuts.* = ""`) and only apply if you map them manually
-    while using virtual fallback backend.
+      codediff-backed file diffs keep native codediff keys such as `q`, `g?`,
+      `t`, `]c`, `[c`, `do`, `dp`, and `gf`; gh-pr help also lists them,
+      plus `gm` when codediff moved-code alignment is enabled
+      in codediff-backed file diffs, native `q` closes the codediff tab while
+      `<localleader>q` remains the gh-pr quick-close action
+      `t` only toggles codediff between side-by-side and inline; horizontal
+      split remains a gh-pr virtual-backend mode
+    Layout/whitespace shortcuts are removed from defaults
+    (`diff_view.shortcuts.* = ""`) and only apply if you map them manually.
+    `toggle_render_whitespace` / `toggle_render_endlines` only affect the
+    virtual diff backend.
 
 :GhPrOpenOriginal
-    Opens PR file diff in codediff and focuses base side when possible.
+    Opens PR file diff in the active backend and focuses base side when
+    possible.
     For non-text files, opens readonly base-side preview.
 
 :GhPrOpenModified
-    Opens PR file diff in codediff and focuses head side when possible.
+    Opens PR file diff in the active backend and focuses head side when
+    possible.
     For non-text files, opens readonly head-side preview.
 
 :GhPrOpenCommitPatch
@@ -522,6 +545,9 @@ Enable default global mappings:
   require("gh-pr").setup({ mappings = { global = { enabled = true } } })
 
 gh_pr PR nodes     Expose only `Overview` child (no `Files` subtree)
+gh_pr PR rows      Keep `#number + title` as primary text and render a
+                   right-aligned metadata badge cluster (`@author`,
+                   `DRAFT`, checks, `CONFLICT`, review state, approvals)
 `r` (gh_pr)      Start review flow for selected PR
 `ra` (gh_pr)     Approve review flow for selected PR
 `rc` (gh_pr)     Comment review flow for selected PR
@@ -529,7 +555,6 @@ gh_pr PR nodes     Expose only `Overview` child (no `Files` subtree)
 `rd` (gh_pr)     Discard pending review for selected PR
 `m` (gh_pr)      Merge flow for selected PR
 `k` (gh_pr)      Checkout selected PR branch
-gh_pr PR rows     Show `[DRAFT]` suffix and draft highlight when draft
 `r` prompt rule   Ask `Notify GitHub...` only for eligible reviewer flow
 `b` (gh_pr)      Open selected PR in browser (PR nodes only)
 `b` (gh_pr_review) Open selected PR in browser (PR context nodes only)
@@ -669,7 +694,10 @@ Call `require("gh-pr").setup({ ... })` with:
 - `follow_current_file.debounce_ms` (`60`)
 - `follow_current_file.sources.pr|pr_review` (`true|true`)
 - `diff_view.mode` (`"vertical"`, also `"horizontal"` / `"unified"`)
-- `diff_view.ignore_whitespace` (`false`)
+- `diff_view.ignore_whitespace_mode` (`"none"`, also `"trim"` / `"eol"` /
+  `"blank_lines"`)
+- `diff_view.ignore_whitespace` (`false`, deprecated alias for
+  `ignore_whitespace_mode`)
 - `diff_view.render_whitespace` (`true`)
 - `diff_view.render_endlines` (`false`)
 - `diff_view.debug.codediff_failures` (`false`; debug notify for codediff failures/fallback decisions and review prefetch activity)
@@ -687,22 +715,23 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.endlines.cr` (`"CR"`)
 - `diff_view.endlines.color` (`"#d16969"`)
 - `diff_view.endlines.highlight_group` (`"GhPrDiffEndline"`)
-- `diff_view.shortcuts.inline_comment` (`"<localleader>ic"`)
-- `diff_view.shortcuts.inline_suggestion` (`"<localleader>is"`)
-- `diff_view.shortcuts.line_comments_popup` (`"<localleader>dk"`)
-- `diff_view.shortcuts.refresh` (`"<localleader>dr"`)
-- `diff_view.shortcuts.close_quick` (`"<localleader>dq"`)
-- `diff_view.shortcuts.close_all_open_review` (`"<localleader>dQ"`)
-- `diff_view.shortcuts.help` (`"<localleader>d?"`)
-- `diff_view.shortcuts.next_change` (`"<localleader>dn"`)
-- `diff_view.shortcuts.prev_change` (`"<localleader>dp"`)
-- `diff_view.shortcuts.next_file` (`"<localleader>df"`)
-- `diff_view.shortcuts.prev_file` (`"<localleader>dF"`)
-- `diff_view.shortcuts.next_reviewed_file` (`"<localleader>dv"`)
-- `diff_view.shortcuts.prev_reviewed_file` (`"<localleader>dV"`)
-- `diff_view.shortcuts.toggle_whitespace` (`""`, removed default mapping)
-- `diff_view.shortcuts.toggle_render_whitespace` (`""`, removed default mapping)
-- `diff_view.shortcuts.toggle_render_endlines` (`""`, removed default mapping)
+- `diff_view.shortcuts.inline_comment` (`"<localleader>c"`)
+- `diff_view.shortcuts.inline_suggestion` (`"<localleader>s"`)
+- `diff_view.shortcuts.line_comments_popup` (`"<localleader>k"`)
+- `diff_view.shortcuts.refresh` (`"<localleader>R"`)
+- `diff_view.shortcuts.close_quick` (`"<localleader>q"`)
+- `diff_view.shortcuts.close_all_open_review` (`"<localleader>Q"`)
+- `diff_view.shortcuts.help` (`"<localleader>?"`)
+- `diff_view.shortcuts.next_change` (`"<localleader>n"`)
+- `diff_view.shortcuts.prev_change` (`"<localleader>p"`)
+- `diff_view.shortcuts.next_file` (`"<localleader>f"`)
+- `diff_view.shortcuts.prev_file` (`"<localleader>F"`)
+- `diff_view.shortcuts.next_reviewed_file` (`"<localleader>v"`)
+- `diff_view.shortcuts.prev_reviewed_file` (`"<localleader>V"`)
+- `diff_view.shortcuts.toggle_whitespace` (`""`, toggles `none` <-> `trim`)
+- `diff_view.shortcuts.cycle_whitespace_mode` (`""`, removed default mapping)
+- `diff_view.shortcuts.toggle_render_whitespace` (`""`, virtual backend only)
+- `diff_view.shortcuts.toggle_render_endlines` (`""`, virtual backend only)
 - `diff_view.shortcuts.cycle_mode` (`""`, removed default mapping)
 - `diff_view.shortcuts.set_vertical` (`""`, removed default mapping)
 - `diff_view.shortcuts.set_horizontal` (`""`, removed default mapping)
@@ -712,7 +741,7 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.shortcuts.submit_pending_request_changes` (`"<localleader>rr"`)
 - `diff_view.shortcuts.discard_pending_review` (`"<localleader>rd"`)
 - `diff_view.shortcuts.toggle_review_tree` (`"<localleader>rx"`)
-- `diff_view.shortcuts.toggle_comments_panel` (`"<localleader>dc"`)
+- `diff_view.shortcuts.toggle_comments_panel` (`"<localleader>C"`)
 - `diff_view.shortcuts.image_default_action` (`"<localleader>io"`; default action for non-text preview buffers)
 - `diff_view.shortcuts.image_fallback_menu` (`"<localleader>im"`; preview actions menu for non-text preview buffers)
 - `diff_view.shortcuts.show_open_hint` (`true`)
@@ -821,9 +850,16 @@ Persistence
 
 - Queries: `stdpath("state")/gh-pr/queries.json`
 - Viewed files: `stdpath("state")/gh-pr/state.json`
-- Diff view prefs (`mode`, `ignore_whitespace`, `render_whitespace`, `render_endlines`): `stdpath("state")/gh-pr/state.json`
+- Diff view prefs (`mode`, `ignore_whitespace_mode`, legacy `ignore_whitespace`, `render_whitespace`, `render_endlines`): `stdpath("state")/gh-pr/state.json`
 - Image fallback default action: `stdpath("state")/gh-pr/state.json`
 - PR Review Files mode (`tree/list`): `stdpath("state")/gh-pr/state.json`
 - PR cache: `stdpath("state")/gh-pr/pr_cache.json`
+- `setup({ diff_view = ... })` defines the default diff prefs; if
+  `state.json` has `prefs.diff_view`, those persisted runtime changes override
+  the Lua defaults on later sessions.
+- Per-open diff overrides do not rewrite `state.json`; only the runtime diff
+  actions persist updated diff prefs.
+- `diff_view.shortcuts.*` remain Lua-configured/opt-in and are not read from
+  or written to `state.json`.
 - Cache is stored per source/repo key (`gh_pr` and `gh_pr_review`).
 

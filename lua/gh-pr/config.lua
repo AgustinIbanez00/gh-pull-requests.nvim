@@ -1,5 +1,6 @@
 local M = {}
 local diff_shortcuts = require("gh-pr.diff_shortcuts")
+local diff_view_core = require("gh-pr.core.diff_view")
 
 local defaults = {
   remotes = { "origin", "upstream" },
@@ -229,6 +230,7 @@ local defaults = {
   diff_view = {
     mode = "vertical",
     ignore_whitespace = false,
+    ignore_whitespace_mode = "none",
     render_whitespace = true,
     render_endlines = false,
     debug = {
@@ -1315,10 +1317,11 @@ local function sanitize_line_comments(line_comments)
   return result
 end
 
-local function sanitize_diff_view(diff_view)
+local function sanitize_diff_view(diff_view, raw_diff_view)
   if type(diff_view) ~= "table" then
     return vim.deepcopy(defaults.diff_view)
   end
+  raw_diff_view = type(raw_diff_view) == "table" and raw_diff_view or {}
 
   local function sanitize_listchars_token(value, fallback)
     if type(value) ~= "string" or value == "" then
@@ -1331,13 +1334,21 @@ local function sanitize_diff_view(diff_view)
   end
 
   local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.diff_view), diff_view)
-  if result.mode ~= "vertical" and result.mode ~= "horizontal" and result.mode ~= "unified" then
-    result.mode = defaults.diff_view.mode
+  result.mode = diff_view_core.normalize_mode(result.mode, defaults.diff_view.mode)
+
+  if type(raw_diff_view.ignore_whitespace) == "boolean" and type(raw_diff_view.ignore_whitespace_mode) ~= "string" then
+    notify_deprecation_once(
+      "diff_view.ignore_whitespace",
+      "gh-pr: `diff_view.ignore_whitespace` is deprecated; use `diff_view.ignore_whitespace_mode` instead."
+    )
   end
 
-  if type(result.ignore_whitespace) ~= "boolean" then
-    result.ignore_whitespace = defaults.diff_view.ignore_whitespace
-  end
+  result.ignore_whitespace_mode = diff_view_core.resolve_whitespace_mode(
+    raw_diff_view.ignore_whitespace_mode,
+    raw_diff_view.ignore_whitespace,
+    defaults.diff_view.ignore_whitespace_mode
+  )
+  result.ignore_whitespace = diff_view_core.legacy_ignore_whitespace(result.ignore_whitespace_mode)
 
   if type(result.render_whitespace) ~= "boolean" then
     result.render_whitespace = defaults.diff_view.render_whitespace
@@ -1627,7 +1638,7 @@ function M.setup(opts)
   end
   state.cache = sanitize_cache(state.cache)
   state.follow_current_file = sanitize_follow_current_file(state.follow_current_file)
-  state.diff_view = sanitize_diff_view(state.diff_view)
+  state.diff_view = sanitize_diff_view(state.diff_view, type(opts.diff_view) == "table" and opts.diff_view or nil)
   state.path_render = sanitize_path_render(state.path_render, opts)
   state.pr_review = sanitize_pr_review(state.pr_review)
   state.mappings = sanitize_mappings(state.mappings)

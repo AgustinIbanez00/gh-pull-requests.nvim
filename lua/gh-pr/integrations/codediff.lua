@@ -18,6 +18,29 @@ local function safe_string(value)
   return type(value) == "string" and value or ""
 end
 
+local function normalize_layout(layout)
+  local value = safe_string(layout):lower()
+  if value == "inline" or value == "unified" then
+    return "inline"
+  end
+  return "side-by-side"
+end
+
+local function apply_codediff_preferences(opts)
+  opts = type(opts) == "table" and opts or {}
+  local ok_config, codediff_config = pcall(require, "codediff.config")
+  if not ok_config or type(codediff_config) ~= "table" or type(codediff_config.setup) ~= "function" then
+    return
+  end
+
+  pcall(codediff_config.setup, {
+    diff = {
+      layout = normalize_layout(opts.layout),
+      ignore_trim_whitespace = opts.ignore_trim_whitespace == true,
+    },
+  })
+end
+
 local function normalize_path(path)
   local value = safe_string(path):gsub("\\", "/")
   if IS_WINDOWS then
@@ -703,14 +726,16 @@ function M.open_pr_file_diff(opts)
     return nil, prepare_err
   end
 
-  local layout = safe_string(opts.layout):lower()
+  local layout = normalize_layout(opts.layout)
   local layout_flag = "--side-by-side"
-  if layout == "inline" or layout == "unified" then
+  if layout == "inline" then
     layout_flag = "--inline"
-    layout = "inline"
-  else
-    layout = "side-by-side"
   end
+
+  apply_codediff_preferences({
+    layout = layout,
+    ignore_trim_whitespace = opts.ignore_trim_whitespace == true,
+  })
 
   local command = string.format(
     "CodeDiff file %s %s %s",
@@ -756,6 +781,7 @@ function M.open_commit_diff(opts)
       file = opts.file,
       cache_scope = opts.cache_scope,
       layout = opts.layout,
+      ignore_trim_whitespace = opts.ignore_trim_whitespace,
       target_side = opts.target_side,
       target_line = opts.target_line,
       target_original_line = opts.target_original_line,
@@ -775,6 +801,11 @@ function M.open_commit_diff(opts)
   if not guard_ok and guard_err then
     return nil, guard_err
   end
+
+  apply_codediff_preferences({
+    layout = "side-by-side",
+    ignore_trim_whitespace = opts.ignore_trim_whitespace == true,
+  })
 
   local command = string.format(
     "CodeDiff dir %s %s --side-by-side",

@@ -27,6 +27,11 @@ local DEFAULT_RENDERERS = {
     { "kind_icon" },
     { "container", width = "100%", content = { { "folder_viewed_badge", zindex = 10 }, { "name", zindex = 11 } } },
   },
+  commit = {
+    { "indent", with_expanders = false },
+    { "kind_icon" },
+    { "container", width = "100%", content = { { "name", zindex = 10 } } },
+  },
   file = {
     { "indent", with_expanders = false },
     { "kind_icon" },

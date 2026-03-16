@@ -1,6 +1,8 @@
 local M = {}
 
 local config = require("gh-pr.config")
+local diff_view_core = require("gh-pr.core.diff_view")
+local review_context = require("gh-pr.core.review_context")
 local diff_shortcuts_config = require("gh-pr.diff_shortcuts")
 local gh = require("gh-pr.gh")
 local image_renderer = require("gh-pr.image_renderer")
@@ -678,11 +680,7 @@ local function set_buffer_name_if_available(bufnr, name)
 end
 
 local function normalize_diff_mode(mode, fallback)
-  if mode == "vertical" or mode == "horizontal" or mode == "unified" then
-    return mode
-  end
-
-  return fallback or "vertical"
+  return diff_view_core.normalize_mode(mode, fallback or "vertical")
 end
 
 local function resolve_configured_diff_view()
@@ -690,9 +688,15 @@ local function resolve_configured_diff_view()
   local whitespace = type(options.whitespace) == "table" and options.whitespace or {}
   local endlines = type(options.endlines) == "table" and options.endlines or {}
   local images = resolve_image_options()
+  local ignore_whitespace_mode = diff_view_core.resolve_whitespace_mode(
+    options.ignore_whitespace_mode,
+    options.ignore_whitespace,
+    "none"
+  )
   return {
     mode = normalize_diff_mode(options.mode, "vertical"),
-    ignore_whitespace = options.ignore_whitespace == true,
+    ignore_whitespace_mode = ignore_whitespace_mode,
+    ignore_whitespace = diff_view_core.legacy_ignore_whitespace(ignore_whitespace_mode),
     render_whitespace = options.render_whitespace ~= false,
     render_endlines = options.render_endlines == true,
     whitespace = {
@@ -721,8 +725,13 @@ end
 
 local function resolve_diff_view_shortcuts()
   local configured = resolve_configured_diff_view()
-  local resolved = diff_shortcuts_config.resolve(configured.shortcuts)
-  return diff_shortcuts_config.expand_localleader(resolved)
+  local resolved, diagnostics = diff_shortcuts_config.resolve_effective(configured.shortcuts, {
+    backend = "virtual",
+  })
+  diff_shortcuts_config.notify_resolution_issues(diagnostics, {
+    prefix = "gh-pr diff shortcuts",
+  })
+  return resolved
 end
 
 local function display_keybinding(key)
@@ -954,10 +963,17 @@ end
 
 function M.resolve_diff_view_options(overrides)
   local configured = resolve_configured_diff_view()
-  local persisted = type(state.get_diff_view_prefs) == "function" and state.get_diff_view_prefs() or {}
-  local options = vim.tbl_deep_extend("force", configured, type(persisted) == "table" and persisted or {})
+  local persisted = type(state.get_persisted_diff_view_prefs) == "function" and state.get_persisted_diff_view_prefs() or nil
+  -- Diff prefs loaded from state.json override setup defaults only when they were explicitly
+  -- persisted; shortcut mappings stay Lua-configured and do not flow through persisted state.
+  local options = vim.tbl_deep_extend("force", configured, persisted or {})
   options.mode = normalize_diff_mode(options.mode, configured.mode)
-  options.ignore_whitespace = options.ignore_whitespace == true
+  options.ignore_whitespace_mode = diff_view_core.resolve_whitespace_mode(
+    options.ignore_whitespace_mode,
+    options.ignore_whitespace,
+    configured.ignore_whitespace_mode
+  )
+  options.ignore_whitespace = diff_view_core.legacy_ignore_whitespace(options.ignore_whitespace_mode)
   options.render_whitespace = options.render_whitespace ~= false
   options.render_endlines = options.render_endlines == true
   options.whitespace = type(options.whitespace) == "table" and options.whitespace or configured.whitespace
@@ -967,6 +983,19 @@ function M.resolve_diff_view_options(overrides)
   if type(overrides) == "table" then
     if overrides.view_mode ~= nil then
       options.mode = normalize_diff_mode(overrides.view_mode, options.mode)
+    end
+    if overrides.ignore_whitespace_mode ~= nil then
+      options.ignore_whitespace_mode = diff_view_core.resolve_whitespace_mode(
+        overrides.ignore_whitespace_mode,
+        nil,
+        options.ignore_whitespace_mode
+      )
+    elseif type(overrides.ignore_whitespace) == "boolean" then
+      options.ignore_whitespace_mode = diff_view_core.resolve_whitespace_mode(
+        nil,
+        overrides.ignore_whitespace,
+        options.ignore_whitespace_mode
+      )
     end
     if type(overrides.ignore_whitespace) == "boolean" then
       options.ignore_whitespace = overrides.ignore_whitespace
@@ -978,6 +1007,13 @@ function M.resolve_diff_view_options(overrides)
       options.render_endlines = overrides.render_endlines
     end
   end
+
+  options.ignore_whitespace_mode = diff_view_core.resolve_whitespace_mode(
+    options.ignore_whitespace_mode,
+    options.ignore_whitespace,
+    configured.ignore_whitespace_mode
+  )
+  options.ignore_whitespace = diff_view_core.legacy_ignore_whitespace(options.ignore_whitespace_mode)
 
   return options
 end
@@ -999,6 +1035,12 @@ local function set_pr_buffer_keymaps(bufnr, keymap_opts)
         actions[name]()
       end
     end
+  end
+
+  local function default_enter()
+    local prefix = vim.v.count > 0 and tostring(vim.v.count) or ""
+    local enter = vim.api.nvim_replace_termcodes("<CR>", true, false, true)
+    vim.api.nvim_feedkeys(prefix .. enter, "n", false)
   end
 
   local opts = { buffer = bufnr, silent = true, nowait = true }
@@ -1028,6 +1070,7 @@ local function set_pr_buffer_keymaps(bufnr, keymap_opts)
     diff_shortcuts.next_reviewed_file,
     diff_shortcuts.prev_reviewed_file,
     diff_shortcuts.toggle_whitespace,
+    diff_shortcuts.cycle_whitespace_mode,
     diff_shortcuts.toggle_render_whitespace,
     diff_shortcuts.toggle_render_endlines,
     diff_shortcuts.cycle_mode,
@@ -1049,40 +1092,14 @@ local function set_pr_buffer_keymaps(bufnr, keymap_opts)
   remove_buffer_keymap("x", diff_shortcuts.inline_comment)
   remove_buffer_keymap("x", diff_shortcuts.inline_suggestion)
   remove_buffer_keymap("n", line_comment_key)
+  remove_buffer_keymap("n", "<CR>")
 
-  -- Clean legacy single-key mappings to avoid collisions with native Neovim keys.
-  for _, lhs in ipairs({
-    "c",
-    "s",
-    "R",
-    "q",
-    "Q",
-    "?",
-    "n",
-    "p",
-    "f",
-    "F",
-    "v",
-    "V",
-    "w",
-    "t",
-    "e",
-    "m",
-    "i",
-    "h",
-    "u",
-    "rc",
-    "ra",
-    "rr",
-    "rd",
-    "x",
-    "<CR>",
-    "gf",
-  }) do
+  for _, lhs in ipairs(diff_shortcuts_config.legacy_buffer_shortcuts()) do
     remove_buffer_keymap("n", lhs)
   end
-  remove_buffer_keymap("x", "c")
-  remove_buffer_keymap("x", "s")
+  local legacy = diff_shortcuts_config.expand_localleader(diff_shortcuts_config.legacy_defaults)
+  remove_buffer_keymap("x", legacy.inline_comment)
+  remove_buffer_keymap("x", legacy.inline_suggestion)
 
   set_buffer_keymap("n", diff_shortcuts.refresh, call_action("refresh_current_diff_buffer"), "Refresh current diff from GitHub")
   set_buffer_keymap("n", diff_shortcuts.close_quick, call_action("close_quick"), "Close quick diff view")
@@ -1126,14 +1143,23 @@ local function set_pr_buffer_keymaps(bufnr, keymap_opts)
     call_action("add_inline_suggestion_visual"),
     "Add inline PR suggestion for selection"
   )
-  if file_kind ~= "unified" then
-    set_buffer_keymap("n", diff_shortcuts.line_comments_popup, function()
-      line_comments.show_at_cursor(bufnr)
-    end, "Show line comments popup")
-  end
+  set_buffer_keymap("n", diff_shortcuts.line_comments_popup, function()
+    line_comments.show_at_cursor(bufnr)
+  end, "Show line comments popup")
+  set_buffer_keymap("n", "<CR>", function()
+    if not line_comments.show_at_cursor(bufnr, { notify_empty = false }) then
+      default_enter()
+    end
+  end, "Open line comments on commented lines")
   set_buffer_keymap("n", diff_shortcuts.next_change, call_action("next_change"), "Next PR change")
   set_buffer_keymap("n", diff_shortcuts.prev_change, call_action("prev_change"), "Previous PR change")
   set_buffer_keymap("n", diff_shortcuts.toggle_whitespace, call_action("toggle_diff_whitespace"), "Toggle whitespace diff mode")
+  set_buffer_keymap(
+    "n",
+    diff_shortcuts.cycle_whitespace_mode,
+    call_action("cycle_diff_whitespace_mode"),
+    "Cycle whitespace diff mode"
+  )
   set_buffer_keymap(
     "n",
     diff_shortcuts.toggle_render_whitespace,
@@ -1319,6 +1345,40 @@ local function apply_unified_syntax_highlights(bufnr, path, line_map)
   end
 end
 
+local function build_unified_comment_line_map(comment_ctx, path, unified_line_map)
+  if type(comment_ctx) ~= "table"
+    or type(comment_ctx.index) ~= "table"
+    or type(unified_line_map) ~= "table"
+    or vim.tbl_isempty(unified_line_map) then
+    return nil
+  end
+
+  local alternate_paths = type(comment_ctx.alternate_paths) == "table" and comment_ctx.alternate_paths or {}
+  local base_line_map = line_comments.build_side_line_map(comment_ctx.index, "base", path, alternate_paths)
+  local head_line_map = line_comments.build_side_line_map(comment_ctx.index, "head", path, alternate_paths)
+  local render_line_map = {}
+
+  for render_line, meta in pairs(unified_line_map) do
+    if type(meta) == "table" then
+      local base_line = tonumber(meta.base_line)
+      if base_line and base_line >= 1 then
+        line_comments.add_render_entries(render_line_map, render_line, base_line_map[base_line], "base")
+      end
+
+      local head_line = tonumber(meta.head_line)
+      if head_line and head_line >= 1 then
+        line_comments.add_render_entries(render_line_map, render_line, head_line_map[head_line], "head")
+      end
+    end
+  end
+
+  if vim.tbl_isempty(render_line_map) then
+    return nil
+  end
+
+  return render_line_map
+end
+
 local function open_buffer(content, path, kind, details, pr, repo_override, comment_ctx, canonical_path, buffer_opts)
   buffer_opts = type(buffer_opts) == "table" and buffer_opts or {}
   local repository = repo_override or resolve_base_repository(details)
@@ -1468,6 +1528,14 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
         side = side,
         file_path = path,
         alternate_paths = comment_ctx.alternate_paths,
+        keymap = comment_ctx.keymap,
+        signs = comment_ctx.signs,
+        max_popup_width = comment_ctx.max_popup_width,
+        max_popup_height = comment_ctx.max_popup_height,
+      })
+    elseif kind == "unified" and type(buffer_opts.unified_line_map) == "table" then
+      line_comments.attach_to_buffer(bufnr, {
+        render_line_map = build_unified_comment_line_map(comment_ctx, path, buffer_opts.unified_line_map),
         keymap = comment_ctx.keymap,
         signs = comment_ctx.signs,
         max_popup_width = comment_ctx.max_popup_width,
@@ -1809,9 +1877,44 @@ local function split_content_lines(content)
   return lines
 end
 
-local function build_unified_diff_text(base_content, head_content, ignore_whitespace)
-  local base_lines = split_content_lines(base_content)
-  local head_lines = split_content_lines(head_content)
+local function build_diff_entries(content, ignore_whitespace_mode)
+  local lines = split_content_lines(content)
+  local mode = diff_view_core.normalize_whitespace_mode(ignore_whitespace_mode, "none")
+  local entries = {}
+
+  if mode == "blank_lines" then
+    local filtered_lines = {}
+    for index, text in ipairs(lines) do
+      if text:find("%S") ~= nil then
+        entries[#entries + 1] = {
+          text = text,
+          original_line = index,
+        }
+        filtered_lines[#filtered_lines + 1] = text
+      end
+    end
+
+    local normalized_content = table.concat(filtered_lines, "\n")
+    if normalized_content ~= "" and type(content) == "string" and content:match("[\r\n]$") then
+      normalized_content = normalized_content .. "\n"
+    end
+
+    return entries, normalized_content
+  end
+
+  for index, text in ipairs(lines) do
+    entries[#entries + 1] = {
+      text = text,
+      original_line = index,
+    }
+  end
+
+  return entries, content or ""
+end
+
+local function build_unified_diff_text(base_content, head_content, ignore_whitespace_mode)
+  local base_entries, base_source = build_diff_entries(base_content, ignore_whitespace_mode)
+  local head_entries, head_source = build_diff_entries(head_content, ignore_whitespace_mode)
   local rendered = {}
   local highlights = {}
   local line_map = {}
@@ -1829,10 +1932,10 @@ local function build_unified_diff_text(base_content, head_content, ignore_whites
     end
   end
 
-  local hunks = vim.diff(base_content or "", head_content or "", {
+  local diff_options = vim.tbl_extend("force", {
     result_type = "indices",
-    ignore_whitespace = ignore_whitespace == true,
-  }) or {}
+  }, diff_view_core.vim_diff_options(ignore_whitespace_mode))
+  local hunks = vim.diff(base_source, head_source, diff_options) or {}
 
   local base_index = 1
   local head_index = 1
@@ -1844,26 +1947,30 @@ local function build_unified_diff_text(base_content, head_content, ignore_whites
     local count_head = tonumber(hunk[4]) or 0
 
     while base_index < start_base and head_index < start_head do
-      append("  ", head_lines[head_index] or "", nil, {
+      local base_entry = base_entries[base_index]
+      local head_entry = head_entries[head_index]
+      append("  ", head_entry and head_entry.text or "", nil, {
         kind = "context",
-        head_line = head_index,
-        base_line = base_index,
+        head_line = head_entry and head_entry.original_line or head_index,
+        base_line = base_entry and base_entry.original_line or base_index,
       })
       base_index = base_index + 1
       head_index = head_index + 1
     end
 
     for index = 0, count_base - 1 do
-      append("- ", base_lines[start_base + index] or "", "DiffDelete", {
+      local entry = base_entries[start_base + index]
+      append("- ", entry and entry.text or "", "DiffDelete", {
         kind = "delete",
-        base_line = start_base + index,
+        base_line = entry and entry.original_line or (start_base + index),
       })
     end
 
     for index = 0, count_head - 1 do
-      append("+ ", head_lines[start_head + index] or "", "DiffAdd", {
+      local entry = head_entries[start_head + index]
+      append("+ ", entry and entry.text or "", "DiffAdd", {
         kind = "add",
-        head_line = start_head + index,
+        head_line = entry and entry.original_line or (start_head + index),
       })
     end
 
@@ -1871,28 +1978,32 @@ local function build_unified_diff_text(base_content, head_content, ignore_whites
     head_index = start_head + count_head
   end
 
-  while base_index <= #base_lines and head_index <= #head_lines do
-    append("  ", head_lines[head_index] or "", nil, {
+  while base_index <= #base_entries and head_index <= #head_entries do
+    local base_entry = base_entries[base_index]
+    local head_entry = head_entries[head_index]
+    append("  ", head_entry and head_entry.text or "", nil, {
       kind = "context",
-      head_line = head_index,
-      base_line = base_index,
+      head_line = head_entry and head_entry.original_line or head_index,
+      base_line = base_entry and base_entry.original_line or base_index,
     })
     base_index = base_index + 1
     head_index = head_index + 1
   end
 
-  while base_index <= #base_lines do
-    append("- ", base_lines[base_index] or "", "DiffDelete", {
+  while base_index <= #base_entries do
+    local entry = base_entries[base_index]
+    append("- ", entry and entry.text or "", "DiffDelete", {
       kind = "delete",
-      base_line = base_index,
+      base_line = entry and entry.original_line or base_index,
     })
     base_index = base_index + 1
   end
 
-  while head_index <= #head_lines do
-    append("+ ", head_lines[head_index] or "", "DiffAdd", {
+  while head_index <= #head_entries do
+    local entry = head_entries[head_index]
+    append("+ ", entry and entry.text or "", "DiffAdd", {
       kind = "add",
-      head_line = head_index,
+      head_line = entry and entry.original_line or head_index,
     })
     head_index = head_index + 1
   end
@@ -1905,7 +2016,7 @@ local function build_unified_diff_text(base_content, head_content, ignore_whites
   return table.concat(rendered, "\n"), highlights, line_map
 end
 
-local function apply_window_diffopt(winid, ignore_whitespace)
+local function apply_window_diffopt(winid, ignore_whitespace_mode)
   local ok, diffopt_value = pcall(vim.api.nvim_get_option_value, "diffopt", { win = winid })
   if not ok then
     return
@@ -1918,15 +2029,13 @@ local function apply_window_diffopt(winid, ignore_whitespace)
     end
   end
 
-  if ignore_whitespace then
-    local with_iwhiteall = vim.deepcopy(entries)
-    with_iwhiteall[#with_iwhiteall + 1] = "iwhiteall"
-    local set_ok = pcall(vim.api.nvim_set_option_value, "diffopt", table.concat(with_iwhiteall, ","), { win = winid })
+  for _, token in ipairs(diff_view_core.diffopt_candidates(ignore_whitespace_mode)) do
+    local next_entries = vim.deepcopy(entries)
+    next_entries[#next_entries + 1] = token
+    local set_ok = pcall(vim.api.nvim_set_option_value, "diffopt", table.concat(next_entries, ","), { win = winid })
     if set_ok then
       return
     end
-
-    entries[#entries + 1] = "iwhite"
   end
 
   pcall(vim.api.nvim_set_option_value, "diffopt", table.concat(entries, ","), { win = winid })
@@ -2503,9 +2612,17 @@ function M.open_diff(details, pr, file, opts)
     local unified_content, highlights, line_map = build_unified_diff_text(
       data.base_content or "",
       data.head_content or "",
-      diff_view.ignore_whitespace
+      diff_view.ignore_whitespace_mode
     )
     local display_path = data.head_path or data.base_path or canonical_path
+    local unified_comment_ctx = build_comment_ctx(opts.line_comments, "head", {
+      data.head_path,
+      data.base_path,
+      file.path,
+      file.filename,
+      file.previousFilename,
+      file.previous_filename,
+    })
     local unified_buf = open_buffer(
       unified_content,
       display_path,
@@ -2513,7 +2630,7 @@ function M.open_diff(details, pr, file, opts)
       details,
       pr,
       data.repo,
-      nil,
+      unified_comment_ctx,
       canonical_path,
       {
         existing_bufnr = existing_unified,
@@ -2649,8 +2766,8 @@ function M.open_diff(details, pr, file, opts)
     vim.cmd("diffthis")
     pcall(vim.api.nvim_set_current_win, head_win)
     vim.cmd("diffthis")
-    apply_window_diffopt(target_win, diff_view.ignore_whitespace)
-    apply_window_diffopt(head_win, diff_view.ignore_whitespace)
+    apply_window_diffopt(target_win, diff_view.ignore_whitespace_mode)
+    apply_window_diffopt(head_win, diff_view.ignore_whitespace_mode)
     apply_window_whitespace_render(target_win, diff_view.render_whitespace)
     apply_window_whitespace_render(head_win, diff_view.render_whitespace)
     apply_window_endline_render(target_win, diff_view.render_endlines)
@@ -2690,21 +2807,7 @@ function M.open_commit_patch(details, pr, commit, opts)
 end
 
 local function find_file_in_details(details, path)
-  local target = normalize_path(path)
-  if target == "" then
-    return nil
-  end
-
-  for _, file in ipairs(type(details.files) == "table" and details.files or {}) do
-    if normalize_path(file.path) == target
-      or normalize_path(file.filename) == target
-      or normalize_path(file.previousFilename) == target
-      or normalize_path(file.previous_filename) == target then
-      return file
-    end
-  end
-
-  return nil
+  return review_context.find_file(details, path)
 end
 
 local function safe_set_buffer_name(bufnr, name)
@@ -2777,7 +2880,7 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
     else
       local diff_view = M.resolve_diff_view_options()
       content, line_highlights, unified_line_map =
-        build_unified_diff_text(data.base_content or "", data.head_content or "", diff_view.ignore_whitespace)
+        build_unified_diff_text(data.base_content or "", data.head_content or "", diff_view.ignore_whitespace_mode)
       file_mode = "unified"
     end
   else
@@ -2957,5 +3060,13 @@ end
 function M.load_remote_file_pair_async(details, file, callback)
   return read_base_and_head_async(details, nil, file, callback)
 end
+
+M._diff_view_helpers = {
+  build_unified_diff_text = build_unified_diff_text,
+  build_unified_comment_line_map = build_unified_comment_line_map,
+  resolve_diff_view_options = M.resolve_diff_view_options,
+  resolve_diff_view_shortcuts = resolve_diff_view_shortcuts,
+  set_pr_buffer_keymaps = set_pr_buffer_keymaps,
+}
 
 return M

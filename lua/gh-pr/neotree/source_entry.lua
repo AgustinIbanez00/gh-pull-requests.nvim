@@ -25,9 +25,7 @@ local DEFAULT_RENDERERS = {
       width = "100%",
       content = {
         { "pr_title", zindex = 10 },
-        { "pr_draft_badge", zindex = 11 },
-        { "pr_author_badge", zindex = 12 },
-        { "pr_checks_badge", zindex = 13 },
+        { "pr_meta_badges", zindex = 20, align = "right" },
       },
     },
   },

@@ -1,5 +1,6 @@
 local M = {}
 local review_context = require("gh-pr.core.review_context")
+local diff_view_core = require("gh-pr.core.diff_view")
 
 local state = {
   active = {
@@ -11,12 +12,6 @@ local state = {
   viewed_remote = {},
   reviews = {},
   prefs = {
-    diff_view = {
-      mode = "vertical",
-      ignore_whitespace = false,
-      render_whitespace = true,
-      render_endlines = false,
-    },
     images = {
       fallback_default_action = "metadata",
     },
@@ -173,17 +168,14 @@ local function normalize_path(path)
 end
 
 local function normalize_diff_mode(mode)
-  if mode == "vertical" or mode == "horizontal" or mode == "unified" then
-    return mode
-  end
-
-  return "vertical"
+  return diff_view_core.normalize_mode(mode, "vertical")
 end
 
 local function sanitize_diff_view_prefs(input)
   local result = {
     mode = "vertical",
     ignore_whitespace = false,
+    ignore_whitespace_mode = "none",
     render_whitespace = true,
     render_endlines = false,
   }
@@ -193,7 +185,12 @@ local function sanitize_diff_view_prefs(input)
   end
 
   result.mode = normalize_diff_mode(input.mode)
-  result.ignore_whitespace = input.ignore_whitespace == true
+  result.ignore_whitespace_mode = diff_view_core.resolve_whitespace_mode(
+    input.ignore_whitespace_mode,
+    input.ignore_whitespace,
+    "none"
+  )
+  result.ignore_whitespace = diff_view_core.legacy_ignore_whitespace(result.ignore_whitespace_mode)
   result.render_whitespace = input.render_whitespace ~= false
   result.render_endlines = input.render_endlines == true
   return result
@@ -237,7 +234,9 @@ end
 function M.setup()
   load_persisted_state()
   state.prefs = state.prefs or {}
-  state.prefs.diff_view = sanitize_diff_view_prefs(state.prefs.diff_view)
+  if type(state.prefs.diff_view) == "table" then
+    state.prefs.diff_view = sanitize_diff_view_prefs(state.prefs.diff_view)
+  end
   state.prefs.images = sanitize_image_prefs(state.prefs.images)
   state.prefs.pr_review = sanitize_pr_review_prefs(state.prefs.pr_review)
 end
@@ -441,14 +440,27 @@ function M.clear_active_review(repo_full_name)
 end
 
 function M.get_diff_view_prefs()
+  return sanitize_diff_view_prefs(state.prefs and state.prefs.diff_view)
+end
+
+function M.get_persisted_diff_view_prefs()
   state.prefs = state.prefs or {}
-  state.prefs.diff_view = sanitize_diff_view_prefs(state.prefs.diff_view)
-  return vim.deepcopy(state.prefs.diff_view)
+  if type(state.prefs.diff_view) ~= "table" then
+    return nil
+  end
+  return sanitize_diff_view_prefs(state.prefs.diff_view)
 end
 
 function M.set_diff_view_prefs(prefs)
   state.prefs = state.prefs or {}
   state.prefs.diff_view = sanitize_diff_view_prefs(prefs)
+  save_persisted_state()
+  return true
+end
+
+function M.clear_diff_view_prefs()
+  state.prefs = state.prefs or {}
+  state.prefs.diff_view = nil
   save_persisted_state()
   return true
 end

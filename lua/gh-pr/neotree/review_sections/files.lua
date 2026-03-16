@@ -128,12 +128,7 @@ local function file_display_name(path)
 end
 
 local function parent_path_of_file(path)
-  if type(path) ~= "string" then
-    return ""
-  end
-
-  local normalized = path:gsub("\\", "/"):gsub("/+", "/")
-  normalized = normalized:gsub("^/", ""):gsub("/$", "")
+  local normalized = review_context.normalize_path(path)
   if normalized == "" then
     return ""
   end
@@ -369,7 +364,7 @@ function M.build_nodes(pr, details, repo_full_name, opts)
           path = normalized_full_path,
           pr = pr,
           details = details,
-          repo = repo_full_name,
+          repo = resolved_repo_full_name,
           viewed_counts = (viewed and total) and { viewed = viewed, total = total } or nil,
           show_viewed_prefix = viewed ~= nil and total ~= nil and total > 0 and viewed > 0,
         },

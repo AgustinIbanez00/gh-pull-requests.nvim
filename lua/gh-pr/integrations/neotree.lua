@@ -1,6 +1,7 @@
 local M = {}
 
 local config = require("gh-pr.config")
+local fast_event_patch = require("gh-pr.integrations.neotree_fast_event")
 local registry = require("gh-pr.neotree.registry")
 local repo = require("gh-pr.repo")
 
@@ -39,6 +40,7 @@ local function maybe_get_neotree(load)
   end
 
   neo_tree.ensure_config()
+  fast_event_patch.apply()
   return neo_tree
 end
 

@@ -91,9 +91,63 @@ local function entry_key(entry)
   }, ":")
 end
 
+local function resolve_display_side(entry, fallback_side)
+  local entry_side = type(entry) == "table" and safe_string(entry.display_side, "") or ""
+  if entry_side == "base" or entry_side == "head" then
+    return entry_side
+  end
+
+  local diff_side = type(entry) == "table" and safe_string(entry.diff_side, ""):upper() or ""
+  if diff_side == "LEFT" then
+    return "base"
+  end
+  if diff_side == "RIGHT" then
+    return "head"
+  end
+
+  if fallback_side == "base" or fallback_side == "head" then
+    return fallback_side
+  end
+
+  return ""
+end
+
+local function sort_line_map(line_map)
+  for _, entries in pairs(type(line_map) == "table" and line_map or {}) do
+    table.sort(entries, function(left, right)
+      local left_key = safe_string(left.created_at, "") .. ":" .. safe_string(left.comment_id, "")
+      local right_key = safe_string(right.created_at, "") .. ":" .. safe_string(right.comment_id, "")
+      return left_key < right_key
+    end)
+  end
+end
+
+local function append_entries(target, source, fallback_side)
+  if type(target) ~= "table" or type(source) ~= "table" then
+    return
+  end
+
+  local dedup = {}
+  for _, entry in ipairs(target) do
+    dedup[entry_key(entry)] = true
+    if type(entry) == "table" and safe_string(entry.display_side, "") == "" then
+      entry.display_side = resolve_display_side(entry, fallback_side)
+    end
+  end
+
+  for _, entry in ipairs(source) do
+    local key = entry_key(entry)
+    if not dedup[key] then
+      dedup[key] = true
+      local copy = vim.deepcopy(entry)
+      copy.display_side = resolve_display_side(copy, fallback_side)
+      target[#target + 1] = copy
+    end
+  end
+end
+
 local function collect_line_map(index, side, primary_path, alternatives)
   local line_map = {}
-  local dedup = {}
   local paths = normalize_paths(primary_path, alternatives)
 
   for _, path in ipairs(paths) do
@@ -104,28 +158,29 @@ local function collect_line_map(index, side, primary_path, alternatives)
         local line_number = tonumber(line)
         if line_number and line_number >= 1 and type(entries) == "table" then
           line_map[line_number] = line_map[line_number] or {}
-          dedup[line_number] = dedup[line_number] or {}
-          for _, entry in ipairs(entries) do
-            local key = entry_key(entry)
-            if not dedup[line_number][key] then
-              dedup[line_number][key] = true
-              line_map[line_number][#line_map[line_number] + 1] = vim.deepcopy(entry)
-            end
-          end
+          append_entries(line_map[line_number], entries, side)
         end
       end
     end
   end
 
-  for _, entries in pairs(line_map) do
-    table.sort(entries, function(left, right)
-      local left_key = safe_string(left.created_at, "") .. ":" .. safe_string(left.comment_id, "")
-      local right_key = safe_string(right.created_at, "") .. ":" .. safe_string(right.comment_id, "")
-      return left_key < right_key
-    end)
+  sort_line_map(line_map)
+  return line_map
+end
+
+local function sanitize_render_line_map(line_map, fallback_side)
+  local sanitized = {}
+
+  for line, entries in pairs(type(line_map) == "table" and line_map or {}) do
+    local line_number = tonumber(line)
+    if line_number and line_number >= 1 and type(entries) == "table" and not vim.tbl_isempty(entries) then
+      sanitized[line_number] = sanitized[line_number] or {}
+      append_entries(sanitized[line_number], entries, fallback_side)
+    end
   end
 
-  return line_map
+  sort_line_map(sanitized)
+  return sanitized
 end
 
 local function marker_kind(entries)
@@ -315,10 +370,29 @@ end
 local function line_popup_items(entries, meta)
   meta = type(meta) == "table" and meta or {}
   local items = {}
+  local visible_sides = {}
   for _, entry in ipairs(entries or {}) do
+    local display_side = resolve_display_side(entry, "")
+    if display_side ~= "" then
+      visible_sides[display_side] = true
+    end
+  end
+  local mixed_sides = visible_sides.base == true and visible_sides.head == true
+
+  for _, entry in ipairs(entries or {}) do
+    local display_side = resolve_display_side(entry, "")
+    local marker = " "
+    if mixed_sides then
+      if display_side == "base" then
+        marker = "B "
+      elseif display_side == "head" then
+        marker = "H "
+      end
+    end
+
     items[#items + 1] = {
       id = safe_string(entry.comment_id, ""),
-      marker = " ",
+      marker = marker,
       state = line_entry_state(entry),
       author = safe_string(entry.author, "unknown"),
       created_at = safe_string(entry.created_at, "-"),
@@ -340,6 +414,7 @@ local function line_popup_items(entries, meta)
         comment_is_pending = entry.is_pending == true,
         thread_is_resolved = entry.is_resolved == true,
         thread_is_outdated = entry.is_outdated == true,
+        display_side = display_side,
       },
     }
   end
@@ -454,7 +529,8 @@ function M.attach_to_buffer(bufnr, ctx)
   end
 
   local side = infer_side(bufnr, ctx)
-  if not side then
+  local render_line_map = type(ctx.render_line_map) == "table" and ctx.render_line_map or nil
+  if not side and render_line_map == nil then
     return
   end
 
@@ -473,14 +549,19 @@ function M.attach_to_buffer(bufnr, ctx)
   })
 
   local index = type(ctx.index) == "table" and ctx.index or {}
-  if vim.tbl_isempty(index) then
+  if render_line_map == nil and vim.tbl_isempty(index) then
     vim.b[bufnr].gh_pr_line_comments = {}
     return
   end
 
-  local file_path = safe_string(ctx.file_path, vim.b[bufnr].gh_pr_path)
-  local alternatives = type(ctx.alternate_paths) == "table" and ctx.alternate_paths or {}
-  local line_map = collect_line_map(index, side, file_path, alternatives)
+  local line_map
+  if render_line_map ~= nil then
+    line_map = sanitize_render_line_map(render_line_map, side)
+  else
+    local file_path = safe_string(ctx.file_path, vim.b[bufnr].gh_pr_path)
+    local alternatives = type(ctx.alternate_paths) == "table" and ctx.alternate_paths or {}
+    line_map = collect_line_map(index, side, file_path, alternatives)
+  end
   vim.b[bufnr].gh_pr_line_comments = line_map
 
   ensure_highlights()
@@ -533,6 +614,20 @@ function M.attach_to_buffer(bufnr, ctx)
       })
     end
   end
+end
+
+function M.build_side_line_map(index, side, primary_path, alternatives)
+  return collect_line_map(index, side, primary_path, alternatives)
+end
+
+function M.add_render_entries(line_map, line, entries, fallback_side)
+  local line_number = tonumber(line)
+  if type(line_map) ~= "table" or not line_number or line_number < 1 then
+    return
+  end
+
+  line_map[line_number] = line_map[line_number] or {}
+  append_entries(line_map[line_number], type(entries) == "table" and entries or {}, fallback_side)
 end
 
 return M
