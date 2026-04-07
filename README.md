@@ -322,9 +322,6 @@ Validation prerequisites:
         labels = true,
       },
     },
-    overview_v2 = {
-      enabled = false, -- deprecated alias; use `overview` / `overview.panes` instead
-    },
     cache = {
       gh_pr = {
         enabled = true,
@@ -551,24 +548,11 @@ Examples:
 - Optional adapters: `lua/gh-pr/integrations/*`.
 - Health checks: `lua/gh-pr/health.lua`.
 
-## Migration notes (legacy overview path removal)
+## Overview API
 
-If you have custom code requiring internal `overview_v2*` modules, migrate to the
-consolidated paths:
-
-| Removed internal module path | New canonical module path |
-| --- | --- |
-| `gh-pr.overview_v2_runtime` | `gh-pr.ui.overview.runtime` |
-| `gh-pr.overview_v2_layout` | `gh-pr.ui.overview.layout` |
-| `gh-pr.overview_v2_render` | `gh-pr.ui.overview.render` |
-| `gh-pr.overview_v2_keymaps` | `gh-pr.ui.overview.keymaps` |
-
-Compatibility aliases kept for user-facing behavior:
-
-- `:GhPrOverviewV2` -> `:GhPrOverview`.
-- `:GhPrOverviewV2Refresh` -> `:GhPrOverviewRefresh`.
-- `setup({ overview_v2 = ... })` is still accepted, mapped to `overview` / `overview.panes`, and warns once as deprecated.
-- `require("gh-pr").open_overview_v2()` and `require("gh-pr").refresh_overview_v2()` still dispatch to canonical overview actions.
+Use the canonical `overview` configuration table, `:GhPrOverview` command,
+and `require("gh-pr").open_overview()` facade. The overview implementation
+lives under `lua/gh-pr/ui/overview/*`.
 
 ## Commands
 
@@ -600,9 +584,7 @@ Compatibility aliases kept for user-facing behavior:
 - `:GhPrRefresh` refresh data.
 - `:GhPRReviewRefresh` force refresh active PR Review data in background (alias: `:GhPrReviewRefresh`).
 - `:GhPrOverview` open active PR overview panes (Summary + Activity / Collaboration).
-- `:GhPrOverviewV2` alias of `:GhPrOverview` (kept for compatibility).
 - `:GhPrOverviewRefresh` refresh active overview panes.
-- `:GhPrOverviewV2Refresh` alias of `:GhPrOverviewRefresh` (kept for compatibility).
 - `:GhPrOverviewMore <checks|commits|comments|reviews|threads> [count]` load more section items.
 - `:GhPrCheckout [number]` checkout PR branch.
 - `:GhPrOpenDiff` open selected file in codediff for text, or dedicated gh-pr preview for non-text.
@@ -798,7 +780,7 @@ Inside the overview buffer:
 - `,x` toggle PR Review source while staying in review flow.
 - gh-pr UI windows (overview panes, popups and composer) force `nospell` without affecting regular file buffers.
 
-Inside overview panes (`:GhPrOverview`, alias `:GhPrOverviewV2`):
+Inside overview panes (`:GhPrOverview`):
 - Panes are rendered in one dedicated tabpage with two normal windows (Summary+Activity/Collaboration).
 - `a`/`d`/`c`/`m`/`k`/`b` keep the same review/browser actions.
 - `<CR>` toggles embedded activity thread headers and keeps the previous open/edit behavior for the rest of the rows.

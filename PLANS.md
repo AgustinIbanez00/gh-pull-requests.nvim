@@ -1,3 +1,17 @@
+# Overview Alias Cleanup Wave
+
+## Status
+- Completed: removed the legacy overview config alias, facade methods, and user commands.
+- Completed: README and vimdoc now describe a single canonical overview API.
+- Completed: exact repo search no longer finds legacy overview alias identifiers.
+
+## Acceptance Criteria
+- Only `overview` is documented as the overview configuration surface.
+- Only `:GhPrOverview` and `:GhPrOverviewRefresh` are registered as overview commands.
+- Only `open_overview()` and `refresh_overview()` are exposed by the public facade.
+- README and vimdoc do not describe legacy overview aliases or compatibility mappings.
+- Repo validation passes: `git diff --check`, headless smoke, Neo-tree lazy smoke, and helptags.
+
 # Overview Thread Cards Wave
 
 ## Status

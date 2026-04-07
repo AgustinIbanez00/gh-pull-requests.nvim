@@ -72,19 +72,9 @@ function M.build(call, command_no_args)
     },
     { name = "GhPrOverview", callback = command_no_args("open_overview"), opts = { desc = "Open active pull request overview" } },
     {
-      name = "GhPrOverviewV2",
-      callback = command_no_args("open_overview_v2"),
-      opts = { desc = "Open active pull request overview (V2 panes POC)" },
-    },
-    {
       name = "GhPrOverviewRefresh",
       callback = command_no_args("refresh_overview"),
       opts = { desc = "Refresh active pull request overview buffer" },
-    },
-    {
-      name = "GhPrOverviewV2Refresh",
-      callback = command_no_args("refresh_overview_v2"),
-      opts = { desc = "Refresh active pull request overview V2 panes" },
     },
     {
       name = "GhPrOverviewMore",

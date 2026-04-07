@@ -343,19 +343,7 @@ function M.open_overview()
   end)
 end
 
-function M.open_overview_v2()
-  return with_runtime(function()
-    call_actions("open_overview")
-  end)
-end
-
 function M.refresh_overview()
-  return with_runtime(function()
-    call_actions("refresh_overview")
-  end)
-end
-
-function M.refresh_overview_v2()
   return with_runtime(function()
     call_actions("refresh_overview")
   end)

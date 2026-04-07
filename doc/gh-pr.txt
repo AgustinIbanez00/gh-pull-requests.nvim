@@ -33,26 +33,12 @@ Canonical module layout after consolidation:
 - Optional adapters: `lua/gh-pr/integrations/*`
 - Health checks: `lua/gh-pr/health.lua`
 
-Migration (legacy overview path removal)
-========================================
+Overview API
+============
 
-Legacy internal `overview_v2*` module paths were removed. Update custom
-`require()` calls:
-
-- `gh-pr.overview_v2_runtime` -> `gh-pr.ui.overview.runtime`
-- `gh-pr.overview_v2_layout` -> `gh-pr.ui.overview.layout`
-- `gh-pr.overview_v2_render` -> `gh-pr.ui.overview.render`
-- `gh-pr.overview_v2_keymaps` -> `gh-pr.ui.overview.keymaps`
-
-User-facing compatibility aliases remain available:
-
-- `:GhPrOverviewV2` maps to `:GhPrOverview`
-- `:GhPrOverviewV2Refresh` maps to `:GhPrOverviewRefresh`
-- `setup({ overview_v2 = ... })` is still accepted and mapped to `overview`
-  / `overview.panes` with a deprecation warning
-- `require("gh-pr").open_overview_v2()` and
-  `require("gh-pr").refresh_overview_v2()` still dispatch to canonical
-  overview actions
+Use the canonical `overview` configuration table, `:GhPrOverview` command,
+and `require("gh-pr").open_overview()` facade. The overview implementation
+lives under `lua/gh-pr/ui/overview/*`.
 
 Commands
 ========
@@ -187,14 +173,8 @@ Commands
     Opens overview panes (Summary with embedded Activity, Collaboration)
     for the active pull request in a dedicated tabpage with normal windows.
 
-:GhPrOverviewV2
-    Compatibility alias of `:GhPrOverview`.
-
 :GhPrOverviewRefresh
     Refreshes the active overview panes.
-
-:GhPrOverviewV2Refresh
-    Compatibility alias of `:GhPrOverviewRefresh`.
 
 :GhPrOverviewMore {section} [count]
     Loads more items in a section (`checks`, `commits`, `comments`,
@@ -701,8 +681,6 @@ Call `require("gh-pr").setup({ ... })` with:
 - `overview.show` (toggle sections)
 - `overview.show.comments|reviews|threads` (`true`)
 - `overview.show.pr_changes` (`true`, show PR change events in `Summary > Activity`)
-- `overview_v2.enabled` (`false`; deprecated compatibility flag)
-- Legacy `overview_v2.date_format|window|layout|activity|show|keymaps` are still accepted and mapped to `overview` / `overview.panes` with deprecation warning.
 - `cache.gh_pr.enabled` (`true`)
 - `cache.gh_pr.ttl_seconds` (`60`)
 - `cache.gh_pr.auto_refresh_when_focused` (`true`)

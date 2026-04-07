@@ -214,9 +214,6 @@ local defaults = {
       labels = true,
     },
   },
-  overview_v2 = {
-    enabled = false,
-  },
   cache = {
     gh_pr = {
       enabled = true,
@@ -980,60 +977,6 @@ local function sanitize_overview(overview)
   return result
 end
 
-local function merge_legacy_overview_v2_alias(overview, overview_v2)
-  if type(overview_v2) ~= "table" then
-    return overview
-  end
-
-  local legacy_overview = {
-    date_format = overview_v2.date_format,
-    window = overview_v2.window,
-    show = overview_v2.show,
-    panes = {
-      layout = overview_v2.layout,
-      activity = overview_v2.activity,
-      keymaps = overview_v2.keymaps,
-    },
-  }
-
-  if type(overview_v2.enabled) == "boolean" then
-    legacy_overview.window = type(legacy_overview.window) == "table" and legacy_overview.window or {}
-    legacy_overview.window.enabled = overview_v2.enabled
-  end
-
-  return vim.tbl_deep_extend("force", legacy_overview, type(overview) == "table" and overview or {})
-end
-
-local function build_overview_v2_alias(overview)
-  local source = type(overview) == "table" and overview or {}
-  local panes = type(source.panes) == "table" and source.panes or {}
-  local window = type(source.window) == "table" and source.window or {}
-
-  return {
-    enabled = window.enabled ~= false,
-    date_format = source.date_format,
-    window = window,
-    layout = panes.layout,
-    activity = panes.activity,
-    show = source.show,
-    keymaps = panes.keymaps,
-  }
-end
-
-local function sanitize_overview_v2(overview_v2)
-  local canonical = sanitize_overview(merge_legacy_overview_v2_alias(nil, overview_v2))
-  local result = build_overview_v2_alias(canonical)
-  local source = type(overview_v2) == "table" and overview_v2 or nil
-
-  if source and type(source.enabled) == "boolean" then
-    result.enabled = source.enabled
-  else
-    result.enabled = defaults.overview_v2.enabled
-  end
-
-  return result
-end
-
 local function sanitize_cache(cache_options)
   if type(cache_options) ~= "table" then
     return vim.deepcopy(defaults.cache)
@@ -1693,19 +1636,6 @@ end
 
 function M.setup(opts)
   opts = type(opts) == "table" and opts or {}
-  local legacy_overview_v2_input = type(opts.overview_v2) == "table" and opts.overview_v2 or nil
-  local merged_overview_input = merge_legacy_overview_v2_alias(
-    type(opts.overview) == "table" and opts.overview or nil,
-    legacy_overview_v2_input
-  )
-
-  if legacy_overview_v2_input and not vim.tbl_isempty(legacy_overview_v2_input) then
-    notify_deprecation_once(
-      "overview_v2",
-      "gh-pr: `overview_v2` is deprecated; migrate to `overview` "
-        .. "(date_format/window/show) and `overview.panes` (layout/activity/keymaps)."
-    )
-  end
 
   state = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts)
   state.remotes = sanitize_remotes(state.remotes)
@@ -1722,13 +1652,7 @@ function M.setup(opts)
   end
 
   state.line_comments = sanitize_line_comments(state.line_comments)
-  state.overview = sanitize_overview(merged_overview_input)
-  state.overview_v2 = sanitize_overview_v2(build_overview_v2_alias(state.overview))
-  if legacy_overview_v2_input and type(legacy_overview_v2_input.enabled) == "boolean" then
-    state.overview_v2.enabled = legacy_overview_v2_input.enabled
-  else
-    state.overview_v2.enabled = defaults.overview_v2.enabled
-  end
+  state.overview = sanitize_overview(type(opts.overview) == "table" and opts.overview or nil)
   state.cache = sanitize_cache(state.cache)
   state.follow_current_file = sanitize_follow_current_file(state.follow_current_file)
   state.diff_view = sanitize_diff_view(state.diff_view, type(opts.diff_view) == "table" and opts.diff_view or nil)
