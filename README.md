@@ -24,7 +24,6 @@ Quick links: [Installation](#installation) · [Quick Start](#quick-start) · [Co
 - [Keymaps](#keymaps)
 - [Troubleshooting](#troubleshooting)
 - [Consolidated architecture](#consolidated-architecture)
-- [Migration notes (legacy overview path removal)](#migration-notes-legacy-overview-path-removal)
 - [Neo-tree source](#neo-tree-source)
 - [Highlights](#highlights)
 - [Notes](#notes)
