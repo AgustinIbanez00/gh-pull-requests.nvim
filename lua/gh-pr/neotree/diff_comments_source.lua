@@ -707,66 +707,10 @@ local function render_session(session)
   end
 end
 
-local function current_node(state)
-  if type(state) ~= "table" or type(state.tree) ~= "table" or type(state.tree.get_node) ~= "function" then
-    return nil
-  end
-
-  return state.tree:get_node()
-end
-
-local function attach_follow_cursor(state, session)
-  if panel_opts().follow_cursor ~= true then
-    return
-  end
-
-  local _, bufnr = live_state_window_buffer(state)
-  if not bufnr or vim.b[bufnr].gh_pr_diff_comments_follow_attached == true then
-    return
-  end
-
-  vim.b[bufnr].gh_pr_diff_comments_follow_attached = true
-
-  vim.api.nvim_create_autocmd("CursorMoved", {
-    buffer = bufnr,
-    callback = function()
-      if panel_opts().follow_cursor ~= true then
-        return
-      end
-
-      local source_state = state_by_buffer[bufnr]
-      if not source_state or not state_is_live(source_state) then
-        return
-      end
-
-      local winid = select(1, live_state_window_buffer(source_state))
-      if not valid_win(winid) or vim.api.nvim_get_current_win() ~= winid then
-        return
-      end
-
-      local node = current_node(source_state)
-      if not node or not node.extra or node.extra.kind ~= "comment" then
-        return
-      end
-
-      if session.last_follow_node_id == node.id then
-        return
-      end
-
-      session.last_follow_node_id = node.id
-      M.open_target(node.extra.target, {
-        keep_source_focus = true,
-        open_popup = false,
-      })
-    end,
-  })
-end
-
 local function register_state(session, state)
   session.states = session.states or {}
   session.states[tostring(state)] = state
   render_state(state, session)
-  attach_follow_cursor(state, session)
 end
 
 local function resolve_target(ctx, pr_number)
@@ -1077,9 +1021,11 @@ function M.sync_for_diff(ctx)
     session.comment_total = 0
     session.nodes = loading_nodes(session)
 
-    local opened, open_err = open_source_window(session, opts)
-    if not opened then
-      return nil, open_err
+    if not source_visible(session.tabid) then
+      local opened, open_err = open_source_window(session, opts)
+      if not opened then
+        return nil, open_err
+      end
     end
 
     render_session(session)

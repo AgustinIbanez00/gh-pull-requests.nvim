@@ -74,6 +74,10 @@ local baseline_links = {
   { "GhPrOverviewTimelineComment", "GhPrOverviewMuted" },
   { "GhPrOverviewTimelineReview", "GhPrOverviewMuted" },
   { "GhPrOverviewTimelineThread", "Identifier" },
+  { "GhPrOverviewThreadCommentMeta", "Directory" },
+  { "GhPrOverviewThreadSeparator", "GhPrOverviewMarkdownRule" },
+  { "GhPrOverviewThreadCommentSeparator", "Comment" },
+  { "GhPrOverviewThreadDiffSeparator", "GhPrOverviewMarkdownRule" },
   { "GhPrOverviewTimelineCommit", "GhPrOverviewMuted" },
   { "GhPrOverviewTimelinePrChange", "GhPrOverviewMuted" },
   { "GhPrOverviewMarkdownHeading", "Title" },
@@ -85,6 +89,7 @@ local baseline_links = {
   { "GhPrOverviewMarkdownListMarker", "SpecialChar" },
   { "GhPrOverviewMarkdownLink", "Underlined" },
   { "GhPrOverviewMarkdownRule", "Comment" },
+  { "GhPrDiffCommentsMuted", "Comment" },
   { "GhPrDiffWhitespace", "Whitespace" },
   { "GhPrDiffEndline", "Comment" },
 }

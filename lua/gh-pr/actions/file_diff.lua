@@ -42,6 +42,84 @@ function FileDiff.register(M, ctx)
   local resolve_commit = thread_diff_helpers.resolve_commit
   local sync_diff_comments_panel = thread_diff_helpers.sync_diff_comments_panel
 
+  local function pr_explorer_enabled()
+    local plugin_config = type(config.get()) == "table" and config.get() or {}
+    local diff_view = type(plugin_config.diff_view) == "table" and plugin_config.diff_view or {}
+    local pr_explorer = type(diff_view.pr_explorer) == "table" and diff_view.pr_explorer or {}
+    return pr_explorer.enabled ~= false
+  end
+
+  local function build_codediff_selection_handler(pr, details, comments_ctx, extra_ctx)
+    extra_ctx = type(extra_ctx) == "table" and extra_ctx or {}
+    return function(active_file, open_result)
+      if type(active_file) == "table" then
+        state.set_active_file(active_file)
+      end
+
+      apply_codediff_open_result_context(pr, details, active_file, open_result, {
+        comments_ctx = comments_ctx,
+        check_annotations_ctx = extra_ctx.check_annotations_ctx,
+        security_annotations_ctx = extra_ctx.security_annotations_ctx,
+      })
+      sync_diff_comments_panel(pr, details, comments_ctx)
+    end
+  end
+
+  local function open_pr_text_diff_with_codediff(pr, details, selected_file, open_opts)
+    open_opts = type(open_opts) == "table" and open_opts or {}
+    local selected_path = normalize_path(selected_file.path or selected_file.filename)
+    local on_selection = build_codediff_selection_handler(pr, details, open_opts.comments_ctx, {
+      check_annotations_ctx = open_opts.check_annotations_ctx,
+      security_annotations_ctx = open_opts.security_annotations_ctx,
+    })
+
+    local explorer_err = nil
+    if pr_explorer_enabled() then
+      local opened_explorer, open_explorer_err = codediff_integration.open_pr_explorer_diff({
+        pr_number = pr.number,
+        details = details,
+        files = details.files,
+        file = selected_file,
+        layout = open_opts.layout,
+        ignore_trim_whitespace = open_opts.ignore_trim_whitespace,
+        target_side = open_opts.target_side,
+        target_line = open_opts.target_line,
+        target_original_line = open_opts.target_original_line,
+        on_selection = on_selection,
+        reuse = open_opts.new_tab ~= true,
+        force = open_opts.force ~= false,
+      })
+      if opened_explorer then
+        return true, nil
+      end
+      explorer_err = open_explorer_err
+    end
+
+    local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
+      details = details,
+      file = selected_file,
+      cache_scope = string.format(
+        "%s|%d|%s|%s|%s",
+        open_opts.cache_scope_prefix or "pr-file",
+        pr.number,
+        safe_string(details.baseRefName),
+        safe_string(details.headRefName),
+        selected_path
+      ),
+      layout = open_opts.layout,
+      ignore_trim_whitespace = open_opts.ignore_trim_whitespace == true,
+      target_side = open_opts.target_side,
+      target_line = open_opts.target_line,
+      target_original_line = open_opts.target_original_line,
+    })
+    if not opened_result then
+      return nil, codediff_err or explorer_err
+    end
+
+    on_selection(selected_file, opened_result)
+    return true, nil
+  end
+
 function M.open_diff(file, opts)
   opts = type(opts) == "table" and opts or {}
   local origin_win = vim.api.nvim_get_current_win()
@@ -58,38 +136,22 @@ function M.open_diff(file, opts)
   end
 
   state.set_active_file(selected_file)
-  local selected_path = normalize_path(selected_file.path or selected_file.filename)
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
 
   local function open_with_codediff(diff_view)
-    local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
-      details = details,
-      file = selected_file,
-      cache_scope = string.format(
-        "pr-file|%d|%s|%s|%s",
-        pr.number,
-        safe_string(details.baseRefName),
-        safe_string(details.headRefName),
-        selected_path
-      ),
+    return open_pr_text_diff_with_codediff(pr, details, selected_file, {
+      cache_scope_prefix = "pr-file",
       layout = diff_view.mode,
       ignore_trim_whitespace = diff_view.ignore_whitespace_mode == "trim",
+      comments_ctx = comments_ctx,
+      new_tab = opts.new_tab,
       target_side = opts.target_side,
       target_line = opts.target_line,
       target_original_line = opts.target_original_line,
-    })
-    if not opened_result then
-      return nil, codediff_err
-    end
-
-    apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
-      comments_ctx = comments_ctx,
       check_annotations_ctx = opts.check_annotations_ctx,
       security_annotations_ctx = opts.security_annotations_ctx,
     })
-    sync_diff_comments_panel(pr, details, comments_ctx)
-    return true, nil
   end
 
   local function open_with_virtual(open_opts)
@@ -162,37 +224,20 @@ function M.open_original(file, opts)
   end
 
   state.set_active_file(selected_file)
-  local selected_path = normalize_path(selected_file.path or selected_file.filename)
   local target_line = positive_integer(opts.target_original_line, positive_integer(opts.target_line, nil))
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
 
   local function open_with_codediff()
-    local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
-      details = details,
-      file = selected_file,
-      cache_scope = string.format(
-        "pr-original|%d|%s|%s|%s",
-        pr.number,
-        safe_string(details.baseRefName),
-        safe_string(details.headRefName),
-        selected_path
-      ),
+    return open_pr_text_diff_with_codediff(pr, details, selected_file, {
+      cache_scope_prefix = "pr-original",
+      comments_ctx = comments_ctx,
       target_side = "base",
       target_original_line = target_line,
       target_line = target_line,
-    })
-    if not opened_result then
-      return nil, codediff_err
-    end
-
-    apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
-      comments_ctx = comments_ctx,
       check_annotations_ctx = opts.check_annotations_ctx,
       security_annotations_ctx = opts.security_annotations_ctx,
     })
-    sync_diff_comments_panel(pr, details, comments_ctx)
-    return true, nil
   end
 
   local function open_with_virtual()
@@ -246,37 +291,20 @@ function M.open_modified(file, opts)
   end
 
   state.set_active_file(selected_file)
-  local selected_path = normalize_path(selected_file.path or selected_file.filename)
   local target_line = positive_integer(opts.target_line, positive_integer(opts.target_original_line, nil))
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
 
   local function open_with_codediff()
-    local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
-      details = details,
-      file = selected_file,
-      cache_scope = string.format(
-        "pr-modified|%d|%s|%s|%s",
-        pr.number,
-        safe_string(details.baseRefName),
-        safe_string(details.headRefName),
-        selected_path
-      ),
+    return open_pr_text_diff_with_codediff(pr, details, selected_file, {
+      cache_scope_prefix = "pr-modified",
+      comments_ctx = comments_ctx,
       target_side = "head",
       target_line = target_line,
       target_original_line = target_line,
-    })
-    if not opened_result then
-      return nil, codediff_err
-    end
-
-    apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
-      comments_ctx = comments_ctx,
       check_annotations_ctx = opts.check_annotations_ctx,
       security_annotations_ctx = opts.security_annotations_ctx,
     })
-    sync_diff_comments_panel(pr, details, comments_ctx)
-    return true, nil
   end
 
   local function open_with_virtual()
@@ -345,31 +373,17 @@ local function reopen_current_diff_with_preferences_impl(opts)
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
   local function open_with_codediff(diff_view)
-    local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
-      details = details,
-      file = selected_file,
-      cache_scope = string.format(
-        "pr-file|%d|%s|%s|%s",
-        pr.number,
-        safe_string(details.baseRefName),
-        safe_string(details.headRefName),
-        normalize_path(selected_file.path or selected_file.filename)
-      ),
+    return open_pr_text_diff_with_codediff(pr, details, selected_file, {
+      cache_scope_prefix = "pr-file",
       layout = diff_view.mode,
       ignore_trim_whitespace = diff_view.ignore_whitespace_mode == "trim",
+      comments_ctx = comments_ctx,
+      new_tab = opts.new_tab,
       target_side = kind == "base" and "base" or "head",
       target_line = cursor[1],
       target_original_line = cursor[1],
+      force = true,
     })
-    if not opened_result then
-      return nil, codediff_err
-    end
-
-    apply_codediff_open_result_context(pr, details, selected_file, opened_result, {
-      comments_ctx = comments_ctx,
-    })
-    sync_diff_comments_panel(pr, details, comments_ctx)
-    return true, nil
   end
 
   local function open_with_virtual(open_opts)

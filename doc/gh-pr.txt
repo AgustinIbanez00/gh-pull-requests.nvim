@@ -184,8 +184,8 @@ Commands
     Alias: `:GhPrReviewRefresh`.
 
 :GhPrOverview
-    Opens overview panes (Summary, Activity, Collaboration) for the
-    active pull request in a dedicated tabpage with normal windows.
+    Opens overview panes (Summary with embedded Activity, Collaboration)
+    for the active pull request in a dedicated tabpage with normal windows.
 
 :GhPrOverviewV2
     Compatibility alias of `:GhPrOverview`.
@@ -224,11 +224,10 @@ Overview buffer keymaps:
     state row uses direct toggle (`open`/`closed`) with confirmation
     draft row uses direct toggle (`ready`/`draft`) with confirmation
     `<CR>` on `Commits` opens the full commit diff in codediff
-    `<CR>` on `Summary > Activity` thread headers opens compare diff for
-    the thread file (comment commit -> latest file)
+    `<CR>` on `Summary > Activity` thread headers toggles the thread fold
     `gp` preview markdown link under cursor in PR description
     `gr` load more for current section tab (`Summary` loads more Activity)
-    `D` open diff for selected row (file/commit)
+    `D` open diff or secondary action for selected row
     `O` open original for selected file row
     `M` open modified for selected file row
     `,x` toggle PR Review source
@@ -271,34 +270,38 @@ Overview buffer keymaps:
     draft/close/reopen/merge/force-push).
     Commit events in embedded Activity can be opened with `<CR>` to view
     commit diffs.
-    Threads in embedded activity are header-only rows for compact UI.
-    `<CR>` on thread header opens compare diff from the thread comment
+    Threads in embedded activity render as collapsible cards with
+    separators, reply indentation, and inline `diff` snippets focused on
+    the commented lines.
+    Open threads render expanded by default; resolved/outdated threads
+    render collapsed by default.
+    `<CR>` on a thread header toggles the fold.
+    `D` on a thread header opens compare diff from the thread comment
     commit to the latest file version in the PR.
     If inline patch resolution fails and
     `overview.thread_fix_diff.fallback_to_buffer = true`, gh-pr opens
     legacy diff buffers as fallback.
 
 Overview panes keymaps:
-    Panes are rendered in a dedicated tabpage (three normal windows:
-    Summary, Activity, Collaboration).
+    Panes are rendered in a dedicated tabpage (two normal windows:
+    Summary with embedded Activity, Collaboration).
     `a`/`d`/`c`/`m`/`k`/`b` same review/browser actions as Overview.
-    `<CR>` executes the action under cursor in focused pane.
+    `<CR>` executes the action under cursor in focused pane, or toggles
+    a thread fold on embedded Activity thread headers.
+    `D` opens the diff or secondary action for the selected item.
     `<CR>` on metadata rows edits PR fields contextually
     (title/description/state/draft/labels/reviewers/assignees/milestone).
     `<CR>` on `## Description` heading uses multiline composer (`<C-s>` submit,
     `q`/`<Esc>` cancel).
     `<CR>` on description link lines previews attachments or confirms
     browser open for non-attachment links (multiple links open selector).
-    `<CR>` on activity thread headers opens compare diff from the thread
-    comment commit to the latest file version.
     `gr` loads more activity events.
     `?` opens floating shortcuts help.
     `<Tab>`/`<S-Tab>` cycle panes.
-    `g1`/`g2`/`g3` focus Summary/Activity/Collaboration panes.
-    `<C-h>`/`<C-j>`/`<C-k>`/`<C-l>` switch focus between
-    Summary/Activity/Collaboration panes.
-    `<C-w>w`/`<C-w>W` cycle panes; `<C-w>h/j/k/l` focuses
-    Summary/Activity/Summary/Collaboration.
+    `g1`/`g3` focus Summary/Collaboration panes.
+    `<C-h>`/`<C-l>` switch focus between Summary/Collaboration panes.
+    `<C-w>w`/`<C-w>W` cycle panes; `<C-w>h/l` focuses
+    Summary/Collaboration.
     Overview panes and gh-pr popups/composer force `nospell` without
     affecting regular file buffers.
 
@@ -316,9 +319,15 @@ Overview panes keymaps:
     required for file diffs).
     If review prefetch is enabled, textual files may already be cached from
     `:GhPrStartReview` / review refresh and open without re-downloading.
+    With `diff_view.pr_explorer.enabled = v:true` (default), compatible PR
+    text-file opens reuse a local codediff explorer session for the active PR
+    snapshot, so subsequent file switches stay local and faster.
     `vertical + none|trim` opens codediff side-by-side, `unified + none|trim`
     opens codediff inline, and `horizontal` or whitespace modes `eol` /
     `blank_lines` use gh-pr's virtual diff backend instead.
+    PR explorer mode only applies to compatible textual PR files; image,
+    binary, and virtual-only layouts still use the existing non-text or
+    virtual fallback flows.
     Persisted/configured `ignore_whitespace_mode = "all"` is coerced to
     `"trim"` on load for backward compatibility.
     `render_whitespace` / `render_endlines` markers remain virtual-backend
@@ -387,6 +396,9 @@ Overview panes keymaps:
     bottom comments panel.
     The diff comments UI only lists comments for the current diff file and
     auto-opens lazily after diff render when the current file has comments.
+    When the panel is already visible, gh-pr keeps it open, shows a muted
+    "Loading comments for ..." state for the next file, and refreshes it
+    without moving focus or following comment nodes automatically.
     In codediff and virtual text diff buffers, `<CR>` on a commented line
     opens the line comments popup for that line.
     Inside line/thread comment popups, `r` opens a reply composer, `R` opens
@@ -633,18 +645,31 @@ Call `require("gh-pr").setup({ ... })` with:
 - `overview.window.backdrop` (`0`, compatibility)
 - `overview.window.enter` (`true`)
 - `overview.panes.layout.sidebar_width_ratio` (`0.34`)
-- `overview.panes.layout.summary_height_ratio` (`0.38`)
 - `overview.panes.layout.gap` (`1`)
 - `overview.panes.layout.min_left_width|min_sidebar_width` (`58|30`)
-- `overview.panes.layout.min_summary_height|min_activity_height` (`10|12`)
+- `overview.panes.layout.summary_height_ratio|min_summary_height|min_activity_height`
+  (`0.38|10|12`, legacy compatibility; ignored by the current two-pane layout)
 - `overview.panes.activity.visual_style` (`"minimal"`, also `"classic"`)
 - `overview.panes.activity.max_body_lines` (`8`)
 - `overview.panes.activity.max_events` (`120`)
-- `overview.panes.activity.show_code_context` (`true`)
+- `overview.panes.activity.show_code_context` (`true`, compatibility alias for `overview.panes.activity.threads.diff.enabled`)
+- `overview.panes.activity.threads.collapse_resolved|collapse_outdated`
+  (`true|true`)
+- `overview.panes.activity.threads.separator_char|separator_length`
+  (`"─"|54`)
+- `overview.panes.activity.threads.reply_indent` (`2`)
+- `overview.panes.activity.threads.diff.enabled|style`
+  (`true|"snippet"`)
+- `overview.panes.activity.threads.diff.context_before|context_after|max_lines`
+  (`2|2|12`)
+- `overview.panes.activity.threads.diff.separator_char|separator_length`
+  (`"─"|38`)
 - `overview.panes.keymaps.cycle_next|cycle_prev` (`<Tab>/<S-Tab>`)
-- `overview.panes.keymaps.focus_summary|focus_activity|focus_meta` (`g1/g2/g3`)
+- `overview.panes.keymaps.focus_summary|focus_meta` (`g1/g3`)
+- `overview.panes.keymaps.focus_activity|focus_down|focus_up`
+  (`g2|<C-j>|<C-k>`, legacy compatibility; ignored by the current two-pane layout)
 - `overview.panes.keymaps.help` (`?`)
-- `overview.panes.keymaps.focus_left|focus_down|focus_up|focus_right` (`<C-h>/<C-j>/<C-k>/<C-l>`)
+- `overview.panes.keymaps.focus_left|focus_right` (`<C-h>/<C-l>`)
 - `overview.theme.state_colors` (`true`)
 - `overview.theme.checks_colors` (`true`)
 - `overview.theme.labels` (`true`)
@@ -701,6 +726,7 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.render_whitespace` (`true`)
 - `diff_view.render_endlines` (`false`)
 - `diff_view.debug.codediff_failures` (`false`; debug notify for codediff failures/fallback decisions and review prefetch activity)
+- `diff_view.pr_explorer.enabled` (`true`; reuse a local codediff explorer for compatible PR text diffs)
 - `diff_view.prefetch.enabled` (`true`; warm textual PR file pairs on review start/refresh)
 - `diff_view.prefetch.concurrency` (`4`)
 - `diff_view.prefetch.text_extensions` (common text/code extension allowlist)
@@ -751,7 +777,7 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.comments_panel.height_ratio` (`0.28`; bottom Neo-tree diff comments pane height, also used by the legacy fallback panel)
 - `diff_view.comments_panel.min_height` (`8`; bottom Neo-tree diff comments pane minimum height)
 - `diff_view.comments_panel.max_height` (`18`; bottom Neo-tree diff comments pane maximum height)
-- `diff_view.comments_panel.follow_cursor` (`true`)
+- `diff_view.comments_panel.follow_cursor` (`false`; deprecated/no-op, kept only for compatibility)
 - `diff_view.comments_panel.show_resolved` (`true`)
 - `diff_view.comments_panel.show_outdated` (`true`)
 - `diff_view.comments_panel.close_with_dq` (`true`)

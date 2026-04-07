@@ -23,8 +23,12 @@ require("gh-pr").setup({
 do
   local cfg = require("gh-pr.config").get()
   local prefetch = cfg.diff_view.prefetch or {}
+  local pr_explorer = cfg.diff_view.pr_explorer or {}
   local comments_panel = cfg.diff_view.comments_panel or {}
   local non_text = cfg.diff_view.non_text or {}
+  local overview_activity = (((cfg.overview or {}).panes or {}).activity or {})
+  local overview_threads = overview_activity.threads or {}
+  local overview_thread_diff = overview_threads.diff or {}
   local pr_service = require("gh-pr.pr_service")
   local virtual_files = require("gh-pr.virtual_files")
   local actions = require("gh-pr.actions")
@@ -41,10 +45,20 @@ do
   assert(prefetch.concurrency == 2, "Missing diff_view.prefetch.concurrency")
   assert(prefetch.text_extensions[1] == "lua" and prefetch.text_extensions[2] == "md",
     "Missing diff_view.prefetch.text_extensions")
+  assert(pr_explorer.enabled == true, "Missing diff_view.pr_explorer.enabled")
   assert(comments_panel.position == "bottom", "Missing diff_view.comments_panel.position default")
   assert(non_text.enabled == true, "Missing diff_view.non_text.enabled")
   assert(non_text.auto_preview == true, "Missing diff_view.non_text.auto_preview")
   assert(non_text.show_metadata == true, "Missing diff_view.non_text.show_metadata")
+  assert(overview_threads.collapse_resolved == true, "Missing overview activity collapse_resolved default")
+  assert(overview_threads.collapse_outdated == true, "Missing overview activity collapse_outdated default")
+  assert(overview_threads.separator_char == "─", "Missing overview activity separator_char default")
+  assert(overview_threads.reply_indent == 2, "Missing overview activity reply_indent default")
+  assert(overview_thread_diff.enabled == true, "Missing overview activity diff.enabled default")
+  assert(overview_thread_diff.style == "snippet", "Missing overview activity diff.style default")
+  assert(overview_thread_diff.context_before == 2 and overview_thread_diff.context_after == 2,
+    "Missing overview activity diff context defaults")
+  assert(overview_thread_diff.max_lines == 12, "Missing overview activity diff.max_lines default")
   assert(type(virtual_files.classify_file) == "function", "Missing virtual_files.classify_file")
   assert(virtual_files.classify_file({ path = "a.png", patch = "" }) == "image", "Expected image classification")
   assert(virtual_files.classify_file({ path = "a.zip", patch = "" }) == "asset", "Expected asset classification")
@@ -115,6 +129,328 @@ do
   local _, whitespace_err = url_open._normalize_url("https://example.com/a b")
   assert(type(whitespace_err) == "string" and whitespace_err:find("unsupported whitespace", 1, true) ~= nil,
     "normalize_url should reject whitespace")
+end
+
+do
+  local render = require("gh-pr.ui.overview.render")
+  local activity_opts = render.sanitize_activity_opts({})
+  assert(activity_opts.threads.diff.enabled == true, "Render activity opts should keep thread diff enabled by default")
+  assert(activity_opts.threads.collapse_resolved == true, "Render activity opts should collapse resolved threads by default")
+
+  local payloads = render.render({
+    model = {
+      number = 42,
+      title = "Embedded Activity Smoke",
+      description = "PR description line",
+      summary = {
+        state = "OPEN",
+        review_decision = "REVIEW_REQUIRED",
+        author = "octocat",
+        head_ref = "feature/overview",
+        base_ref = "main",
+        additions = 3,
+        deletions = 1,
+        files_changed = 2,
+        updated_at = "2026-03-16T10:00:00Z",
+        merge_state = "clean",
+        mergeable = "MERGEABLE",
+      },
+      people = {
+        review_requests = {},
+        assignees = {},
+        labels = {},
+      },
+      timeline = {
+        items = {
+          {
+            kind = "comment",
+            author = "octocat",
+            body = "Looks good",
+            created_at = "2026-03-16T10:05:00Z",
+          },
+        },
+      },
+      comments = { total = 1 },
+      reviews = { total = 0 },
+      threads = { total = 0 },
+      commits = { total = 0 },
+      pr_changes = { total = 0 },
+    },
+    show = {
+      timeline = true,
+      comments = true,
+      reviews = true,
+      threads = true,
+      commits = true,
+      pr_changes = true,
+    },
+    activity = activity_opts,
+    theme = {},
+    date_format = "%Y-%m-%d %H:%M",
+  })
+
+  assert(payloads.activity == nil, "Overview render should not expose a standalone activity pane payload")
+
+  local description_line = nil
+  local activity_line = nil
+  for index, line in ipairs(payloads.summary.lines or {}) do
+    if not description_line and line:find("## Description", 1, true) then
+      description_line = index
+    end
+    if not activity_line and line == "# Activity" then
+      activity_line = index
+    end
+  end
+
+  assert(type(description_line) == "number", "Overview summary payload should include the description heading")
+  assert(type(activity_line) == "number" and activity_line > description_line,
+    "Activity section should render after the description inside the summary pane")
+  assert(payloads.meta and payloads.meta.lines and payloads.meta.lines[1] == "# Collaboration",
+    "Overview should keep a dedicated collaboration pane payload")
+end
+
+do
+  local render = require("gh-pr.ui.overview.render")
+  local activity = render.sanitize_activity_opts({})
+
+  local function build_thread_event(thread_id, opts)
+    opts = opts or {}
+    return {
+      id = string.format("thread:%s:%s", thread_id, opts.comment_id or "c1"),
+      kind = "thread_comment",
+      thread_id = thread_id,
+      author = opts.author or "octocat",
+      body = opts.body or "Comment body",
+      diff_hunk = opts.diff_hunk or "@@ -10,3 +10,4 @@\n context one\n-context two\n+context two changed\n+context three\n",
+      state = opts.state or "SUBMITTED",
+      created_at = opts.created_at or "2026-03-16T10:05:00Z",
+      url = opts.url or "https://example.com/comment",
+      path = opts.path or "lua/gh-pr/example.lua",
+      line = opts.line or 11,
+      original_line = opts.original_line or 11,
+      side = opts.side or "head",
+      commit_oid = opts.commit_oid or "abc123",
+      original_commit_oid = opts.original_commit_oid or "def456",
+      is_resolved = opts.is_resolved == true,
+      is_outdated = opts.is_outdated == true,
+    }
+  end
+
+  local session = {
+    model = {
+      number = 42,
+      title = "Thread cards",
+      description = "PR description line",
+      summary = {
+        state = "OPEN",
+        review_decision = "REVIEW_REQUIRED",
+        author = "octocat",
+        head_ref = "feature/overview",
+        base_ref = "main",
+        additions = 3,
+        deletions = 1,
+        files_changed = 2,
+        updated_at = "2026-03-16T10:00:00Z",
+        merge_state = "clean",
+        mergeable = "MERGEABLE",
+      },
+      people = {
+        review_requests = {},
+        assignees = {},
+      },
+      labels = { items = {} },
+      timeline = {
+        items = {
+          build_thread_event("thread-open", {
+            body = "Primary comment body",
+            line = 11,
+            original_line = 10,
+          }),
+          build_thread_event("thread-open", {
+            comment_id = "c2",
+            author = "hubot",
+            body = "Reply body",
+            created_at = "2026-03-16T10:06:00Z",
+            line = 12,
+            original_line = 11,
+          }),
+          build_thread_event("thread-resolved", {
+            comment_id = "c3",
+            author = "reviewer",
+            body = "Resolved body",
+            is_resolved = true,
+            line = 20,
+            original_line = 20,
+          }),
+        },
+      },
+      comments = { total = 0 },
+      reviews = { total = 0 },
+      threads = { total = 2 },
+      commits = { total = 0 },
+      pr_changes = { total = 0 },
+    },
+    show = {
+      timeline = true,
+      comments = true,
+      reviews = true,
+      threads = true,
+      commits = true,
+      pr_changes = true,
+    },
+    activity = activity,
+    activity_folds = {},
+    theme = {},
+    date_format = "%Y-%m-%d %H:%M",
+  }
+
+  local payloads = render.render(session)
+  local summary_lines = payloads.summary.lines or {}
+  local open_header = nil
+  local resolved_header = nil
+  local primary_body = nil
+  local reply_line = nil
+  local diff_fence = nil
+  local resolved_body = nil
+
+  for index, line in ipairs(summary_lines) do
+    if line:find("%[%-%]%s+thread%s+lua/gh%-pr/example%.lua:11", 1) then
+      open_header = index
+    end
+    if line:find("%[%+%]%s+thread%s+lua/gh%-pr/example%.lua:20%s+%[resolved%]", 1) then
+      resolved_header = index
+    end
+    if line:find("Primary comment body", 1, true) then
+      primary_body = index
+    end
+    if line:find("^%s+@hubot", 1) then
+      reply_line = line
+    end
+    if line:find("```diff", 1, true) then
+      diff_fence = index
+    end
+    if line:find("Resolved body", 1, true) then
+      resolved_body = index
+    end
+  end
+
+  assert(type(open_header) == "number", "Open thread header should render expanded by default")
+  assert(type(resolved_header) == "number", "Resolved thread header should render collapsed by default")
+  assert(type(primary_body) == "number" and primary_body > open_header, "Expanded thread should render comment body")
+  assert(type(reply_line) == "string" and reply_line:find("^%s%s%s%s@hubot", 1) ~= nil,
+    "Replies should render with additional indentation")
+  assert(type(diff_fence) == "number" and diff_fence > open_header, "Expanded thread should render inline diff fence")
+  assert(resolved_body == nil, "Collapsed resolved thread should hide comment body by default")
+end
+
+do
+  local render = require("gh-pr.ui.overview.render")
+  local runtime = require("gh-pr.ui.overview.runtime")
+  local activity = render.sanitize_activity_opts({})
+  local opened_payload = nil
+  local session_id = runtime.open({
+    number = 42,
+    title = "Overview runtime thread toggle",
+    description = "Runtime body",
+    summary = {
+      state = "OPEN",
+      review_decision = "REVIEW_REQUIRED",
+      author = "octocat",
+      head_ref = "feature/runtime",
+      base_ref = "main",
+      additions = 1,
+      deletions = 0,
+      files_changed = 1,
+      updated_at = "2026-03-16T10:00:00Z",
+      merge_state = "clean",
+      mergeable = "MERGEABLE",
+    },
+    people = {
+      review_requests = {},
+      assignees = {},
+    },
+    labels = { items = {} },
+    timeline = {
+      items = {
+        {
+          id = "thread:runtime:c1",
+          kind = "thread_comment",
+          thread_id = "runtime-thread",
+          author = "reviewer",
+          body = "Collapsed runtime body",
+          diff_hunk = "@@ -2,2 +2,3 @@\n context\n-old line\n+new line\n+extra line\n",
+          state = "SUBMITTED",
+          created_at = "2026-03-16T10:05:00Z",
+          url = "https://example.com/runtime-thread",
+          path = "lua/gh-pr/runtime.lua",
+          line = 3,
+          original_line = 3,
+          side = "head",
+          commit_oid = "abc123",
+          original_commit_oid = "def456",
+          is_resolved = true,
+          is_outdated = false,
+        },
+      },
+    },
+    comments = { total = 0 },
+    reviews = { total = 0 },
+    threads = { total = 1 },
+    commits = { total = 0 },
+    pr_changes = { total = 0 },
+  }, {
+    show = {
+      timeline = true,
+      comments = true,
+      reviews = true,
+      threads = true,
+      commits = true,
+      pr_changes = true,
+    },
+    activity = activity,
+    theme = {},
+    date_format = "%Y-%m-%d %H:%M",
+    actions = {
+      open_activity_thread_workspace = function(payload)
+        opened_payload = payload
+      end,
+    },
+  })
+
+  assert(type(session_id) == "number", "Overview runtime should open session for thread toggle smoke")
+  local summary_buf = vim.api.nvim_get_current_buf()
+  local lines = vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false)
+  local header_line = nil
+  for index, line in ipairs(lines) do
+    if line:find("%[%+%]%s+thread%s+lua/gh%-pr/runtime%.lua:3%s+%[resolved%]", 1) then
+      header_line = index
+      break
+    end
+  end
+  assert(type(header_line) == "number", "Runtime smoke should render collapsed thread header")
+  assert(vim.fn.maparg("<CR>", "n", false, true).desc == "GH PR Overview: open selection or toggle thread",
+    "Overview <CR> mapping should describe thread toggle behavior")
+  assert(vim.fn.maparg("D", "n", false, true).desc == "GH PR Overview: open diff or secondary action",
+    "Overview D mapping should describe diff behavior")
+
+  vim.api.nvim_win_set_cursor(0, { header_line, 0 })
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+  vim.wait(20)
+
+  lines = vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false)
+  local expanded_header = lines[header_line] or ""
+  local expanded_body = table.concat(lines, "\n")
+  assert(expanded_header:find("%[%-%]") ~= nil, "Pressing <CR> on thread header should expand the thread")
+  assert(expanded_body:find("Collapsed runtime body", 1, true) ~= nil,
+    "Expanded runtime thread should render its body")
+
+  vim.api.nvim_win_set_cursor(0, { header_line, 0 })
+  vim.api.nvim_feedkeys("D", "x", false)
+  vim.wait(20)
+
+  assert(type(opened_payload) == "table" and opened_payload.thread_id == "runtime-thread",
+    "Pressing D on thread header should open the thread diff/workspace")
+  runtime.close(session_id)
 end
 
 do
@@ -977,6 +1313,7 @@ do
   local original_panel = package.loaded["gh-pr.diff_comments_panel"]
   package.loaded["gh-pr.diff_comments_panel"] = { sync_for_diff = function() end }
 
+  local original_pr_explorer = codediff.open_pr_explorer_diff
   local original_codediff = codediff.open_pr_file_diff
   local original_virtual = virtual_files.open_diff
   local calls = {}
@@ -1000,8 +1337,26 @@ do
     return last_open_result
   end
 
+  codediff.open_pr_explorer_diff = function(opts)
+    calls[#calls + 1] = { "pr_explorer", vim.deepcopy(opts) }
+    local opened = {
+      mode = "directory",
+      tabpage = vim.api.nvim_get_current_tabpage(),
+      layout = opts.layout == "unified" and "inline" or "side-by-side",
+    }
+    local selected_file = type(opts.file) == "table" and opts.file or {
+      path = "lua/gh-pr/actions.lua",
+      filename = "lua/gh-pr/actions.lua",
+    }
+    local selection_result = make_open_result(opts)
+    if type(opts.on_selection) == "function" then
+      opts.on_selection(selected_file, selection_result)
+    end
+    return opened, nil
+  end
+
   codediff.open_pr_file_diff = function(opts)
-    calls[#calls + 1] = { "codediff", vim.deepcopy(opts) }
+    calls[#calls + 1] = { "codediff_file", vim.deepcopy(opts) }
     return make_open_result(opts), nil
   end
 
@@ -1037,10 +1392,10 @@ do
 
   assert(actions.open_diff(pr.files[1], { view_mode = "vertical", ignore_whitespace_mode = "none" }) == true,
     "Vertical+none PR file diff should open")
-  assert(calls[1] and calls[1][1] == "codediff",
-    "Vertical+none PR file diff should prefer codediff")
+  assert(calls[1] and calls[1][1] == "pr_explorer",
+    "Vertical+none PR file diff should prefer the PR codediff explorer")
   assert(calls[1][2].layout == "vertical" and calls[1][2].ignore_trim_whitespace ~= true,
-    "Vertical+none PR file diff should open codediff side-by-side without trim ignore")
+    "Vertical+none PR file diff should open the PR codediff explorer side-by-side without trim ignore")
   local prefs_after_one_shot_open = state.get_diff_view_prefs()
   assert(prefs_after_one_shot_open.mode == "unified"
       and prefs_after_one_shot_open.ignore_whitespace_mode == "trim"
@@ -1057,8 +1412,8 @@ do
   calls = {}
   assert(actions.open_diff(pr.files[1], { view_mode = "unified", ignore_whitespace_mode = "none" }) == true,
     "Unified PR file diff should open")
-  assert(calls[1] and calls[1][1] == "codediff",
-    "Unified PR file diff should prefer codediff inline")
+  assert(calls[1] and calls[1][1] == "pr_explorer",
+    "Unified PR file diff should prefer the PR codediff explorer inline")
   assert(calls[1][2].layout == "unified" and calls[1][2].ignore_trim_whitespace ~= true,
     "Unified+none should pass unified layout without trim ignore")
   assert(last_open_result and vim.b[last_open_result.head_buf].gh_pr_file_kind == "unified"
@@ -1068,16 +1423,16 @@ do
   calls = {}
   assert(actions.open_diff(pr.files[1], { view_mode = "vertical", ignore_whitespace_mode = "trim" }) == true,
     "Trim-whitespace PR file diff should open")
-  assert(calls[1] and calls[1][1] == "codediff",
-    "Trim-whitespace PR file diff should use codediff backend")
+  assert(calls[1] and calls[1][1] == "pr_explorer",
+    "Trim-whitespace PR file diff should use the PR codediff explorer")
   assert(calls[1][2].layout == "vertical" and calls[1][2].ignore_trim_whitespace == true,
     "Vertical+trim should pass trim ignore to codediff")
 
   calls = {}
   assert(actions.open_diff(pr.files[1], { view_mode = "unified", ignore_whitespace_mode = "trim" }) == true,
     "Unified+trim PR file diff should open")
-  assert(calls[1] and calls[1][1] == "codediff",
-    "Unified+trim PR file diff should use codediff backend")
+  assert(calls[1] and calls[1][1] == "pr_explorer",
+    "Unified+trim PR file diff should use the PR codediff explorer")
   assert(calls[1][2].layout == "unified" and calls[1][2].ignore_trim_whitespace == true,
     "Unified+trim should pass inline layout and trim ignore to codediff")
 
@@ -1111,8 +1466,8 @@ do
   })
   calls = {}
   actions.toggle_diff_whitespace()
-  assert(calls[1] and calls[1][1] == "codediff",
-    "Toggling whitespace from strict should rerender with codediff when trim is supported")
+  assert(calls[1] and calls[1][1] == "pr_explorer",
+    "Toggling whitespace from strict should rerender with the PR codediff explorer when trim is supported")
   assert(calls[1][2].ignore_trim_whitespace == true,
     "Whitespace toggle should pass trim ignore to codediff")
   assert(state.get_diff_view_prefs().ignore_whitespace_mode == "trim",
@@ -1137,12 +1492,793 @@ do
   })
   calls = {}
   actions.set_diff_view_mode("unified")
-  assert(calls[1] and calls[1][1] == "codediff",
-    "Returning to unified+none should rerender with codediff")
+  assert(calls[1] and calls[1][1] == "pr_explorer",
+    "Returning to unified+none should rerender with the PR codediff explorer")
   assert(calls[1][2].layout == "unified",
     "Returning to codediff should pass unified layout")
 
+  codediff.open_pr_explorer_diff = original_pr_explorer
   codediff.open_pr_file_diff = original_codediff
   virtual_files.open_diff = original_virtual
   package.loaded["gh-pr.diff_comments_panel"] = original_panel
+end
+
+do
+  local codediff = require("gh-pr.integrations.codediff")
+  local virtual_files = require("gh-pr.virtual_files")
+
+  local original_remote_pair_loader = virtual_files.load_remote_file_pair
+  local original_codediff_config = package.loaded["codediff.config"]
+  local original_codediff_view = package.loaded["codediff.ui.view"]
+  local original_codediff_lifecycle = package.loaded["codediff.ui.lifecycle"]
+  local original_codediff_dir = package.loaded["codediff.core.dir"]
+  local original_side_by_side = package.loaded["codediff.ui.view.side_by_side"]
+  local original_inline_view = package.loaded["codediff.ui.view.inline_view"]
+
+  local created_codediff_command = false
+  if vim.fn.exists(":CodeDiff") ~= 2 then
+    vim.api.nvim_create_user_command("CodeDiff", function() end, {})
+    created_codediff_command = true
+  end
+
+  local sessions = {}
+  local explorers = {}
+  local side_by_side_single_file_calls = {}
+  local status_entries = {
+    {
+      path = "lua/new.lua",
+      status = "A",
+      group = "unstaged",
+    },
+    {
+      path = "lua/other.lua",
+      status = "A",
+      group = "unstaged",
+    },
+  }
+
+  local function build_file_content(prefix, total)
+    local lines = {}
+    for index = 1, total do
+      lines[#lines + 1] = string.format("%s line %d", prefix, index)
+    end
+    return table.concat(lines, "\n") .. "\n"
+  end
+
+  local function ensure_modified_win(tabpage)
+    local session = sessions[tabpage]
+    local explorer = explorers[tabpage]
+    if not session or not explorer then
+      return nil
+    end
+
+    if type(session.modified_win) == "number"
+      and session.modified_win > 0
+      and vim.api.nvim_win_is_valid(session.modified_win)
+      and session.modified_win ~= explorer.winid then
+      return session.modified_win
+    end
+
+    pcall(vim.api.nvim_set_current_win, explorer.winid)
+    vim.cmd("vsplit")
+    session.modified_win = vim.api.nvim_get_current_win()
+    return session.modified_win
+  end
+
+  local function mount_selected_file(tabpage, file_data, abs_path)
+    local session = sessions[tabpage]
+    local modified_win = ensure_modified_win(tabpage)
+    local modified_bufnr = vim.fn.bufadd(abs_path)
+    vim.fn.bufload(modified_bufnr)
+    local original_bufnr = vim.api.nvim_create_buf(false, true)
+    vim.bo[original_bufnr].buftype = "nofile"
+
+    session.original_bufnr = original_bufnr
+    session.modified_bufnr = modified_bufnr
+    session.original_path = ""
+    session.modified_path = abs_path
+    session.original_revision = nil
+    session.modified_revision = nil
+    session.original_win = nil
+    session.modified_win = modified_win
+
+    vim.api.nvim_win_set_buf(modified_win, modified_bufnr)
+    return {
+      original_bufnr = original_bufnr,
+      modified_bufnr = modified_bufnr,
+      modified_win = modified_win,
+      file_data = vim.deepcopy(file_data),
+    }
+  end
+
+  package.loaded["codediff.config"] = {
+    options = {
+      diff = {
+        layout = "side-by-side",
+        ignore_trim_whitespace = false,
+      },
+    },
+    setup = function(_) end,
+  }
+
+  package.loaded["codediff.ui.lifecycle"] = {
+    get_session = function(tabpage)
+      return sessions[tabpage]
+    end,
+    get_explorer = function(tabpage)
+      return explorers[tabpage]
+    end,
+    update_layout = function(tabpage, layout)
+      if sessions[tabpage] then
+        sessions[tabpage].layout = layout
+      end
+      return true
+    end,
+    update_buffers = function(tabpage, original_bufnr, modified_bufnr)
+      if sessions[tabpage] then
+        sessions[tabpage].original_bufnr = original_bufnr
+        sessions[tabpage].modified_bufnr = modified_bufnr
+      end
+      return true
+    end,
+    update_paths = function(tabpage, original_path, modified_path)
+      if sessions[tabpage] then
+        sessions[tabpage].original_path = original_path
+        sessions[tabpage].modified_path = modified_path
+      end
+      return true
+    end,
+    update_revisions = function(tabpage, original_revision, modified_revision)
+      if sessions[tabpage] then
+        sessions[tabpage].original_revision = original_revision
+        sessions[tabpage].modified_revision = modified_revision
+      end
+      return true
+    end,
+    update_diff_result = function(tabpage, diff_result)
+      if sessions[tabpage] then
+        sessions[tabpage].stored_diff_result = diff_result
+      end
+      return true
+    end,
+  }
+
+  package.loaded["codediff.core.dir"] = {
+    diff_directories = function(base_dir, head_dir)
+      return {
+        root1 = base_dir,
+        root2 = head_dir,
+        status_result = {
+          conflicts = {},
+          unstaged = vim.deepcopy(status_entries),
+          staged = {},
+        },
+      }
+    end,
+  }
+
+  package.loaded["codediff.ui.view.side_by_side"] = {
+    show_untracked_file = function(tabpage, abs_path)
+      side_by_side_single_file_calls[#side_by_side_single_file_calls + 1] = abs_path
+      local current_selection = explorers[tabpage] and explorers[tabpage].current_selection or {
+        path = "lua/new.lua",
+        status = "A",
+        group = "unstaged",
+      }
+      mount_selected_file(tabpage, current_selection, abs_path)
+    end,
+  }
+
+  package.loaded["codediff.ui.view.inline_view"] = {
+    show_single_file = function(tabpage, abs_path, opts)
+      local load_bufnr = vim.fn.bufadd(abs_path)
+      vim.fn.bufload(load_bufnr)
+      local empty_buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[empty_buf].buftype = "nofile"
+
+      local session = sessions[tabpage]
+      session.original_bufnr = (opts and opts.side == "original") and load_bufnr or empty_buf
+      session.modified_bufnr = (opts and opts.side == "original") and empty_buf or load_bufnr
+      session.original_path = (opts and opts.side == "original") and abs_path or ""
+      session.modified_path = (opts and opts.side == "original") and "" or abs_path
+      session.original_revision = nil
+      session.modified_revision = nil
+      session.modified_win = session.modified_win or vim.api.nvim_get_current_win()
+    end,
+  }
+
+  package.loaded["codediff.ui.view"] = {
+    create = function(session_config)
+      vim.cmd("tabnew")
+      local tabpage = vim.api.nvim_get_current_tabpage()
+      local winid = vim.api.nvim_get_current_win()
+      local bufnr = vim.api.nvim_get_current_buf()
+
+      sessions[tabpage] = {
+        mode = "explorer",
+        layout = session_config.layout or "side-by-side",
+        original_bufnr = vim.api.nvim_create_buf(false, true),
+        modified_bufnr = vim.api.nvim_create_buf(false, true),
+        original_win = nil,
+        modified_win = nil,
+        root1 = session_config.original_path,
+        root2 = session_config.modified_path,
+        original_path = "",
+        modified_path = "",
+      }
+
+      local selection = {
+        path = session_config.explorer_data.focus_file or "lua/new.lua",
+        status = "A",
+        group = "unstaged",
+      }
+
+      local explorer = {
+        bufnr = bufnr,
+        winid = winid,
+        tabpage = tabpage,
+        status_result = session_config.explorer_data.status_result,
+        current_selection = nil,
+        current_file_path = nil,
+        current_file_group = nil,
+        tree = {
+          get_node = function(_, line)
+            local entry = status_entries[line]
+            if entry then
+              return {
+                data = {
+                  path = entry.path,
+                  group = entry.group,
+                },
+              }
+            end
+            return nil
+          end,
+        },
+      }
+
+      explorer.clear_selection = function()
+        explorer.current_selection = nil
+        explorer.current_file_path = nil
+        explorer.current_file_group = nil
+      end
+
+      explorer.on_file_select = function(file_data, _)
+        explorer.current_selection = vim.deepcopy(file_data)
+        explorer.current_file_path = file_data.path
+        explorer.current_file_group = file_data.group
+
+        local root2 = sessions[tabpage] and sessions[tabpage].root2 or ""
+        local abs_path = vim.fs.joinpath(root2, file_data.path)
+        mount_selected_file(tabpage, file_data, abs_path)
+      end
+
+      explorers[tabpage] = explorer
+
+      vim.schedule(function()
+        pcall(vim.api.nvim_win_set_cursor, winid, { 1, 0 })
+        explorer.on_file_select(vim.deepcopy(selection), { force = true })
+      end)
+    end,
+    toggle_layout = function()
+      return true
+    end,
+  }
+
+  virtual_files.load_remote_file_pair = function(_, file)
+    local path = file.path or file.filename
+    local head_content = path == "lua/other.lua"
+        and build_file_content("other", 16)
+      or build_file_content("new", 20)
+    return {
+      status = "added",
+      file_mode = "added_single",
+      base_path = path,
+      head_path = path,
+      base_content = "",
+      head_content = head_content,
+    }, nil
+  end
+
+  local selection_calls = {}
+  local function record_selection(file, open_result)
+    selection_calls[#selection_calls + 1] = {
+      file = vim.deepcopy(file),
+      open_result = vim.deepcopy(open_result),
+    }
+
+    if type(open_result) == "table" then
+      if type(open_result.base_buf) == "number" and open_result.base_buf > 0 then
+        vim.b[open_result.base_buf].gh_pr_path = file.path
+        vim.b[open_result.base_buf].gh_pr_file_path = file.path
+      end
+      if type(open_result.head_buf) == "number" and open_result.head_buf > 0 then
+        vim.b[open_result.head_buf].gh_pr_path = file.path
+        vim.b[open_result.head_buf].gh_pr_file_path = file.path
+      end
+    end
+  end
+
+  local details = {
+    baseRefName = "main",
+    headRefName = "feature",
+    files = {
+      {
+        path = "lua/new.lua",
+        filename = "lua/new.lua",
+        status = "added",
+      },
+      {
+        path = "lua/other.lua",
+        filename = "lua/other.lua",
+        status = "added",
+      },
+    },
+  }
+
+  local opened, open_err = codediff.open_pr_explorer_diff({
+    pr_number = 88,
+    details = details,
+    file = details.files[1],
+    layout = "vertical",
+    on_selection = record_selection,
+  })
+  assert(opened ~= nil, open_err or "PR explorer should open for added file smoke test")
+
+  vim.wait(50)
+
+  assert(#selection_calls == 0,
+    "Opening the PR codediff explorer should not auto-select the focused file")
+
+  local lifecycle = require("codediff.ui.lifecycle")
+  local explorer = lifecycle.get_explorer(opened.tabpage)
+  assert(type(explorer) == "table" and type(explorer.on_file_select) == "function",
+    "PR explorer smoke test should expose the wrapped codediff explorer")
+
+  local passive_calls_before = #selection_calls
+  local passive_single_file_before = #side_by_side_single_file_calls
+  explorer.on_file_select({
+    path = "lua/new.lua",
+    status = "A",
+    group = "unstaged",
+  }, { no_jump = true })
+
+  vim.wait(50)
+
+  assert(#selection_calls == passive_calls_before,
+    "Passive PR explorer selection replay should not sync gh-pr")
+  assert(#side_by_side_single_file_calls == passive_single_file_before,
+    "Passive PR explorer selection replay should not trigger single-file rendering")
+
+  explorer.on_file_select({
+    path = "lua/new.lua",
+    status = "A",
+    group = "unstaged",
+  }, { force = true })
+
+  vim.wait(50, function()
+    return #selection_calls == 1 and #side_by_side_single_file_calls == 1
+  end)
+
+  assert(#side_by_side_single_file_calls == 1,
+    string.format(
+      "Added PR explorer files should render as single-file content in side-by-side layout (got %d calls)",
+      #side_by_side_single_file_calls
+    ))
+  assert(#selection_calls == 1 and selection_calls[1].open_result.file_mode == "added_single",
+    "Added PR explorer selection should sync gh-pr as an added_single view")
+
+  local active_session = lifecycle.get_session(opened.tabpage)
+  assert(type(active_session) == "table" and vim.api.nvim_win_is_valid(active_session.modified_win),
+    "PR explorer selection should expose a modified diff window")
+
+  vim.api.nvim_set_current_win(active_session.modified_win)
+  vim.api.nvim_win_set_cursor(active_session.modified_win, { 9, 0 })
+  vim.api.nvim_set_current_win(explorer.winid)
+
+  explorer.on_file_select({
+    path = "lua/other.lua",
+    status = "A",
+    group = "unstaged",
+  }, { force = true })
+
+  vim.wait(50, function()
+    return #selection_calls == 2
+  end)
+
+  active_session = lifecycle.get_session(opened.tabpage)
+  assert(selection_calls[2].file.path == "lua/other.lua",
+    "Selecting a second PR explorer file should sync gh-pr with that file")
+
+  vim.api.nvim_set_current_win(active_session.modified_win)
+  vim.api.nvim_win_set_cursor(active_session.modified_win, { 6, 0 })
+  vim.api.nvim_set_current_win(explorer.winid)
+
+  explorer.on_file_select({
+    path = "lua/new.lua",
+    status = "A",
+    group = "unstaged",
+  }, { force = true })
+
+  vim.wait(50, function()
+    return #selection_calls == 3
+  end)
+
+  active_session = lifecycle.get_session(opened.tabpage)
+  local restored_cursor = vim.api.nvim_win_get_cursor(active_session.modified_win)
+  assert(restored_cursor[1] == 9,
+    "Re-selecting a visited PR explorer file should restore its previous modified-side line")
+
+  vim.api.nvim_set_current_win(explorer.winid)
+  explorer.on_file_select({
+    path = "lua/other.lua",
+    status = "A",
+    group = "unstaged",
+  }, { force = true })
+
+  vim.wait(50, function()
+    return #selection_calls == 4
+  end)
+
+  active_session = lifecycle.get_session(opened.tabpage)
+  restored_cursor = vim.api.nvim_win_get_cursor(active_session.modified_win)
+  assert(restored_cursor[1] == 6,
+    "Each PR explorer file should keep its own remembered modified-side line")
+
+  local reused_calls_before = #selection_calls
+  local single_file_calls_before = #side_by_side_single_file_calls
+  local reopened, reopen_err = codediff.open_pr_explorer_diff({
+    pr_number = 88,
+    details = details,
+    file = details.files[1],
+    layout = "vertical",
+    on_selection = record_selection,
+  })
+  assert(reopened ~= nil, reopen_err or "PR explorer reuse smoke test should reopen the existing tab")
+
+  vim.wait(50)
+
+  assert(#selection_calls == reused_calls_before,
+    "Reusing the PR codediff explorer should not auto-open the requested file")
+  assert(#side_by_side_single_file_calls == single_file_calls_before,
+    "Reusing the PR codediff explorer should not trigger single-file rendering until manual selection")
+
+  virtual_files.load_remote_file_pair = original_remote_pair_loader
+  package.loaded["codediff.config"] = original_codediff_config
+  package.loaded["codediff.ui.view"] = original_codediff_view
+  package.loaded["codediff.ui.lifecycle"] = original_codediff_lifecycle
+  package.loaded["codediff.core.dir"] = original_codediff_dir
+  package.loaded["codediff.ui.view.side_by_side"] = original_side_by_side
+  package.loaded["codediff.ui.view.inline_view"] = original_inline_view
+
+  if created_codediff_command then
+    pcall(vim.api.nvim_del_user_command, "CodeDiff")
+  end
+end
+
+do
+  local config_mod = require("gh-pr.config")
+  local panel = require("gh-pr.diff_comments_panel")
+  local pr_service = require("gh-pr.pr_service")
+
+  local original_tree_source = package.loaded["gh-pr.neotree.diff_comments_source"]
+  local original_fetch_async = pr_service.fetch_review_threads_with_pending_async
+
+  local pending_callback = nil
+
+  local function find_panel_window()
+    for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      local bufnr = vim.api.nvim_win_get_buf(winid)
+      if vim.bo[bufnr].filetype == "gh_pr_diff_comments" then
+        return winid, bufnr
+      end
+    end
+    return nil, nil
+  end
+
+  package.loaded["gh-pr.neotree.diff_comments_source"] = {
+    available = function()
+      return false
+    end,
+  }
+
+  pr_service.fetch_review_threads_with_pending_async = function(_, _, callback)
+    pending_callback = callback
+  end
+
+  config_mod.setup({
+    diff_view = {
+      comments_panel = {
+        enabled = true,
+        auto_open = "always",
+        follow_cursor = true,
+      },
+    },
+  })
+
+  vim.cmd("tabnew")
+  local diff_buf = vim.api.nvim_get_current_buf()
+  local diff_win = vim.api.nvim_get_current_win()
+  vim.b[diff_buf].gh_pr_number = 501
+  vim.b[diff_buf].gh_pr_file_kind = "head"
+  vim.b[diff_buf].gh_pr_file_path = "lua/a.lua"
+  vim.b[diff_buf].gh_pr_path = "lua/a.lua"
+
+  local pr = { number = 501 }
+  local details = {
+    number = 501,
+    files = {
+      { path = "lua/a.lua", filename = "lua/a.lua" },
+      { path = "lua/b.lua", filename = "lua/b.lua" },
+    },
+  }
+
+  assert(panel.sync_for_diff({
+    pr = pr,
+    details = details,
+    pr_number = 501,
+    origin_win = diff_win,
+    origin_buf = diff_buf,
+    file_path = "lua/a.lua",
+    file_kind = "head",
+  }) == true, "Legacy diff comments panel should open for the active file")
+
+  local panel_win, panel_buf = find_panel_window()
+  assert(type(panel_win) == "number" and panel_win > 0 and panel_buf > 0,
+    "Legacy diff comments panel should create a panel window")
+  assert(vim.api.nvim_get_current_win() == diff_win,
+    "Opening the legacy diff comments panel should keep focus in the diff window")
+
+  local loading_lines = vim.api.nvim_buf_get_lines(panel_buf, 0, -1, false)
+  assert(loading_lines[4] == "Loading comments for lua/a.lua...",
+    "Legacy diff comments panel should render a loading message for the active file")
+  local loading_marks = vim.api.nvim_buf_get_extmarks(panel_buf, -1, 0, -1, { details = true })
+  local found_loading_highlight = false
+  for _, mark in ipairs(loading_marks) do
+    local row = mark[2]
+    local details_mark = mark[4] or {}
+    if row == 3 and details_mark.hl_group == "GhPrDiffCommentsMuted" then
+      found_loading_highlight = true
+      break
+    end
+  end
+  assert(found_loading_highlight == true,
+    "Legacy diff comments panel should mute the loading message line")
+
+  pending_callback({
+    {
+      id = "thread-a",
+      path = "lua/a.lua",
+      line = 6,
+      diffSide = "RIGHT",
+      comments = {
+        {
+          id = "comment-a1",
+          author = { login = "alice" },
+          body = "first comment",
+          createdAt = "2026-03-18T12:00:00Z",
+          line = 6,
+        },
+      },
+    },
+  }, nil)
+
+  vim.wait(50, function()
+    local lines = vim.api.nvim_buf_get_lines(panel_buf, 0, -1, false)
+    for _, line in ipairs(lines) do
+      if line:find("@alice", 1, true) ~= nil then
+        return true
+      end
+    end
+    return false
+  end)
+
+  local comment_line = nil
+  for index, line in ipairs(vim.api.nvim_buf_get_lines(panel_buf, 0, -1, false)) do
+    if line:find("@alice", 1, true) ~= nil then
+      comment_line = index
+      break
+    end
+  end
+  assert(type(comment_line) == "number" and comment_line > 0,
+    "Legacy diff comments panel should render the fetched comment")
+
+  local diff_cursor_before_follow = vim.api.nvim_win_get_cursor(diff_win)
+  vim.api.nvim_set_current_win(panel_win)
+  vim.api.nvim_win_set_cursor(panel_win, { comment_line, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = panel_buf, modeline = false })
+  assert(vim.api.nvim_get_current_win() == panel_win,
+    "Moving inside the legacy diff comments panel should not steal focus away from the panel")
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(diff_win), diff_cursor_before_follow),
+    "Moving inside the legacy diff comments panel should not move the diff cursor automatically")
+
+  vim.api.nvim_set_current_win(diff_win)
+  local diff_cursor_before_refresh = vim.api.nvim_win_get_cursor(diff_win)
+  pending_callback = nil
+  assert(panel.sync_for_diff({
+    pr = pr,
+    details = details,
+    pr_number = 501,
+    origin_win = diff_win,
+    origin_buf = diff_buf,
+    file_path = "lua/b.lua",
+    file_kind = "head",
+  }) == true, "Refreshing the legacy diff comments panel should keep the panel open")
+  assert(vim.api.nvim_get_current_win() == diff_win,
+    "Refreshing the legacy diff comments panel should not change the focused diff window")
+  assert(panel.is_open_current_tab() == true,
+    "Refreshing the legacy diff comments panel should keep it open")
+
+  local refreshed_lines = vim.api.nvim_buf_get_lines(panel_buf, 0, -1, false)
+  assert(refreshed_lines[4] == "Loading comments for lua/b.lua...",
+    "Refreshing the legacy diff comments panel should immediately show loading for the new file")
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(diff_win), diff_cursor_before_refresh),
+    "Refreshing the legacy diff comments panel should not move the diff cursor")
+
+  panel.close_current_tab()
+  pr_service.fetch_review_threads_with_pending_async = original_fetch_async
+  package.loaded["gh-pr.neotree.diff_comments_source"] = original_tree_source
+end
+
+do
+  local config_mod = require("gh-pr.config")
+  local pr_service = require("gh-pr.pr_service")
+
+  local original_neotree_module = package.loaded["neo-tree"]
+  local original_renderer = package.loaded["neo-tree.ui.renderer"]
+  local original_integration = package.loaded["gh-pr.integrations.neotree"]
+  local original_source = package.loaded["gh-pr.neotree.diff_comments_source"]
+  local original_fetch_async = pr_service.fetch_review_threads_with_pending_async
+
+  local open_source_calls = 0
+  local close_source_calls = 0
+  local pending_callback = nil
+  local source_visible = false
+
+  package.loaded["neo-tree"] = {}
+  package.loaded["neo-tree.ui.renderer"] = {
+    show_nodes = function(nodes, state)
+      state.last_nodes = vim.deepcopy(nodes)
+    end,
+  }
+  package.loaded["gh-pr.integrations.neotree"] = {
+    is_source_visible = function()
+      return source_visible
+    end,
+    open_source = function(_, _, _)
+      open_source_calls = open_source_calls + 1
+      return true
+    end,
+    close_source = function(_, _)
+      close_source_calls = close_source_calls + 1
+      return true
+    end,
+  }
+
+  pr_service.fetch_review_threads_with_pending_async = function(_, _, callback)
+    pending_callback = callback
+  end
+
+  package.loaded["gh-pr.neotree.diff_comments_source"] = nil
+  local source = require("gh-pr.neotree.diff_comments_source")
+
+  config_mod.setup({
+    diff_view = {
+      comments_panel = {
+        enabled = true,
+        auto_open = "always",
+        follow_cursor = true,
+      },
+    },
+  })
+
+  vim.cmd("tabnew")
+  local diff_buf = vim.api.nvim_get_current_buf()
+  local diff_win = vim.api.nvim_get_current_win()
+  vim.b[diff_buf].gh_pr_number = 777
+  vim.b[diff_buf].gh_pr_file_kind = "head"
+  vim.b[diff_buf].gh_pr_file_path = "lua/a.lua"
+  vim.b[diff_buf].gh_pr_path = "lua/a.lua"
+
+  local pr = { number = 777 }
+  local details = {
+    number = 777,
+    files = {
+      { path = "lua/a.lua", filename = "lua/a.lua" },
+      { path = "lua/b.lua", filename = "lua/b.lua" },
+    },
+  }
+
+  assert(source.sync_for_diff({
+    pr = pr,
+    details = details,
+    pr_number = 777,
+    origin_win = diff_win,
+    origin_buf = diff_buf,
+    file_path = "lua/a.lua",
+    file_kind = "head",
+  }) == true, "Neo-tree diff comments source should open when auto_open is always")
+  assert(open_source_calls == 1,
+    "Neo-tree diff comments source should open the source once for the initial file")
+
+  vim.cmd("vsplit")
+  local source_win = vim.api.nvim_get_current_win()
+  local source_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(source_win, source_buf)
+  vim.bo[source_buf].filetype = "neo-tree"
+  vim.b[source_buf].neo_tree_source = "gh_pr_diff_comments"
+  source_visible = true
+
+  local state = {
+    winid = source_win,
+    path = vim.fn.getcwd(),
+    tree = {
+      get_node = function()
+        return {
+          id = "comment-node-1",
+          extra = {
+            kind = "comment",
+            target = {
+              path = "lua/a.lua",
+              side = "head",
+              line = 6,
+            },
+          },
+        }
+      end,
+    },
+  }
+
+  source.navigate(state, vim.fn.getcwd())
+  assert(type(state.last_nodes) == "table"
+      and state.last_nodes[1]
+      and state.last_nodes[1].children
+      and state.last_nodes[1].children[1]
+      and state.last_nodes[1].children[1].name == "Loading comments for lua/a.lua...",
+    "Neo-tree diff comments source should render loading nodes for the initial file")
+
+  local open_target_calls = 0
+  local original_open_target = source.open_target
+  source.open_target = function(...)
+    open_target_calls = open_target_calls + 1
+    return true
+  end
+
+  vim.api.nvim_set_current_win(source_win)
+  vim.api.nvim_win_set_cursor(source_win, { 1, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = source_buf, modeline = false })
+  assert(open_target_calls == 0,
+    "Moving inside the Neo-tree diff comments source should not auto-open or follow comment targets")
+
+  vim.api.nvim_set_current_win(diff_win)
+  local diff_cursor_before_refresh = vim.api.nvim_win_get_cursor(diff_win)
+  pending_callback = nil
+  assert(source.sync_for_diff({
+    pr = pr,
+    details = details,
+    pr_number = 777,
+    origin_win = diff_win,
+    origin_buf = diff_buf,
+    file_path = "lua/b.lua",
+    file_kind = "head",
+  }) == true, "Neo-tree diff comments source should refresh the visible source for the new file")
+  assert(open_source_calls == 1 and close_source_calls == 0,
+    "Refreshing the visible Neo-tree diff comments source should reuse the existing source window")
+  assert(vim.api.nvim_get_current_win() == diff_win,
+    "Refreshing the Neo-tree diff comments source should not change the focused diff window")
+  assert(type(state.last_nodes) == "table"
+      and state.last_nodes[1]
+      and state.last_nodes[1].children
+      and state.last_nodes[1].children[1]
+      and state.last_nodes[1].children[1].name == "Loading comments for lua/b.lua...",
+    "Refreshing the Neo-tree diff comments source should immediately show loading nodes for the new file")
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(diff_win), diff_cursor_before_refresh),
+    "Refreshing the Neo-tree diff comments source should not move the diff cursor")
+
+  source.open_target = original_open_target
+  pr_service.fetch_review_threads_with_pending_async = original_fetch_async
+  package.loaded["neo-tree"] = original_neotree_module
+  package.loaded["neo-tree.ui.renderer"] = original_renderer
+  package.loaded["gh-pr.integrations.neotree"] = original_integration
+  package.loaded["gh-pr.neotree.diff_comments_source"] = original_source
 end

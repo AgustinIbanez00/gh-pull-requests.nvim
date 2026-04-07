@@ -18,17 +18,58 @@ local function sanitize_positive_integer(value, fallback, min_value, max_value)
   return number
 end
 
+local function sanitize_separator_value(value, fallback)
+  local text = utils.safe_string(value, "")
+  if text == "" then
+    return fallback
+  end
+  return text
+end
+
+local function sanitize_activity_threads_opts(source, show_code_context)
+  local threads = type(source.threads) == "table" and source.threads or {}
+  local diff = type(threads.diff) == "table" and threads.diff or {}
+  local diff_enabled = diff.enabled
+  if type(diff_enabled) ~= "boolean" then
+    diff_enabled = show_code_context
+  end
+
+  local style = utils.safe_string(diff.style, "snippet"):lower()
+  if style ~= "snippet" then
+    style = "snippet"
+  end
+
+  return {
+    collapse_resolved = threads.collapse_resolved ~= false,
+    collapse_outdated = threads.collapse_outdated ~= false,
+    separator_char = sanitize_separator_value(threads.separator_char, "─"),
+    separator_length = sanitize_positive_integer(threads.separator_length, 54, 8, 200),
+    reply_indent = sanitize_positive_integer(threads.reply_indent, 2, 1, 12),
+    diff = {
+      enabled = diff_enabled == true,
+      style = style,
+      context_before = sanitize_positive_integer(diff.context_before, 2, 0, 200),
+      context_after = sanitize_positive_integer(diff.context_after, 2, 0, 200),
+      max_lines = sanitize_positive_integer(diff.max_lines, 12, 3, 80),
+      separator_char = sanitize_separator_value(diff.separator_char, "─"),
+      separator_length = sanitize_positive_integer(diff.separator_length, 38, 8, 200),
+    },
+  }
+end
+
 function M.sanitize_activity_opts(input)
   local source = type(input) == "table" and input or {}
   local visual_style = utils.safe_string(source.visual_style, "minimal"):lower()
   if visual_style ~= "minimal" and visual_style ~= "classic" then
     visual_style = "minimal"
   end
+  local show_code_context = source.show_code_context ~= false
   return {
     visual_style = visual_style,
     max_body_lines = sanitize_positive_integer(source.max_body_lines, 8, 2, 80),
     max_events = sanitize_positive_integer(source.max_events, 120, 20, 500),
-    show_code_context = source.show_code_context ~= false,
+    show_code_context = show_code_context,
+    threads = sanitize_activity_threads_opts(source, show_code_context),
   }
 end
 local function new_payload()
@@ -83,6 +124,42 @@ local function add_action_line(payload, text, highlight, action, hint)
     add_span(payload, row, hint_start, hint_start + #hint_text, "GhPrOverviewMuted")
   end
   return row
+end
+
+local function separator_text(character, length)
+  local token = sanitize_separator_value(character, "─")
+  local width = sanitize_positive_integer(length, 1, 1, 400)
+  return token:rep(width)
+end
+
+local function add_separator_line(payload, indent, character, length, highlight)
+  return add_line(payload, utils.safe_string(indent, "") .. separator_text(character, length), highlight)
+end
+
+local function append_payload(target, source)
+  if type(target) ~= "table" or type(source) ~= "table" then
+    return target
+  end
+
+  local line_offset = #target.lines
+  for _, line in ipairs(type(source.lines) == "table" and source.lines or {}) do
+    target.lines[#target.lines + 1] = line
+  end
+
+  for _, item in ipairs(type(source.highlights) == "table" and source.highlights or {}) do
+    target.highlights[#target.highlights + 1] = {
+      line = (tonumber(item.line) or 1) + line_offset,
+      start_col = tonumber(item.start_col) or 0,
+      end_col = tonumber(item.end_col) or -1,
+      group = item.group,
+    }
+  end
+
+  for line, action in pairs(type(source.actions) == "table" and source.actions or {}) do
+    target.actions[(tonumber(line) or 1) + line_offset] = action
+  end
+
+  return target
 end
 
 local function normalize_show_flags(session)
@@ -335,7 +412,7 @@ local function pick_thread_focus_index(parsed, thread)
   return nil
 end
 
-local function trim_diff_hunk(thread, diff_hunk, context_before, context_after)
+local function trim_diff_hunk(thread, diff_hunk, context_before, context_after, max_lines)
   local source_lines = utils.split_lines(diff_hunk)
   if vim.tbl_isempty(source_lines) then
     return {}
@@ -349,6 +426,19 @@ local function trim_diff_hunk(thread, diff_hunk, context_before, context_after)
 
   local start_index = math.max(1, focus_index - context_before)
   local end_index = math.min(#source_lines, focus_index + context_after)
+  if type(max_lines) == "number" and max_lines > 0 and (end_index - start_index + 1) > max_lines then
+    local before = math.floor((max_lines - 1) / 2)
+    local after = math.max(0, max_lines - before - 1)
+    start_index = math.max(1, focus_index - before)
+    end_index = math.min(#source_lines, focus_index + after)
+    local visible = end_index - start_index + 1
+    if visible < max_lines and start_index > 1 then
+      start_index = math.max(1, start_index - (max_lines - visible))
+    end
+    if (end_index - start_index + 1) > max_lines then
+      end_index = start_index + max_lines - 1
+    end
+  end
   local result = {}
 
   if start_index > 1 then
@@ -471,50 +561,58 @@ local function snippet_code_lines(source_lines, side)
 end
 
 local function render_thread_code_context(payload, session, thread, indent)
-  local before = tonumber(session.thread_snippet and session.thread_snippet.context_before) or 5
-  local after = tonumber(session.thread_snippet and session.thread_snippet.context_after) or 5
+  local activity = type(session.activity) == "table" and session.activity or {}
+  local thread_opts = type(activity.threads) == "table" and activity.threads or {}
+  local diff_opts = type(thread_opts.diff) == "table" and thread_opts.diff or {}
+  if diff_opts.enabled == false then
+    return
+  end
+
+  local before = tonumber(diff_opts.context_before)
+  if type(before) ~= "number" then
+    before = tonumber(session.thread_snippet and session.thread_snippet.context_before) or 5
+  end
+  local after = tonumber(diff_opts.context_after)
+  if type(after) ~= "number" then
+    after = tonumber(session.thread_snippet and session.thread_snippet.context_after) or 5
+  end
+  local max_lines = tonumber(diff_opts.max_lines) or 12
   local diff_hunk = utils.safe_string(thread.diff_hunk, "")
-  local snippet = trim_diff_hunk(thread, diff_hunk, before, after)
+  local snippet = trim_diff_hunk(thread, diff_hunk, before, after, max_lines)
   if vim.tbl_isempty(snippet) then
     return
   end
 
-  local side = utils.safe_string(thread.side, "head"):lower()
-  if side == "left" or side == "base" then
-    side = "base"
-  else
-    side = "head"
-  end
-  local language = resolve_thread_snippet_language(thread.path)
-  local code_lines = snippet_code_lines(snippet, side)
-  if vim.tbl_isempty(code_lines) then
-    language = "diff"
-    code_lines = snippet
-  end
-
-  add_line(payload, indent .. string.format("code context (%s, %s)", language, side), "GhPrOverviewMuted")
-  add_line(payload, indent .. "```" .. language)
-  for _, line in ipairs(code_lines) do
+  add_line(payload, indent .. "```diff", "GhPrOverviewMarkdownCodeFence")
+  for _, line in ipairs(snippet) do
     add_line(payload, indent .. line)
   end
-  add_line(payload, indent .. "```")
+  add_line(payload, indent .. "```", "GhPrOverviewMarkdownCodeFence")
 end
 
-local function thread_default_expanded(thread)
-  return not (thread.is_resolved == true or thread.is_outdated == true)
+local function thread_default_expanded(session, thread)
+  local activity = type(session.activity) == "table" and session.activity or {}
+  local threads = type(activity.threads) == "table" and activity.threads or {}
+  if thread.is_resolved == true and threads.collapse_resolved ~= false then
+    return false
+  end
+  if thread.is_outdated == true and threads.collapse_outdated ~= false then
+    return false
+  end
+  return true
 end
 
 local function thread_expanded(session, thread)
   local thread_id = utils.safe_string(thread.id, "")
   if thread_id == "" then
-    return thread_default_expanded(thread)
+    return thread_default_expanded(session, thread)
   end
   local folds = type(session.activity_folds) == "table" and session.activity_folds or {}
   local override = folds[thread_id]
   if type(override) == "boolean" then
     return override
   end
-  return thread_default_expanded(thread)
+  return thread_default_expanded(session, thread)
 end
 
 local function normalized_side(value)
@@ -717,10 +815,12 @@ local function thread_comment_menu_action(session, thread, comment)
   end
 
   local author = utils.safe_string(comment.author, "unknown")
+  local default_action = evolution_action or fix_action or location_action
   return {
     kind = "thread_comment_menu",
     title = string.format("Thread comment actions (@%s)", author),
     options = options,
+    default_action = default_action,
   }
 end
 local function event_action(event)
@@ -1198,6 +1298,11 @@ local function thread_status_suffix(thread)
   return " [" .. table.concat(flags, ", ") .. "]"
 end
 
+local function activity_thread_opts(session)
+  local activity = type(session.activity) == "table" and session.activity or {}
+  return type(activity.threads) == "table" and activity.threads or {}
+end
+
 local function thread_location_text(thread)
   local location = utils.safe_string(thread.path, "(unknown path)")
   if tonumber(thread.line) and thread.line > 0 then
@@ -1213,6 +1318,15 @@ local function thread_comment_meta(comment, date_format)
     return string.format("%s [%s]", when, state)
   end
   return when
+end
+
+local function thread_comment_location_text(thread, comment)
+  local path = utils.safe_string(type(comment) == "table" and comment.path or "", utils.safe_string(thread.path, "(unknown path)"))
+  local line = positive_line(type(comment) == "table" and comment.line or nil, type(comment) == "table" and comment.original_line or nil)
+  if type(line) == "number" then
+    return string.format("%s:%d", path, line)
+  end
+  return path
 end
 
 local function build_thread_open_payload(session, thread)
@@ -1280,43 +1394,119 @@ local function build_thread_open_payload(session, thread)
   }
 end
 
-local function render_activity_thread_classic(session, payload, thread)
-  local prefix = "### Thread"
+local function build_thread_toggle_action(session, thread)
+  return {
+    kind = "toggle_activity_thread",
+    thread_id = utils.safe_string(thread.id, ""),
+    default_expanded = thread_default_expanded(session, thread),
+    open_action = {
+      kind = "open_activity_thread_workspace",
+      payload = build_thread_open_payload(session, thread),
+    },
+  }
+end
+
+local function thread_fold_marker(expanded)
+  if expanded then
+    return "[-]"
+  end
+  return "[+]"
+end
+
+local function thread_header_text(session, thread, expanded)
+  local marker = thread_fold_marker(expanded)
   local location = thread_location_text(thread) .. thread_status_suffix(thread)
   local comments_count = #(type(thread.comments) == "table" and thread.comments or {})
-  local thread_action = {
-    kind = "open_activity_thread_workspace",
-    payload = build_thread_open_payload(session, thread),
-  }
+  if activity_visual_style(session) == "classic" then
+    return string.format("### %s Thread | %s | %d comments", marker, location, comments_count)
+  end
+  return string.format("%s thread %s (%d)", marker, location, comments_count)
+end
+
+local function thread_comment_diff_action(comment_action)
+  if type(comment_action) ~= "table" then
+    return nil
+  end
+  if type(comment_action.default_action) == "table" then
+    return comment_action.default_action
+  end
+  return comment_action
+end
+
+local function render_thread_comment_block(session, payload, thread, comment, index)
+  if type(comment) ~= "table" then
+    return
+  end
+
+  local thread_opts = activity_thread_opts(session)
+  local diff_opts = type(thread_opts.diff) == "table" and thread_opts.diff or {}
+  local is_reply = index > 1
+  local indent = "  "
+  if is_reply then
+    indent = indent .. string.rep(" ", tonumber(thread_opts.reply_indent) or 2)
+  end
+  local body_indent = indent .. "  "
+  local comment_action = thread_comment_menu_action(session, thread, comment)
+  local diff_action = thread_comment_diff_action(comment_action)
+  local location = thread_comment_location_text(thread, comment)
+  local role_label = is_reply and "reply" or "comment"
+
+  if index > 1 then
+    add_separator_line(payload, indent, thread_opts.separator_char, math.max(12, (thread_opts.separator_length or 54) - 10), "GhPrOverviewThreadCommentSeparator")
+  end
 
   add_action_line(
     payload,
-    string.format("%s | %s | %d comments", prefix, location, comments_count),
-    "GhPrOverviewTimelineThread",
-    thread_action,
-    "· <CR> open diff"
+    string.format("%s@%s  %s  %s  %s", indent, utils.safe_string(comment.author, "unknown"), thread_comment_meta(comment, session.date_format), location, role_label),
+    "GhPrOverviewThreadCommentMeta",
+    comment_action,
+    "· <CR> actions · D open diff"
   )
+  append_limited_body(payload, utils.safe_string(comment.body, ""), session.activity.max_body_lines, body_indent)
+
+  local diff_hunk = utils.safe_string(comment.diff_hunk, utils.safe_string(thread.diff_hunk, ""))
+  if diff_opts.enabled ~= false and diff_hunk ~= "" then
+    add_separator_line(payload, body_indent, diff_opts.separator_char, diff_opts.separator_length, "GhPrOverviewThreadDiffSeparator")
+    add_action_line(payload, body_indent .. "diff", "GhPrOverviewMuted", diff_action, "· D open diff")
+    render_thread_code_context(payload, session, {
+      path = utils.safe_string(comment.path, thread.path),
+      side = utils.safe_string(comment.side, thread.side),
+      line = tonumber(comment.line) or tonumber(thread.line),
+      original_line = tonumber(comment.original_line) or tonumber(thread.original_line),
+      diff_hunk = diff_hunk,
+    }, body_indent)
+  end
+end
+
+local function render_activity_thread_classic(session, payload, thread)
+  local thread_opts = activity_thread_opts(session)
+  local expanded = thread_expanded(session, thread)
+  add_separator_line(payload, "", thread_opts.separator_char, thread_opts.separator_length, "GhPrOverviewThreadSeparator")
+  add_action_line(payload, thread_header_text(session, thread, expanded), "GhPrOverviewTimelineThread", build_thread_toggle_action(session, thread), "· <CR> toggle · D open diff")
+  if not expanded then
+    add_line(payload, "")
+    return
+  end
+
+  for index, comment in ipairs(type(thread.comments) == "table" and thread.comments or {}) do
+    render_thread_comment_block(session, payload, thread, comment, index)
+  end
   add_line(payload, "")
 end
 
 local function render_activity_thread_minimal(session, payload, thread)
-  local indicator = ">"
-  local location = thread_location_text(thread)
-  local suffix = thread_status_suffix(thread)
-  local comments_count = #(type(thread.comments) == "table" and thread.comments or {})
-  local thread_action = {
-    kind = "open_activity_thread_workspace",
-    payload = build_thread_open_payload(session, thread),
-  }
+  local thread_opts = activity_thread_opts(session)
+  local expanded = thread_expanded(session, thread)
+  add_separator_line(payload, "", thread_opts.separator_char, thread_opts.separator_length, "GhPrOverviewThreadSeparator")
+  add_action_line(payload, thread_header_text(session, thread, expanded), "GhPrOverviewTimelineThread", build_thread_toggle_action(session, thread), "· <CR> toggle · D open diff")
+  if not expanded then
+    add_line(payload, "")
+    return
+  end
 
-  add_action_line(
-    payload,
-    string.format("%s thread %s%s (%d)", indicator, location, suffix, comments_count),
-    "GhPrOverviewTimelineThread",
-    thread_action,
-    "· <CR> open diff"
-  )
-
+  for index, comment in ipairs(type(thread.comments) == "table" and thread.comments or {}) do
+    render_thread_comment_block(session, payload, thread, comment, index)
+  end
   add_line(payload, "")
 end
 
@@ -1425,6 +1615,18 @@ local function render_activity(session)
 
   return payload
 end
+
+local function render_summary_with_activity(session)
+  local payload = render_summary(session)
+  local activity_payload = render_activity(session)
+
+  if #payload.lines > 0 and payload.lines[#payload.lines] ~= "" and #activity_payload.lines > 0 then
+    add_line(payload, "")
+  end
+
+  return append_payload(payload, activity_payload)
+end
+
 local function render_meta(session)
   local payload = new_payload()
   local model = session.model or {}
@@ -1548,11 +1750,9 @@ end
 
 function M.render(session)
   return {
-    summary = render_summary(session),
-    activity = render_activity(session),
+    summary = render_summary_with_activity(session),
     meta = render_meta(session),
   }
 end
 
 return M
-

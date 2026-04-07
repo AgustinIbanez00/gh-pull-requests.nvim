@@ -159,6 +159,22 @@ local defaults = {
         max_body_lines = 8,
         max_events = 120,
         show_code_context = true,
+        threads = {
+          collapse_resolved = true,
+          collapse_outdated = true,
+          separator_char = "─",
+          separator_length = 54,
+          reply_indent = 2,
+          diff = {
+            enabled = true,
+            style = "snippet",
+            context_before = 2,
+            context_after = 2,
+            max_lines = 12,
+            separator_char = "─",
+            separator_length = 38,
+          },
+        },
       },
       keymaps = {
         cycle_next = "<Tab>",
@@ -236,6 +252,9 @@ local defaults = {
     debug = {
       codediff_failures = false,
     },
+    pr_explorer = {
+      enabled = true,
+    },
     whitespace = {
       tab = ">-",
       space = ".",
@@ -259,7 +278,7 @@ local defaults = {
       height_ratio = 0.28,
       min_height = 8,
       max_height = 18,
-      follow_cursor = true,
+      follow_cursor = false,
       show_resolved = true,
       show_outdated = true,
       close_with_dq = true,
@@ -819,6 +838,75 @@ local function sanitize_overview(overview)
   if type(result.panes.activity.show_code_context) ~= "boolean" then
     result.panes.activity.show_code_context = defaults.overview.panes.activity.show_code_context
   end
+  result.panes.activity.threads = type(result.panes.activity.threads) == "table" and result.panes.activity.threads or {}
+  if type(result.panes.activity.threads.collapse_resolved) ~= "boolean" then
+    result.panes.activity.threads.collapse_resolved = defaults.overview.panes.activity.threads.collapse_resolved
+  end
+  if type(result.panes.activity.threads.collapse_outdated) ~= "boolean" then
+    result.panes.activity.threads.collapse_outdated = defaults.overview.panes.activity.threads.collapse_outdated
+  end
+  if type(result.panes.activity.threads.separator_char) ~= "string"
+    or result.panes.activity.threads.separator_char == "" then
+    result.panes.activity.threads.separator_char = defaults.overview.panes.activity.threads.separator_char
+  end
+  result.panes.activity.threads.separator_length = sanitize_positive_integer(
+    result.panes.activity.threads.separator_length,
+    defaults.overview.panes.activity.threads.separator_length
+  )
+  if result.panes.activity.threads.separator_length > 200 then
+    result.panes.activity.threads.separator_length = defaults.overview.panes.activity.threads.separator_length
+  end
+  result.panes.activity.threads.reply_indent = sanitize_positive_integer(
+    result.panes.activity.threads.reply_indent,
+    defaults.overview.panes.activity.threads.reply_indent
+  )
+  if result.panes.activity.threads.reply_indent > 12 then
+    result.panes.activity.threads.reply_indent = defaults.overview.panes.activity.threads.reply_indent
+  end
+  result.panes.activity.threads.diff = type(result.panes.activity.threads.diff) == "table"
+      and result.panes.activity.threads.diff
+    or {}
+  if type(result.panes.activity.threads.diff.enabled) ~= "boolean" then
+    result.panes.activity.threads.diff.enabled = result.panes.activity.show_code_context
+  end
+  if type(result.panes.activity.threads.diff.style) == "string" then
+    result.panes.activity.threads.diff.style = result.panes.activity.threads.diff.style:lower()
+  end
+  if result.panes.activity.threads.diff.style ~= "snippet" then
+    result.panes.activity.threads.diff.style = defaults.overview.panes.activity.threads.diff.style
+  end
+  result.panes.activity.threads.diff.context_before = sanitize_non_negative_integer(
+    result.panes.activity.threads.diff.context_before,
+    defaults.overview.panes.activity.threads.diff.context_before
+  )
+  result.panes.activity.threads.diff.context_after = sanitize_non_negative_integer(
+    result.panes.activity.threads.diff.context_after,
+    defaults.overview.panes.activity.threads.diff.context_after
+  )
+  if result.panes.activity.threads.diff.context_before > 200 then
+    result.panes.activity.threads.diff.context_before = defaults.overview.panes.activity.threads.diff.context_before
+  end
+  if result.panes.activity.threads.diff.context_after > 200 then
+    result.panes.activity.threads.diff.context_after = defaults.overview.panes.activity.threads.diff.context_after
+  end
+  result.panes.activity.threads.diff.max_lines = sanitize_positive_integer(
+    result.panes.activity.threads.diff.max_lines,
+    defaults.overview.panes.activity.threads.diff.max_lines
+  )
+  if result.panes.activity.threads.diff.max_lines > 80 then
+    result.panes.activity.threads.diff.max_lines = defaults.overview.panes.activity.threads.diff.max_lines
+  end
+  if type(result.panes.activity.threads.diff.separator_char) ~= "string"
+    or result.panes.activity.threads.diff.separator_char == "" then
+    result.panes.activity.threads.diff.separator_char = defaults.overview.panes.activity.threads.diff.separator_char
+  end
+  result.panes.activity.threads.diff.separator_length = sanitize_positive_integer(
+    result.panes.activity.threads.diff.separator_length,
+    defaults.overview.panes.activity.threads.diff.separator_length
+  )
+  if result.panes.activity.threads.diff.separator_length > 200 then
+    result.panes.activity.threads.diff.separator_length = defaults.overview.panes.activity.threads.diff.separator_length
+  end
 
   result.panes.keymaps = type(result.panes.keymaps) == "table" and result.panes.keymaps or {}
   if type(result.panes.keymaps.cycle_next) ~= "string" then
@@ -1360,6 +1448,11 @@ local function sanitize_diff_view(diff_view, raw_diff_view)
   result.debug = type(result.debug) == "table" and result.debug or {}
   if type(result.debug.codediff_failures) ~= "boolean" then
     result.debug.codediff_failures = defaults.diff_view.debug.codediff_failures
+  end
+
+  result.pr_explorer = type(result.pr_explorer) == "table" and result.pr_explorer or {}
+  if type(result.pr_explorer.enabled) ~= "boolean" then
+    result.pr_explorer.enabled = defaults.diff_view.pr_explorer.enabled
   end
 
   result.whitespace = type(result.whitespace) == "table" and result.whitespace or {}

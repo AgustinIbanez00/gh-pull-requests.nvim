@@ -83,14 +83,6 @@ local function safe_set_width(winid, width)
   pcall(vim.api.nvim_win_set_width, winid, value)
 end
 
-local function safe_set_height(winid, height)
-  if not utils.valid_win(winid) then
-    return
-  end
-  local value = math.max(1, math.floor(tonumber(height) or 1))
-  pcall(vim.api.nvim_win_set_height, winid, value)
-end
-
 local function apply_dimensions(windows, layout_opts)
   if not M.windows_valid(windows) then
     return
@@ -116,28 +108,6 @@ local function apply_dimensions(windows, layout_opts)
 
   safe_set_width(windows.meta, sidebar_width)
   safe_set_width(windows.summary, left_width)
-  safe_set_width(windows.activity, left_width)
-
-  local summary_height = vim.api.nvim_win_get_height(windows.summary)
-  local activity_height = vim.api.nvim_win_get_height(windows.activity)
-  local total_left_height = math.max(1, summary_height + activity_height)
-
-  local preferred_summary_height = math.floor(total_left_height * layout_opts.summary_height_ratio)
-  local max_summary_height = math.max(layout_opts.min_summary_height, total_left_height - layout_opts.min_activity_height)
-  summary_height = utils.clamp(preferred_summary_height, layout_opts.min_summary_height, max_summary_height)
-  activity_height = total_left_height - summary_height
-
-  if activity_height < layout_opts.min_activity_height then
-    activity_height = layout_opts.min_activity_height
-    summary_height = math.max(layout_opts.min_summary_height, total_left_height - activity_height)
-  end
-  if summary_height < layout_opts.min_summary_height then
-    summary_height = layout_opts.min_summary_height
-    activity_height = math.max(layout_opts.min_activity_height, total_left_height - summary_height)
-  end
-
-  safe_set_height(windows.summary, summary_height)
-  safe_set_height(windows.activity, activity_height)
 end
 
 local function restore_previous_location(tabpage, winid)
@@ -153,7 +123,7 @@ function M.windows_valid(windows)
   if type(windows) ~= "table" then
     return false
   end
-  return utils.valid_win(windows.summary) and utils.valid_win(windows.activity) and utils.valid_win(windows.meta)
+  return utils.valid_win(windows.summary) and utils.valid_win(windows.meta)
 end
 
 function M.open_windows(buffers, _window_opts, layout_opts, focus_role)
@@ -171,20 +141,14 @@ function M.open_windows(buffers, _window_opts, layout_opts, focus_role)
   local meta_win = vim.api.nvim_get_current_win()
   set_window_buffer(meta_win, buffers.meta)
 
-  vim.api.nvim_set_current_win(summary_win)
-  vim.cmd("belowright split")
-  local activity_win = vim.api.nvim_get_current_win()
-  set_window_buffer(activity_win, buffers.activity)
-
   local windows = {
     summary = summary_win,
-    activity = activity_win,
     meta = meta_win,
   }
 
   apply_dimensions(windows, layout_opts)
 
-  for _, role in ipairs({ "summary", "activity", "meta" }) do
+  for _, role in ipairs({ "summary", "meta" }) do
     utils.ensure_window_options(windows[role])
   end
 

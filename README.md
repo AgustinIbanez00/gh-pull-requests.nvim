@@ -45,7 +45,7 @@ Quick links: [Installation](#installation) · [Quick Start](#quick-start) · [Co
 
 ### 📝 Overview + Activity
 
-- Multi-pane overview (Summary + Activity + Collaboration).
+- Two-pane overview (Summary + embedded Activity, plus Collaboration).
 - Overview panes open in a dedicated tabpage using normal windows (not fullscreen float popups).
 - Summary embeds a chronological activity stream (comments, reviews, commits, thread comments, PR state changes).
 - Open commit diffs from overview without checkout (`codediff` backend).
@@ -232,29 +232,39 @@ Validation prerequisites:
       panes = {
         layout = {
           sidebar_width_ratio = 0.34, -- right panel width ratio
-          summary_height_ratio = 0.38, -- top-left panel height ratio
           gap = 1, -- compatibility spacing option for pane layout
           min_left_width = 58,
           min_sidebar_width = 30,
-          min_summary_height = 10,
-          min_activity_height = 12,
         },
         activity = {
           visual_style = "minimal", -- "minimal" | "classic"
           max_body_lines = 8, -- max body lines per event/comment block
-          max_events = 120, -- max rendered timeline events in activity pane
-          show_code_context = true, -- render diffHunk snippet in thread blocks
+          max_events = 120, -- max rendered timeline events in embedded activity stream
+          show_code_context = true, -- compatibility alias for threads.diff.enabled
+          threads = {
+            collapse_resolved = true, -- resolved threads start collapsed
+            collapse_outdated = true, -- outdated threads start collapsed
+            separator_char = "─", -- repeated between thread cards
+            separator_length = 54,
+            reply_indent = 2, -- extra spaces for replies inside a thread
+            diff = {
+              enabled = true, -- render inline diff snippets per comment
+              style = "snippet", -- currently "snippet"
+              context_before = 2,
+              context_after = 2,
+              max_lines = 12,
+              separator_char = "─",
+              separator_length = 38,
+            },
+          },
         },
         keymaps = {
           cycle_next = "<Tab>",
           cycle_prev = "<S-Tab>",
           focus_summary = "g1",
-          focus_activity = "g2",
           focus_meta = "g3",
           help = "?",
           focus_left = "<C-h>",
-          focus_down = "<C-j>",
-          focus_up = "<C-k>",
           focus_right = "<C-l>",
         },
       },
@@ -308,7 +318,7 @@ Validation prerequisites:
         comments = true,
         reviews = true,
         threads = true,
-        pr_changes = true, -- show PR metadata/state change events inside Summary > Activity
+        pr_changes = true, -- show PR metadata/state change events inside the embedded Summary activity stream
         labels = true,
       },
     },
@@ -349,6 +359,9 @@ Validation prerequisites:
       render_endlines = false, -- render LF/CRLF/CR markers at EOL
       debug = {
         codediff_failures = false, -- when true, show debug notifications for codediff errors/fallback decisions and review prefetch activity
+      },
+      pr_explorer = {
+        enabled = true, -- reuse a local codediff explorer for compatible PR file diffs
       },
       whitespace = {
         tab = ">-", -- symbol for leading/trailing tabs
@@ -405,7 +418,7 @@ Validation prerequisites:
         height_ratio = 0.28, -- bottom Neo-tree diff comments pane height (also used by the legacy fallback panel)
         min_height = 8, -- bottom Neo-tree diff comments pane minimum height
         max_height = 18, -- bottom Neo-tree diff comments pane maximum height
-        follow_cursor = true,
+        follow_cursor = false, -- deprecated/no-op; comment navigation now only happens on explicit open actions
         show_resolved = true,
         show_outdated = true,
         close_with_dq = true,
@@ -564,7 +577,7 @@ Compatibility aliases kept for user-facing behavior:
 | `:GhPrOpen` | Focus/open PR UI (idempotent; Neo-tree first, Telescope fallback) | Start or refocus a PR browsing session |
 | `:GhPrStartReview [number]` | Start review flow for selected PR | Enter review workspace quickly and warm textual diffs in background |
 | `:GhPrReviewTree` | Toggle PR Review source | Jump between list and review tree |
-| `:GhPrOverview` | Open active PR overview panes | Inspect summary/activity/collaboration |
+| `:GhPrOverview` | Open active PR overview panes | Inspect summary/activity and collaboration |
 | `:GhPrOpenDiff` | Open selected file diff or non-text preview | Review code and assets |
 | `:GhPrOpenCommitPatch` | Open selected commit diff in codediff | Inspect commit-level changes |
 | `:GhPrToggleReviewed` | Toggle viewed state | Track reviewed files |
@@ -586,7 +599,7 @@ Compatibility aliases kept for user-facing behavior:
 - `:GhPrReviewTree` toggle PR Review source.
 - `:GhPrRefresh` refresh data.
 - `:GhPRReviewRefresh` force refresh active PR Review data in background (alias: `:GhPrReviewRefresh`).
-- `:GhPrOverview` open active PR overview panes (Summary/Activity/Collaboration).
+- `:GhPrOverview` open active PR overview panes (Summary + Activity / Collaboration).
 - `:GhPrOverviewV2` alias of `:GhPrOverview` (kept for compatibility).
 - `:GhPrOverviewRefresh` refresh active overview panes.
 - `:GhPrOverviewV2Refresh` alias of `:GhPrOverviewRefresh` (kept for compatibility).
@@ -755,10 +768,10 @@ Inside the overview buffer:
 - state row uses direct toggle (`open`/`closed`) with confirmation
 - draft row uses direct toggle (`ready`/`draft`) with confirmation
 - `<CR>` on `Commits` opens the full commit diff in codediff (or legacy virtual fallback if selected for this session)
-- `<CR>` on `Summary > Activity` thread headers opens evolution diff for that thread file (comment commit -> latest file)
+- `<CR>` on `Summary > Activity` thread headers toggles collapsed/expanded state
 - `gp` preview markdown link under cursor in PR description
 - `gr` load more for current section tab (`Summary` loads more Activity)
-- `D` open diff for selected row (file or commit)
+- `D` open diff or secondary action for the selected row
 - `O` open original file for selected file row
 - `M` open modified file for selected file row
 - Every overview edit asks confirmation before execution and refreshes the overview on success.
@@ -778,33 +791,37 @@ Inside the overview buffer:
 - `Summary` no longer renders the old `Actions` block.
 - `Summary > Activity` includes commit upload events and PR change events (labels/review requests/assignees/milestones/title/base-ref/draft/ready/close/reopen/merge/force-push).
 - Commit events in `Summary > Activity` can be opened with `<CR>` to view commit diff.
-- `Summary > Activity` thread rows are rendered header-only for low-noise navigation.
-- `<CR>` on a thread header opens compare diff from the thread comment commit to the latest file version in the PR.
+- `Summary > Activity` threads render as collapsible cards with separators, reply indentation, and inline `diff` snippets focused on the commented lines.
+- Open threads render expanded by default; resolved and outdated threads render collapsed by default.
+- `<CR>` on a thread header toggles the fold, and `D` opens the thread diff/workspace directly.
 - If inline patch resolution fails, `overview.thread_fix_diff.fallback_to_buffer = true` falls back to legacy diff buffers.
 - `,x` toggle PR Review source while staying in review flow.
 - gh-pr UI windows (overview panes, popups and composer) force `nospell` without affecting regular file buffers.
 
 Inside overview panes (`:GhPrOverview`, alias `:GhPrOverviewV2`):
-- Panes are rendered in one dedicated tabpage with three normal windows (Summary/Activity/Collaboration).
+- Panes are rendered in one dedicated tabpage with two normal windows (Summary+Activity/Collaboration).
 - `a`/`d`/`c`/`m`/`k`/`b` keep the same review/browser actions.
-- `<CR>` executes the action under cursor in the focused pane.
+- `<CR>` toggles embedded activity thread headers and keeps the previous open/edit behavior for the rest of the rows.
+- `D` opens the diff or secondary action for the selected embedded activity item.
+- `<CR>` executes the action under cursor in the focused pane when the row is not a thread header.
 - `<CR>` on metadata rows handles PR edits contextually (title/description/state/draft/labels/reviewers/assignees/milestone).
 - `<CR>` on `## Description` heading opens multiline composer (preloaded text, `<C-s>` submit, `q`/`<Esc>` cancel).
 - `<CR>` on description link lines previews GitHub attachments or confirms browser-open for non-attachment links (multiple links => selector).
-- `<CR>` on `Activity` thread headers opens compare diff from the thread comment commit to the latest file version.
-- `gr` loads more activity events.
+- `gr` loads more activity events inside `Summary`.
 - `?` opens floating shortcuts help.
 - `<Tab>` / `<S-Tab>` cycle panes.
-- `g1` / `g2` / `g3` focus Summary / Activity / Collaboration.
-- `<C-h>`/`<C-j>`/`<C-k>`/`<C-l>` switch focus between Summary/Activity/Collaboration panes.
-- `<C-w>w` / `<C-w>W` cycle panes, `<C-w>h/j/k/l` focus Summary/Activity/Summary/Collaboration.
+- `g1` / `g3` focus Summary / Collaboration.
+- `<C-h>` / `<C-l>` switch focus between Summary / Collaboration panes.
+- `<C-w>w` / `<C-w>W` cycle panes, `<C-w>h/l` focus Summary/Collaboration.
 
 Diff backend behavior:
 - gh-pr uses `codediff.nvim` as the primary backend for `Files`, `Commits`, overview diff actions, and comment/thread location opens.
 - For PR/commit file diffs, gh-pr downloads base/head content from GitHub and opens codediff without git fetch.
 - Starting or refreshing an active PR review warms textual PR file pairs in the background under the codediff temp cache, so later diff opens reuse local temp files.
+- With `diff_view.pr_explorer.enabled = true` (default), compatible PR text-file opens reuse a local codediff explorer session for the active PR snapshot, so later file switches stay local and faster.
 - Text PR/commit file diffs stay in codediff whenever `diff_view.mode` is `vertical` or `unified` and `diff_view.ignore_whitespace_mode` is `none` or `trim` (or the legacy `ignore_whitespace = true|false` alias mapped to `trim|none`).
 - `vertical + none|trim` opens codediff side-by-side, `unified + none|trim` opens codediff inline, and `horizontal` or whitespace modes `eol` / `blank_lines` are rendered through gh-pr's virtual diff backend.
+- PR explorer mode applies only to compatible textual PR files; image/binary files and virtual-only layouts still use the existing non-text or virtual fallback paths.
 - Legacy persisted/configured `ignore_whitespace_mode = "all"` is coerced to `trim` on load so older state keeps working without silently falling back to `none`.
 - `render_whitespace` and `render_endlines` remain virtual-backend-only markers; codediff buffers show that those markers are unavailable there.
 - codediff windows opened by gh-pr force `number = true` and `relativenumber = true`.
@@ -816,7 +833,7 @@ Diff backend behavior:
 - Inline comments/suggestions and diff comments panel are available in codediff file diffs; codediff inline/unified buffers use the modified side for inline actions.
 - Line comment indicators/authors are rendered in codediff side-by-side, codediff inline, and gh-pr virtual unified text diffs.
 - When Neo-tree is available, `<localleader>C` opens a temporary bottom comments tree scoped to the current diff file (`thread -> comment`) and isolated from the other Neo-tree sources; set `diff_view.comments_panel.position = "right"` if you prefer a side pane. Otherwise gh-pr falls back to the legacy bottom panel.
-- The diff comments UI renders lazily after codediff opens and only loads comments for the current file in the background.
+- The diff comments UI renders lazily after codediff opens and only loads comments for the current file in the background. If the panel is already open, gh-pr keeps it visible, shows a muted `Loading comments for ...` state for the new file, and refreshes it without moving focus or following comment nodes automatically.
 - In codediff and virtual text diff buffers, pressing `<CR>` on a commented line opens the existing line comments popup for that line.
 - Inside line/thread comment popups, `r` opens a reply composer, `R` opens a quoted reply composer, `x` resolves/unresolves the selected thread, `e` edits your selected comment, `D` deletes it, and `+` / `-` open the emoji reactions picker for published comments. Draft comments in the current pending review support edit/delete but not reactions yet. Replies are added to the current pending review.
 - Popup reaction summaries render emoji chips (`👍 2*`, `❤️ 1`, `🚀 3`) instead of raw GitHub enum names.

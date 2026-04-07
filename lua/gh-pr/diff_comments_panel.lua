@@ -7,6 +7,7 @@ local M = {}
 local sessions = {}
 local pending_requests = {}
 local request_counters = {}
+local render_namespace = vim.api.nvim_create_namespace("gh-pr-diff-comments-panel")
 
 local function valid_buf(bufnr)
   return type(bufnr) == "number" and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr)
@@ -358,7 +359,26 @@ local function build_comment_model(raw_threads, opts, pr_number, target_path, ta
   return model
 end
 
-local function apply_render(session, lines, actions)
+local function apply_muted_line_highlights(session, muted_lines)
+  if not valid_buf(session.bufnr) then
+    return
+  end
+
+  vim.api.nvim_buf_clear_namespace(session.bufnr, render_namespace, 0, -1)
+
+  for _, line in ipairs(type(muted_lines) == "table" and muted_lines or {}) do
+    local row = tonumber(line)
+    if row and row >= 1 then
+      local text = vim.api.nvim_buf_get_lines(session.bufnr, row - 1, row, false)[1] or ""
+      vim.api.nvim_buf_set_extmark(session.bufnr, render_namespace, row - 1, 0, {
+        end_col = #text,
+        hl_group = "GhPrDiffCommentsMuted",
+      })
+    end
+  end
+end
+
+local function apply_render(session, lines, actions, opts)
   if not valid_buf(session.bufnr) then
     return
   end
@@ -367,6 +387,7 @@ local function apply_render(session, lines, actions)
   vim.api.nvim_buf_set_lines(session.bufnr, 0, -1, false, lines)
   vim.bo[session.bufnr].modifiable = false
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = session.bufnr })
+  apply_muted_line_highlights(session, type(opts) == "table" and opts.muted_lines or nil)
 end
 
 local function header_lines(session)
@@ -385,7 +406,9 @@ end
 local function render_loading(session)
   local lines = header_lines(session)
   lines[#lines + 1] = string.format("Loading comments for %s...", session.target_path ~= "" and session.target_path or "current file")
-  apply_render(session, lines, {})
+  apply_render(session, lines, {}, {
+    muted_lines = { #lines },
+  })
 end
 
 local function render_error(session, err)
@@ -394,13 +417,21 @@ local function render_error(session, err)
   if type(err) == "string" and err ~= "" then
     lines[#lines + 1] = err
   end
-  apply_render(session, lines, {})
+  local muted_lines = {}
+  for line = 4, #lines do
+    muted_lines[#muted_lines + 1] = line
+  end
+  apply_render(session, lines, {}, {
+    muted_lines = muted_lines,
+  })
 end
 
 local function render_empty(session)
   local lines = header_lines(session)
   lines[#lines + 1] = "No comments for this file."
-  apply_render(session, lines, {})
+  apply_render(session, lines, {}, {
+    muted_lines = { #lines },
+  })
 end
 
 local function render_ready(session, model)
@@ -536,25 +567,6 @@ local function apply_keymaps(session)
     end
   end, "GH PR diff comments: close all/open review")
 
-  vim.api.nvim_create_autocmd("CursorMoved", {
-    buffer = session.bufnr,
-    callback = function()
-      if not panel_opts().follow_cursor or session.suspend_follow then
-        return
-      end
-      if not valid_win(session.winid) or vim.api.nvim_get_current_win() ~= session.winid then
-        return
-      end
-      local line = vim.api.nvim_win_get_cursor(session.winid)[1]
-      if line == session.last_line then
-        return
-      end
-      session.last_line = line
-      session.suspend_follow = true
-      jump(session, session.actions[line], true)
-      session.suspend_follow = false
-    end,
-  })
 end
 
 local function ensure_window(session, opts)

@@ -7,9 +7,12 @@ local virtual_files = require("gh-pr.virtual_files")
 local temp_state = {
   root = nil,
   file_cache = {},
+  remote_pair_cache = {},
   dir_cache = {},
+  pr_explorer_sessions = {},
   cleanup_attached = false,
   readonly_guard_attached = false,
+  pr_explorer_tracking_attached = false,
 }
 
 local IS_WINDOWS = package.config:sub(1, 1) == "\\"
@@ -113,6 +116,10 @@ end
 
 local function is_valid_tab(tabpage)
   return type(tabpage) == "number" and tabpage > 0 and vim.api.nvim_tabpage_is_valid(tabpage)
+end
+
+local function is_valid_win(winid)
+  return type(winid) == "number" and winid > 0 and vim.api.nvim_win_is_valid(winid)
 end
 
 local function sha256(value)
@@ -483,13 +490,79 @@ local function repository_identity(repository)
     return full_name
   end
 
-  local owner = safe_string(repository.owner)
+  full_name = safe_string(repository.nameWithOwner)
+  if full_name ~= "" then
+    return full_name
+  end
+
+  local owner = safe_string(type(repository.owner) == "table" and repository.owner.login or repository.owner)
   local name = safe_string(repository.name)
   if owner ~= "" and name ~= "" then
     return owner .. "/" .. name
   end
 
   return ""
+end
+
+local function file_lookup_candidates(file)
+  file = type(file) == "table" and file or {}
+  local candidates = {}
+  local seen = {}
+
+  local function add(path)
+    local normalized = sanitize_relative_path(path, "")
+    if normalized ~= "" and not seen[normalized] then
+      seen[normalized] = true
+      candidates[#candidates + 1] = normalized
+    end
+  end
+
+  add(file.path)
+  add(file.filename)
+  add(file.previous_filename)
+  add(file.previousFilename)
+
+  return candidates
+end
+
+local function build_pr_file_lookup(details)
+  local lookup = {}
+  for _, raw in ipairs(type(details) == "table" and type(details.files) == "table" and details.files or {}) do
+    if type(raw) == "table" then
+      for _, candidate in ipairs(file_lookup_candidates(raw)) do
+        if lookup[candidate] == nil then
+          lookup[candidate] = raw
+        end
+      end
+    end
+  end
+  return lookup
+end
+
+local function resolve_lookup_file(lookup, file_data)
+  lookup = type(lookup) == "table" and lookup or {}
+  file_data = type(file_data) == "table" and file_data or {}
+  for _, candidate in ipairs({
+    sanitize_relative_path(file_data.path, ""),
+    sanitize_relative_path(file_data.old_path, ""),
+  }) do
+    if candidate ~= "" and type(lookup[candidate]) == "table" then
+      return lookup[candidate]
+    end
+  end
+  return nil
+end
+
+local function pr_explorer_session_key(opts)
+  opts = type(opts) == "table" and opts or {}
+  local details = type(opts.details) == "table" and opts.details or {}
+  return table.concat({
+    "pr-explorer",
+    repository_identity(details.baseRepository),
+    tostring(tonumber(opts.pr_number) or tonumber(details.number) or 0),
+    safe_string(details.baseRefName),
+    safe_string(details.headRefName),
+  }, "|")
 end
 
 local function pair_side_cache_key(opts, data, side, relative_path)
@@ -550,7 +623,15 @@ local function prepare_pair_from_remote(opts)
     return nil, "Missing details/file payload for codediff open"
   end
 
-  local data, data_err = virtual_files.load_remote_file_pair(details, file)
+  local scope = pair_scope(opts)
+  local data = temp_state.remote_pair_cache[scope]
+  local data_err = nil
+  if type(data) ~= "table" then
+    data, data_err = virtual_files.load_remote_file_pair(details, file)
+    if type(data) == "table" then
+      temp_state.remote_pair_cache[scope] = data
+    end
+  end
   if not data then
     return nil, data_err or "Unable to load file content from GitHub"
   end
@@ -568,12 +649,20 @@ local function prepare_pair_from_remote_async(opts, callback)
     return
   end
 
+  local scope = pair_scope(opts)
+  local cached = temp_state.remote_pair_cache[scope]
+  if type(cached) == "table" then
+    callback(prepare_pair_from_data(opts, cached))
+    return
+  end
+
   virtual_files.load_remote_file_pair_async(details, file, function(data, data_err)
     if not data then
       callback(nil, data_err or "Unable to load file content from GitHub")
       return
     end
 
+    temp_state.remote_pair_cache[scope] = data
     callback(prepare_pair_from_data(opts, data))
   end)
 end
@@ -620,16 +709,52 @@ local function prepare_directory_snapshot(opts)
     return nil, "Unable to prepare codediff temporary directories"
   end
 
+  local target_candidates = {}
+  for _, candidate in ipairs(file_lookup_candidates({
+    path = opts.target_path,
+    filename = opts.target_path,
+  })) do
+    target_candidates[candidate] = true
+  end
+
+  local included = 0
+  local target_included = next(target_candidates) == nil
+
   for _, raw in ipairs(files) do
     local file = type(raw) == "table" and raw or {}
-    local data, data_err = virtual_files.load_remote_file_pair(details, file)
+    local matches_target = false
+    for _, candidate in ipairs(file_lookup_candidates(file)) do
+      if target_candidates[candidate] then
+        matches_target = true
+        break
+      end
+    end
+
+    local scope = pair_scope({
+      details = details,
+      file = file,
+    })
+    local data = temp_state.remote_pair_cache[scope]
+    local data_err = nil
+    if type(data) ~= "table" then
+      data, data_err = virtual_files.load_remote_file_pair(details, file)
+      if type(data) == "table" then
+        temp_state.remote_pair_cache[scope] = data
+      end
+    end
     if not data then
-      return nil, data_err or "Unable to load commit file content from GitHub"
+      if matches_target then
+        return nil, data_err or "Unable to load commit file content from GitHub"
+      end
+      goto continue
     end
 
     local textual_ok, textual_err = ensure_textual_remote_pair(data)
     if not textual_ok then
-      return nil, textual_err
+      if matches_target then
+        return nil, textual_err
+      end
+      goto continue
     end
 
     local file_mode = safe_string(data.file_mode)
@@ -658,6 +783,20 @@ local function prepare_directory_snapshot(opts)
         return nil, write_head_err
       end
     end
+
+    included = included + 1
+    if matches_target then
+      target_included = true
+    end
+
+    ::continue::
+  end
+
+  if included < 1 then
+    return nil, fallback_error("No textual files are available for codediff explorer.")
+  end
+  if not target_included then
+    return nil, "Selected file is unavailable in codediff PR explorer"
   end
 
   local prepared = {
@@ -665,10 +804,610 @@ local function prepare_directory_snapshot(opts)
     base_dir = base_dir,
     head_dir = head_dir,
     key = dir_key,
+    included = included,
   }
   temp_state.dir_cache[dir_key] = prepared
   ensure_cleanup_autocmd()
   return prepared, nil
+end
+
+local function resolve_tab_open_result(tabpage)
+  if not is_valid_tab(tabpage) then
+    return nil
+  end
+
+  local ok_lifecycle, lifecycle = pcall(require, "codediff.ui.lifecycle")
+  if not ok_lifecycle then
+    return nil
+  end
+
+  local session = lifecycle.get_session(tabpage)
+  if type(session) ~= "table" then
+    return nil
+  end
+
+  local base_buf = tonumber(session.original_bufnr)
+  local head_buf = tonumber(session.modified_bufnr)
+  if not is_valid_buf(base_buf) or not is_valid_buf(head_buf) then
+    return nil
+  end
+
+  return {
+    mode = "file",
+    tabpage = tabpage,
+    base_buf = base_buf,
+    head_buf = head_buf,
+    base_win = session.original_win,
+    head_win = session.modified_win,
+    base_path = safe_string(session.original_path),
+    head_path = safe_string(session.modified_path),
+    layout = session.layout == "inline" and "inline" or "side-by-side",
+    diff_result = type(session.stored_diff_result) == "table" and session.stored_diff_result or nil,
+  }
+end
+
+local function resolve_selected_file_paths(file)
+  file = type(file) == "table" and file or {}
+  local base_path = sanitize_relative_path(file.previous_filename or file.previousFilename or file.path or file.filename, "")
+  local head_path = sanitize_relative_path(file.path or file.filename, "")
+  return base_path, head_path
+end
+
+local function resolve_selected_relative_path(file)
+  file = type(file) == "table" and file or {}
+  return sanitize_relative_path(file.path or file.filename, "")
+end
+
+local function resolve_selected_file_mode(file)
+  local status = safe_string(type(file) == "table" and file.status or ""):lower()
+  if status == "added" or status == "a" then
+    return "added_single"
+  end
+  if status == "removed" or status == "d" then
+    return "removed_single"
+  end
+  return "diff_pair"
+end
+
+local function build_pending_focus(opts, target_path)
+  return {
+    target_side = opts.target_side,
+    target_line = opts.target_line,
+    target_original_line = opts.target_original_line,
+    target_path = sanitize_relative_path(target_path, ""),
+  }
+end
+
+local function consume_pending_focus(session, selected_file)
+  local pending_focus = type(session) == "table" and type(session.pending_focus) == "table"
+      and vim.deepcopy(session.pending_focus)
+    or {}
+  session.pending_focus = nil
+
+  if type(selected_file) ~= "table" then
+    pending_focus.target_line = nil
+    pending_focus.target_original_line = nil
+    pending_focus.target_path = nil
+    return pending_focus
+  end
+
+  local pending_path = sanitize_relative_path(pending_focus.target_path, "")
+  if pending_path ~= "" and pending_path ~= resolve_selected_relative_path(selected_file) then
+    pending_focus.target_side = nil
+    pending_focus.target_line = nil
+    pending_focus.target_original_line = nil
+  end
+  pending_focus.target_path = nil
+
+  return pending_focus
+end
+
+local function valid_pr_explorer_session(session)
+  if type(session) ~= "table" then
+    return false
+  end
+
+  if not is_valid_tab(tonumber(session.tabpage)) then
+    return false
+  end
+
+  if vim.fn.isdirectory(session.base_dir or "") ~= 1 or vim.fn.isdirectory(session.head_dir or "") ~= 1 then
+    return false
+  end
+
+  return true
+end
+
+local function current_pr_explorer_layout(tabpage)
+  local ok_lifecycle, lifecycle = pcall(require, "codediff.ui.lifecycle")
+  if not ok_lifecycle then
+    return nil
+  end
+  local session = lifecycle.get_session(tabpage)
+  if type(session) ~= "table" then
+    return nil
+  end
+  return session.layout == "inline" and "inline" or "side-by-side"
+end
+
+local function ensure_pr_explorer_layout(tabpage, layout)
+  local desired = normalize_layout(layout)
+  local current = current_pr_explorer_layout(tabpage)
+  if current == nil or current == desired then
+    return true, nil
+  end
+
+  local ok_view, view = pcall(require, "codediff.ui.view")
+  if not ok_view or type(view.toggle_layout) ~= "function" then
+    return nil, "Unable to toggle codediff PR explorer layout"
+  end
+
+  local ok_toggle, toggle_err = pcall(view.toggle_layout, tabpage)
+  if not ok_toggle then
+    return nil, tostring(toggle_err)
+  end
+
+  return true, nil
+end
+
+local function resolve_explorer_selection(explorer, relative_path)
+  explorer = type(explorer) == "table" and explorer or {}
+  local path = sanitize_relative_path(relative_path, "")
+  local status_result = type(explorer.status_result) == "table" and explorer.status_result or {}
+
+  local groups = {
+    { name = "conflicts", items = type(status_result.conflicts) == "table" and status_result.conflicts or {} },
+    { name = "unstaged", items = type(status_result.unstaged) == "table" and status_result.unstaged or {} },
+    { name = "staged", items = type(status_result.staged) == "table" and status_result.staged or {} },
+  }
+
+  for _, group in ipairs(groups) do
+    for _, raw in ipairs(group.items) do
+      local item = type(raw) == "table" and raw or {}
+      if sanitize_relative_path(item.path, "") == path then
+        local selection = vim.deepcopy(item)
+        selection.group = group.name
+        return selection
+      end
+    end
+  end
+
+  return nil
+end
+
+local function move_explorer_cursor_to_selection(explorer, selection)
+  if type(explorer) ~= "table"
+    or type(selection) ~= "table"
+    or not is_valid_win(tonumber(explorer.winid))
+    or type(explorer.tree) ~= "table"
+    or type(explorer.tree.get_node) ~= "function" then
+    return
+  end
+
+  local line_count = vim.api.nvim_buf_line_count(explorer.bufnr)
+  for line = 1, line_count do
+    local node = explorer.tree:get_node(line)
+    if node
+      and type(node.data) == "table"
+      and sanitize_relative_path(node.data.path, "") == sanitize_relative_path(selection.path, "")
+      and safe_string(node.data.group) == safe_string(selection.group) then
+      pcall(vim.api.nvim_win_set_cursor, explorer.winid, { line, 0 })
+      break
+    end
+  end
+end
+
+local function clear_pr_explorer_session(key)
+  if type(key) == "string" and key ~= "" then
+    temp_state.pr_explorer_sessions[key] = nil
+  end
+end
+
+local function normalize_focus_side(side)
+  local value = safe_string(side):lower()
+  if value == "base" or value == "left" or value == "original" then
+    return "base"
+  end
+  return "head"
+end
+
+local function current_pr_explorer_session(tabpage)
+  if not is_valid_tab(tabpage) then
+    return nil
+  end
+
+  for _, session in pairs(temp_state.pr_explorer_sessions) do
+    if valid_pr_explorer_session(session) and tonumber(session.tabpage) == tonumber(tabpage) then
+      return session
+    end
+  end
+
+  return nil
+end
+
+local function current_pr_explorer_file_path(open_result)
+  open_result = type(open_result) == "table" and open_result or {}
+
+  local function buffer_path(bufnr)
+    if not is_valid_buf(bufnr) then
+      return ""
+    end
+
+    local path = vim.b[bufnr].gh_pr_file_path or vim.b[bufnr].gh_pr_path or ""
+    return sanitize_relative_path(path, "")
+  end
+
+  local head_path = buffer_path(tonumber(open_result.head_buf))
+  if head_path ~= "" then
+    return head_path
+  end
+
+  local base_path = buffer_path(tonumber(open_result.base_buf))
+  if base_path ~= "" then
+    return base_path
+  end
+
+  head_path = sanitize_relative_path(open_result.head_path, "")
+  if head_path ~= "" then
+    return head_path
+  end
+
+  return sanitize_relative_path(open_result.base_path, "")
+end
+
+local function cursor_line_for_window(winid)
+  if not is_valid_win(tonumber(winid)) then
+    return nil
+  end
+
+  local ok, cursor = pcall(vim.api.nvim_win_get_cursor, winid)
+  if not ok or type(cursor) ~= "table" then
+    return nil
+  end
+
+  return positive_integer(cursor[1], nil)
+end
+
+local function store_pr_explorer_file_position(session)
+  if not valid_pr_explorer_session(session) then
+    return
+  end
+
+  local open_result = resolve_tab_open_result(session.tabpage)
+  if type(open_result) ~= "table" then
+    return
+  end
+
+  local path = current_pr_explorer_file_path(open_result)
+  if path == "" then
+    return
+  end
+
+  local base_line = cursor_line_for_window(open_result.base_win)
+  local head_line = cursor_line_for_window(open_result.head_win)
+  if type(base_line) ~= "number" and type(head_line) ~= "number" then
+    return
+  end
+
+  local target_side = normalize_focus_side(session.last_view_side)
+  if target_side == "base" and type(base_line) ~= "number" then
+    target_side = "head"
+  elseif target_side ~= "base" and type(head_line) ~= "number" and type(base_line) == "number" then
+    target_side = "base"
+  end
+
+  session.file_positions = type(session.file_positions) == "table" and session.file_positions or {}
+  session.file_positions[path] = {
+    target_side = target_side,
+    target_line = head_line,
+    target_original_line = base_line or head_line,
+    target_path = path,
+  }
+end
+
+local function saved_pr_explorer_focus(session, selected_file)
+  if type(session) ~= "table" or type(session.file_positions) ~= "table" then
+    return nil
+  end
+
+  local path = type(selected_file) == "table" and resolve_selected_relative_path(selected_file) or ""
+  if path == "" then
+    return nil
+  end
+
+  local saved = session.file_positions[path]
+  if type(saved) ~= "table" then
+    return nil
+  end
+
+  return vim.deepcopy(saved)
+end
+
+local function merge_focus(preferred, fallback)
+  local result = vim.deepcopy(type(fallback) == "table" and fallback or {})
+  preferred = type(preferred) == "table" and preferred or {}
+
+  for key, value in pairs(preferred) do
+    if value ~= nil then
+      result[key] = value
+    end
+  end
+
+  return result
+end
+
+local function resolve_pr_explorer_focus(session, selected_file)
+  local pending_focus = consume_pending_focus(session, selected_file)
+  local saved_focus = saved_pr_explorer_focus(session, selected_file)
+  return merge_focus(pending_focus, saved_focus)
+end
+
+local function update_pr_explorer_last_view_side(session)
+  if not valid_pr_explorer_session(session) then
+    return
+  end
+
+  local open_result = resolve_tab_open_result(session.tabpage)
+  if type(open_result) ~= "table" then
+    return
+  end
+
+  local current_buf = vim.api.nvim_get_current_buf()
+  if tonumber(open_result.base_buf) == tonumber(current_buf) then
+    session.last_view_side = "base"
+  elseif tonumber(open_result.head_buf) == tonumber(current_buf) then
+    session.last_view_side = "head"
+  end
+end
+
+local function ensure_pr_explorer_tracking_autocmd()
+  if temp_state.pr_explorer_tracking_attached then
+    return
+  end
+
+  temp_state.pr_explorer_tracking_attached = true
+  local group = vim.api.nvim_create_augroup("GhPrCodediffPrExplorerTracking", { clear = true })
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "WinEnter", "TabEnter" }, {
+    group = group,
+    desc = "gh-pr: track last focused PR codediff side",
+    callback = function()
+      local session = current_pr_explorer_session(vim.api.nvim_get_current_tabpage())
+      if session then
+        update_pr_explorer_last_view_side(session)
+      end
+    end,
+  })
+end
+
+local function is_passive_pr_explorer_selection(opts)
+  opts = type(opts) == "table" and opts or {}
+  return opts.no_jump == true or opts.passive == true
+end
+
+local function sync_pr_explorer_selection(session, selected_file, version, attempt)
+  session = type(session) == "table" and session or {}
+  attempt = tonumber(attempt) or 0
+
+  if not valid_pr_explorer_session(session) then
+    clear_pr_explorer_session(session.key)
+    return
+  end
+
+  if tonumber(session.selection_version) ~= tonumber(version) then
+    return
+  end
+
+  local open_result = resolve_tab_open_result(session.tabpage)
+  if type(open_result) ~= "table" then
+    if attempt >= 8 then
+      return
+    end
+    vim.schedule(function()
+      sync_pr_explorer_selection(session, selected_file, version, attempt + 1)
+    end)
+    return
+  end
+
+  if type(selected_file) == "table" then
+    local base_path, head_path = resolve_selected_file_paths(selected_file)
+    open_result.base_path = base_path
+    open_result.head_path = head_path
+    open_result.file_mode = resolve_selected_file_mode(selected_file)
+  end
+
+  apply_readonly_lock_to_tab(session.tabpage)
+  M.focus_side_and_line(open_result, resolve_pr_explorer_focus(session, selected_file))
+
+  if type(session.on_selection) == "function" and type(selected_file) == "table" then
+    session.on_selection(selected_file, open_result)
+  end
+end
+
+local function added_pr_explorer_file_path(session, file_data)
+  if type(session) ~= "table" or type(file_data) ~= "table" then
+    return nil
+  end
+
+  local relative_path = resolve_selected_relative_path(file_data)
+  if relative_path == "" then
+    return nil
+  end
+
+  local head_path = joinpath(session.head_dir or "", relative_path)
+  if file_readable(head_path) then
+    return head_path
+  end
+
+  return nil
+end
+
+local function should_use_added_single_file_view(file_data)
+  local status = safe_string(type(file_data) == "table" and file_data.status or ""):lower()
+  return status == "a" or status == "added"
+end
+
+local function show_pr_explorer_added_single_file(session, file_data)
+  local head_path = added_pr_explorer_file_path(session, file_data)
+  if not head_path then
+    return false
+  end
+
+  local layout = current_pr_explorer_layout(session.tabpage)
+  if layout == "inline" then
+    local ok_inline, inline_view = pcall(require, "codediff.ui.view.inline_view")
+    if not ok_inline or type(inline_view.show_single_file) ~= "function" then
+      return false
+    end
+    inline_view.show_single_file(session.tabpage, head_path, {
+      side = "modified",
+    })
+  else
+    local ok_side, side_by_side = pcall(require, "codediff.ui.view.side_by_side")
+    if not ok_side or type(side_by_side.show_untracked_file) ~= "function" then
+      return false
+    end
+    side_by_side.show_untracked_file(session.tabpage, head_path)
+  end
+
+  apply_readonly_lock_to_tab(session.tabpage)
+  return true
+end
+
+local function attach_pr_explorer_hooks(session)
+  if not valid_pr_explorer_session(session) then
+    return nil, "Unable to attach codediff PR explorer hooks"
+  end
+
+  local ok_lifecycle, lifecycle = pcall(require, "codediff.ui.lifecycle")
+  if not ok_lifecycle or type(lifecycle.get_explorer) ~= "function" then
+    return nil, "codediff explorer lifecycle is unavailable"
+  end
+
+  local explorer = lifecycle.get_explorer(session.tabpage)
+  if type(explorer) ~= "table" or type(explorer.on_file_select) ~= "function" then
+    return nil, "Unable to resolve codediff explorer session"
+  end
+
+  if explorer._gh_pr_session_key == session.key then
+    session.explorer = explorer
+    return true, nil
+  end
+
+  local original_on_file_select = explorer.on_file_select
+  explorer.on_file_select = function(file_data, opts)
+    opts = type(opts) == "table" and opts or {}
+
+    if session.suppress_next_auto_select == true then
+      session.suppress_next_auto_select = nil
+      return
+    end
+
+    if is_passive_pr_explorer_selection(opts) then
+      original_on_file_select(file_data, opts)
+      return
+    end
+
+    store_pr_explorer_file_position(session)
+
+    local selected_file = resolve_lookup_file(session.file_lookup, file_data)
+    local version = (tonumber(session.selection_version) or 0) + 1
+    session.selection_version = version
+
+    original_on_file_select(file_data, opts)
+
+    if should_use_added_single_file_view(file_data) then
+      vim.schedule(function()
+        if valid_pr_explorer_session(session) then
+          show_pr_explorer_added_single_file(session, file_data)
+        end
+      end)
+    end
+
+    vim.schedule(function()
+      sync_pr_explorer_selection(session, selected_file, version, 0)
+    end)
+  end
+  explorer._gh_pr_session_key = session.key
+  session.explorer = explorer
+  return true, nil
+end
+
+local function create_pr_explorer_session(opts)
+  opts = type(opts) == "table" and opts or {}
+  local prepared, prepare_err = prepare_directory_snapshot({
+    details = opts.details,
+    files = opts.files,
+    cache_scope = opts.cache_scope,
+    target_path = opts.target_path,
+  })
+  if not prepared then
+    return nil, nil, prepare_err
+  end
+
+  local ok_dir, dir_mod = pcall(require, "codediff.core.dir")
+  local ok_view, view = pcall(require, "codediff.ui.view")
+  if not ok_dir or not ok_view or type(dir_mod.diff_directories) ~= "function" or type(view.create) ~= "function" then
+    return nil, nil, "codediff explorer internals are unavailable"
+  end
+
+  local diff = dir_mod.diff_directories(prepared.base_dir, prepared.head_dir)
+  local status_result = type(diff) == "table" and type(diff.status_result) == "table" and diff.status_result or nil
+  if type(status_result) ~= "table" then
+    return nil, nil, "Unable to build codediff PR explorer snapshot"
+  end
+  if #status_result.unstaged < 1 and #status_result.staged < 1 and #(status_result.conflicts or {}) < 1 then
+    return nil, nil, "No textual changes are available in the codediff PR explorer snapshot"
+  end
+
+  local focus_file = sanitize_relative_path(opts.target_path, "")
+  local session_config = {
+    mode = "explorer",
+    git_root = nil,
+    original_path = diff.root1,
+    modified_path = diff.root2,
+    original_revision = nil,
+    modified_revision = nil,
+    layout = normalize_layout(opts.layout),
+    explorer_data = {
+      status_result = status_result,
+      focus_file = focus_file ~= "" and focus_file or nil,
+    },
+  }
+
+  view.create(session_config, "")
+  local tabpage = vim.api.nvim_get_current_tabpage()
+
+  local session = {
+    key = opts.session_key,
+    tabpage = tabpage,
+    base_dir = prepared.base_dir,
+    head_dir = prepared.head_dir,
+    file_lookup = build_pr_file_lookup(opts.details),
+    on_selection = opts.on_selection,
+    pending_focus = build_pending_focus(opts, focus_file),
+    file_positions = {},
+    last_view_side = normalize_focus_side(opts.target_side),
+    suppress_next_auto_select = true,
+    selection_version = 0,
+  }
+  temp_state.pr_explorer_sessions[opts.session_key] = session
+
+  ensure_pr_explorer_tracking_autocmd()
+  local attached, attach_err = attach_pr_explorer_hooks(session)
+  if not attached then
+    clear_pr_explorer_session(opts.session_key)
+    return nil, nil, attach_err
+  end
+
+  apply_readonly_lock_to_tab(tabpage)
+
+  return session, {
+    mode = "directory",
+    tabpage = tabpage,
+    base_dir = prepared.base_dir,
+    head_dir = prepared.head_dir,
+    layout = normalize_layout(opts.layout),
+  }, nil
 end
 
 local function resolve_focus_line(opts, side)
@@ -764,6 +1503,100 @@ function M.open_pr_file_diff(opts)
   opened.layout = layout
 
   M.focus_side_and_line(opened, opts)
+  return opened, nil
+end
+
+function M.open_pr_explorer_diff(opts)
+  opts = type(opts) == "table" and opts or {}
+  local details = type(opts.details) == "table" and opts.details or nil
+  local file = type(opts.file) == "table" and opts.file or nil
+  if not details or not file then
+    return nil, "Missing details/file payload for codediff PR explorer"
+  end
+
+  local guard_ok, guard_err = ensure_readonly_guard_autocmd()
+  if not guard_ok and guard_err then
+    return nil, guard_err
+  end
+  if not ensure_codediff_command() then
+    return nil, "codediff.nvim is unavailable (`:CodeDiff` not found)"
+  end
+
+  local focus_path = sanitize_relative_path(file.path or file.filename, "")
+  if focus_path == "" then
+    return nil, "Unable to resolve selected path for codediff PR explorer"
+  end
+
+  apply_codediff_preferences({
+    layout = opts.layout,
+    ignore_trim_whitespace = opts.ignore_trim_whitespace == true,
+  })
+
+  local session_key = pr_explorer_session_key({
+    details = details,
+    pr_number = opts.pr_number,
+  })
+  local session = temp_state.pr_explorer_sessions[session_key]
+  if not valid_pr_explorer_session(session) then
+    clear_pr_explorer_session(session_key)
+    session = nil
+  end
+
+  if session and opts.reuse ~= false then
+    store_pr_explorer_file_position(session)
+    session.file_lookup = build_pr_file_lookup(details)
+    session.on_selection = opts.on_selection
+    session.pending_focus = build_pending_focus(opts, focus_path)
+
+    ensure_pr_explorer_tracking_autocmd()
+    local attached, attach_err = attach_pr_explorer_hooks(session)
+    if not attached then
+      clear_pr_explorer_session(session_key)
+      return nil, attach_err
+    end
+
+    pcall(vim.api.nvim_set_current_tabpage, session.tabpage)
+    local layout_ok, layout_err = ensure_pr_explorer_layout(session.tabpage, opts.layout)
+    if not layout_ok then
+      return nil, layout_err
+    end
+
+    local selection = resolve_explorer_selection(session.explorer, focus_path)
+    if not selection then
+      return nil, "Unable to resolve selected file inside codediff PR explorer"
+    end
+
+    move_explorer_cursor_to_selection(session.explorer, selection)
+
+    return {
+      mode = "directory",
+      tabpage = session.tabpage,
+      base_dir = session.base_dir,
+      head_dir = session.head_dir,
+      layout = current_pr_explorer_layout(session.tabpage) or normalize_layout(opts.layout),
+    }, nil
+  end
+
+  local _, opened, open_err = create_pr_explorer_session({
+    session_key = session_key,
+    details = details,
+    files = type(opts.files) == "table" and opts.files or details.files,
+    target_path = focus_path,
+    layout = opts.layout,
+    target_side = opts.target_side,
+    target_line = opts.target_line,
+    target_original_line = opts.target_original_line,
+    on_selection = opts.on_selection,
+    cache_scope = table.concat({
+      session_key,
+      safe_string(details.baseRefName),
+      safe_string(details.headRefName),
+    }, "|"),
+  })
+  if not opened then
+    return nil, open_err
+  end
+
   return opened, nil
 end
 

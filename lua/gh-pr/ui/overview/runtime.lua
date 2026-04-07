@@ -8,16 +8,25 @@ local comment_popup = require("gh-pr.comment_popup")
 local M = {}
 
 local namespace = vim.api.nvim_create_namespace("gh-pr-overview")
-local pane_roles = { "summary", "activity", "meta" }
+local pane_roles = { "summary", "meta" }
 local pane_index = {
   summary = 1,
-  activity = 2,
-  meta = 3,
+  meta = 2,
 }
 
 local sessions = {}
 local sessions_by_pr = {}
 local next_session_id = 1
+
+local function normalize_role(role, fallback)
+  if role == "activity" then
+    return "summary"
+  end
+  if pane_index[role] then
+    return role
+  end
+  return fallback
+end
 
 local function tabpage_valid(tabpage)
   return type(tabpage) == "number" and tabpage > 0 and vim.api.nvim_tabpage_is_valid(tabpage)
@@ -225,7 +234,30 @@ local function apply_payload_to_buffer(session, role, payload)
 
   attach_buffer_metadata(session, role)
 end
-local execute_action
+local execute_action, render_session
+
+local function toggle_activity_thread(session, action)
+  if type(session) ~= "table" or type(action) ~= "table" then
+    return
+  end
+
+  local thread_id = utils.safe_string(action.thread_id, "")
+  if thread_id == "" then
+    if type(action.open_action) == "table" then
+      execute_action(session, action.open_action, "diff")
+    end
+    return
+  end
+
+  session.activity_folds = type(session.activity_folds) == "table" and session.activity_folds or {}
+  local expanded = action.default_expanded == true
+  local override = session.activity_folds[thread_id]
+  if type(override) == "boolean" then
+    expanded = override
+  end
+  session.activity_folds[thread_id] = not expanded
+  render_session(session)
+end
 
 local function open_action_menu(session, action, variant, fallback_title)
   local options = {}
@@ -256,6 +288,15 @@ execute_action = function(session, action, variant)
     return
   end
 
+  if action.kind == "toggle_activity_thread" then
+    if variant == "diff" and type(action.open_action) == "table" then
+      execute_action(session, action.open_action, variant)
+      return
+    end
+    toggle_activity_thread(session, action)
+    return
+  end
+
   if action.kind == "open_activity_thread_workspace" then
     if type(session.callbacks.open_activity_thread_workspace) == "function"
       and type(action.payload) == "table" then
@@ -265,6 +306,10 @@ execute_action = function(session, action, variant)
   end
 
   if action.kind == "thread_comment_menu" then
+    if variant == "diff" and type(action.default_action) == "table" then
+      execute_action(session, action.default_action, variant)
+      return
+    end
     open_action_menu(session, action, variant, "Thread comment action")
     return
   end
@@ -389,7 +434,7 @@ execute_action = function(session, action, variant)
     return
   end
 end
-local function render_session(session)
+render_session = function(session)
   capture_cursor_state(session)
   local payloads = renderer.render(session)
   for _, role in ipairs(pane_roles) do
@@ -399,6 +444,7 @@ end
 
 local function ensure_windows(session, focus_role)
   sync_session_windows(session)
+  focus_role = normalize_role(focus_role, nil)
   if not layout.windows_valid(session.windows) then
     local windows, tabpage = layout.open_windows(session.buffers, session.window, session.layout, focus_role)
     session.windows = windows
@@ -432,8 +478,9 @@ end
 
 local function focus_pane(session, role)
   sync_session_windows(session)
+  role = normalize_role(role, "summary")
   local winid = session.windows[role]
-  if not utils.valid_win(winid) and role ~= "summary" then
+  if not utils.valid_win(winid) then
     winid = session.windows.summary
   end
   if utils.valid_win(winid) then
@@ -457,7 +504,7 @@ local function role_from_current_window(session)
 end
 
 local function cycle_pane(session, step)
-  local current_role = role_from_current_window(session) or "summary"
+  local current_role = normalize_role(role_from_current_window(session), "summary")
   local index = pane_index[current_role] or 1
   local direction = tonumber(step) or 1
   if direction == 0 then
@@ -480,7 +527,6 @@ local function help_lines(session)
   local cycle_next = key_display(km.cycle_next, "<Tab>")
   local cycle_prev = key_display(km.cycle_prev, "<S-Tab>")
   local focus_summary = key_display(km.focus_summary, "g1")
-  local focus_activity = key_display(km.focus_activity, "g2")
   local focus_meta = key_display(km.focus_meta, "g3")
 
   return {
@@ -488,17 +534,16 @@ local function help_lines(session)
     "",
     "Navigation",
     string.format("%-10s Focus summary pane", focus_summary),
-    string.format("%-10s Focus activity pane", focus_activity),
     string.format("%-10s Focus collaboration pane", focus_meta),
     string.format("%-10s Next pane", cycle_next),
     string.format("%-10s Previous pane", cycle_prev),
     string.format("%-10s Next pane (alias)", "<C-w>w"),
     string.format("%-10s Previous pane (alias)", "<C-w>W"),
-    string.format("%-10s/%-4s Focus summary/activity", "<C-w>h", "<C-w>j"),
-    string.format("%-10s/%-4s Focus summary/collab", "<C-w>k", "<C-w>l"),
+    string.format("%-10s/%-4s Focus summary/collab", "<C-w>h", "<C-w>l"),
     "",
     "Actions",
-    "<CR>       Open selected item",
+    "<CR>       Open selected item or toggle thread fold",
+    "D          Open diff / secondary action for selected item",
     "O / M      Open original / modified file for selected diff file",
     "gr         Load more activity",
     "R          Refresh overview",
@@ -667,7 +712,7 @@ function M.open(model, opts)
 
   local focus_role = nil
   if session.window.enter ~= false then
-    focus_role = opts.focus_role or "summary"
+    focus_role = normalize_role(opts.focus_role, "summary")
   end
   ensure_windows(session, focus_role)
   ensure_keymaps(session)
@@ -712,7 +757,7 @@ function M.focus_for_pr(pr_number, role)
   if not session then
     return nil
   end
-  ensure_windows(session, role or "summary")
+  ensure_windows(session, normalize_role(role, "summary"))
   return session.id
 end
 
