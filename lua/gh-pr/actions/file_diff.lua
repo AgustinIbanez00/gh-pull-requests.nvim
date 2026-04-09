@@ -49,6 +49,106 @@ function FileDiff.register(M, ctx)
     return pr_explorer.enabled ~= false
   end
 
+  local function joinpath(...)
+    if vim.fs and type(vim.fs.joinpath) == "function" then
+      return vim.fs.joinpath(...)
+    end
+    return table.concat({ ... }, "/")
+  end
+
+  local function current_source_name()
+    local bufnr = vim.api.nvim_get_current_buf()
+    local ok_filetype, filetype = pcall(vim.api.nvim_get_option_value, "filetype", { buf = bufnr })
+    filetype = ok_filetype and filetype or vim.bo[bufnr].filetype
+    if filetype == "neo-tree" then
+      local source_name = vim.b[bufnr].neo_tree_source
+      if type(source_name) == "string" and source_name ~= "" then
+        return source_name
+      end
+    end
+
+    local stored_source_name = vim.b[bufnr].gh_pr_source_name
+    if type(stored_source_name) == "string" and stored_source_name ~= "" then
+      return stored_source_name
+    end
+
+    return nil
+  end
+
+  local function resolve_my_pr_git_root()
+    local source_name = current_source_name()
+    if source_name ~= "gh_my_pr" then
+      return nil
+    end
+
+    local manager_ok, manager = pcall(require, "neo-tree.sources.manager")
+    if manager_ok and type(manager.get_state_for_window) == "function" then
+      local winid = vim.api.nvim_get_current_win()
+      local ok_state, tree_state = pcall(manager.get_state_for_window, winid)
+      local tree_path = ok_state and type(tree_state) == "table" and tree_state.path or nil
+      if type(tree_path) == "string" and tree_path ~= "" then
+        local repo_ok, repo_module = pcall(require, "gh-pr.repo")
+        if repo_ok and type(repo_module.git_root) == "function" then
+          local git_root = select(1, repo_module.git_root({ cwd = tree_path }))
+          if type(git_root) == "string" and git_root ~= "" then
+            return git_root
+          end
+        end
+      end
+    end
+
+    local repo_ok, repo_module = pcall(require, "gh-pr.repo")
+    if repo_ok and type(repo_module.git_root) == "function" then
+      return select(1, repo_module.git_root())
+    end
+
+    return nil
+  end
+
+  local function local_head_path_available(path)
+    if type(path) ~= "string" or path == "" then
+      return false
+    end
+
+    local absolute = vim.fn.fnamemodify(path, ":p")
+    return vim.fn.filereadable(absolute) == 1 or vim.fn.bufexists(absolute) == 1
+  end
+
+  local function resolve_my_pr_local_head_context(file)
+    local source_name = current_source_name()
+    if source_name == "gh_my_pr" then
+      local status = safe_string(type(file) == "table" and file.status or ""):lower()
+      if status == "removed" then
+        return nil, source_name
+      end
+
+      local git_root = resolve_my_pr_git_root()
+      local relative_path = normalize_path(type(file) == "table" and (file.path or file.filename) or nil)
+      if type(git_root) ~= "string" or git_root == "" or relative_path == "" then
+        return nil, source_name
+      end
+
+      local local_head_path = joinpath(git_root, relative_path)
+      if local_head_path_available(local_head_path) then
+        return local_head_path, source_name
+      end
+
+      return nil, source_name
+    end
+
+    local bufnr = vim.api.nvim_get_current_buf()
+    local stored_source_name = vim.b[bufnr].gh_pr_source_name
+    local stored_local_head_path = vim.b[bufnr].gh_pr_local_head_path
+    if stored_source_name == "gh_my_pr"
+      and type(stored_local_head_path) == "string"
+      and stored_local_head_path ~= ""
+      and local_head_path_available(stored_local_head_path) then
+      return stored_local_head_path, stored_source_name
+    end
+
+    return nil, source_name
+  end
+
   local function build_codediff_selection_handler(pr, details, comments_ctx, extra_ctx)
     extra_ctx = type(extra_ctx) == "table" and extra_ctx or {}
     return function(active_file, open_result)
@@ -60,6 +160,8 @@ function FileDiff.register(M, ctx)
         comments_ctx = comments_ctx,
         check_annotations_ctx = extra_ctx.check_annotations_ctx,
         security_annotations_ctx = extra_ctx.security_annotations_ctx,
+        source_name = extra_ctx.source_name,
+        local_head_path = extra_ctx.local_head_path,
       })
       sync_diff_comments_panel(pr, details, comments_ctx)
     end
@@ -71,10 +173,12 @@ function FileDiff.register(M, ctx)
     local on_selection = build_codediff_selection_handler(pr, details, open_opts.comments_ctx, {
       check_annotations_ctx = open_opts.check_annotations_ctx,
       security_annotations_ctx = open_opts.security_annotations_ctx,
+      source_name = open_opts.source_name,
+      local_head_path = open_opts.local_head_path,
     })
 
     local explorer_err = nil
-    if pr_explorer_enabled() then
+    if pr_explorer_enabled() and open_opts.source_name ~= "gh_my_pr" then
       local opened_explorer, open_explorer_err = codediff_integration.open_pr_explorer_diff({
         pr_number = pr.number,
         details = details,
@@ -111,6 +215,8 @@ function FileDiff.register(M, ctx)
       target_side = open_opts.target_side,
       target_line = open_opts.target_line,
       target_original_line = open_opts.target_original_line,
+      local_head_path = open_opts.local_head_path,
+      source_name = open_opts.source_name,
     })
     if not opened_result then
       return nil, codediff_err or explorer_err
@@ -136,6 +242,7 @@ function M.open_diff(file, opts)
   end
 
   state.set_active_file(selected_file)
+  local local_head_path, source_name = resolve_my_pr_local_head_context(selected_file)
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
 
@@ -151,6 +258,8 @@ function M.open_diff(file, opts)
       target_original_line = opts.target_original_line,
       check_annotations_ctx = opts.check_annotations_ctx,
       security_annotations_ctx = opts.security_annotations_ctx,
+      local_head_path = local_head_path,
+      source_name = source_name,
     })
   end
 
@@ -224,6 +333,7 @@ function M.open_original(file, opts)
   end
 
   state.set_active_file(selected_file)
+  local local_head_path, source_name = resolve_my_pr_local_head_context(selected_file)
   local target_line = positive_integer(opts.target_original_line, positive_integer(opts.target_line, nil))
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
@@ -237,6 +347,8 @@ function M.open_original(file, opts)
       target_line = target_line,
       check_annotations_ctx = opts.check_annotations_ctx,
       security_annotations_ctx = opts.security_annotations_ctx,
+      local_head_path = local_head_path,
+      source_name = source_name,
     })
   end
 
@@ -291,6 +403,7 @@ function M.open_modified(file, opts)
   end
 
   state.set_active_file(selected_file)
+  local local_head_path, source_name = resolve_my_pr_local_head_context(selected_file)
   local target_line = positive_integer(opts.target_line, positive_integer(opts.target_original_line, nil))
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
@@ -304,6 +417,8 @@ function M.open_modified(file, opts)
       target_original_line = target_line,
       check_annotations_ctx = opts.check_annotations_ctx,
       security_annotations_ctx = opts.security_annotations_ctx,
+      local_head_path = local_head_path,
+      source_name = source_name,
     })
   end
 
@@ -370,6 +485,7 @@ local function reopen_current_diff_with_preferences_impl(opts)
   end
 
   state.set_active_file(selected_file)
+  local local_head_path, source_name = resolve_my_pr_local_head_context(selected_file)
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
   local function open_with_codediff(diff_view)
@@ -383,6 +499,8 @@ local function reopen_current_diff_with_preferences_impl(opts)
       target_line = cursor[1],
       target_original_line = cursor[1],
       force = true,
+      local_head_path = local_head_path,
+      source_name = source_name,
     })
   end
 

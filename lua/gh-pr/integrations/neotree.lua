@@ -3,6 +3,7 @@ local M = {}
 local config = require("gh-pr.config")
 local fast_event_patch = require("gh-pr.integrations.neotree_fast_event")
 local registry = require("gh-pr.neotree.registry")
+local pr_service = require("gh-pr.pr_service")
 local repo = require("gh-pr.repo")
 
 local configured_sources = {}
@@ -16,6 +17,7 @@ local DISPLAY_NAMES = {
   gh_pr_comments = "  Comments ",
   gh_pr_diff_comments = "  Diff Comments ",
   gh_pr_review = "  PR Review ",
+  gh_my_pr = "  My PR ",
 }
 
 local function notify_error(opts, message)
@@ -48,15 +50,16 @@ local function read_config()
   return config.get() or {}
 end
 
-local function pr_source_settings()
+local function source_settings(source_key)
   local ui = (read_config().ui or {})
   local neotree_sources = type(ui.neotree_sources) == "table" and ui.neotree_sources or {}
-  local pr = type(neotree_sources.pr) == "table" and neotree_sources.pr or {}
+  local key = source_key == "my_pr" and "my_pr" or "pr"
+  local source = type(neotree_sources[key]) == "table" and neotree_sources[key] or {}
 
   return {
-    auto_register = pr.auto_register ~= false,
-    gate = type(pr.gate) == "string" and pr.gate or "github_repo",
-    workspace = type(pr.workspace) == "string" and pr.workspace or "cwd",
+    auto_register = source.auto_register ~= false,
+    gate = type(source.gate) == "string" and source.gate or "github_repo",
+    workspace = type(source.workspace) == "string" and source.workspace or "cwd",
   }
 end
 
@@ -478,10 +481,12 @@ local function handle_pr_probe_result(probe_key, source_name, source_module_name
 
   if pending and pending.probe_key == probe_key then
     pending_open[source_name] = nil
-    local message = result.status == "not_git"
-        and "gh-pr requires a git repository"
-      or result.status == "no_github_remote"
-        and "gh-pr requires a GitHub repository remote"
+    local status_messages = type(opts.status_messages) == "table" and opts.status_messages or {}
+    local message = status_messages[result.status]
+      or (result.status == "not_git" and "gh-pr requires a git repository")
+      or (result.status == "no_github_remote" and "gh-pr requires a GitHub repository remote")
+      or (result.status == "no_branch" and "gh-pr requires a local branch for My PR")
+      or (result.status == "no_matching_pr" and "No pull request matches the current branch in this repository")
       or "Unable to resolve repository for gh-pr"
     notify_error(pending.opts, message)
   end
@@ -489,7 +494,7 @@ end
 
 local function request_pr_probe(source_name, source_module_name, opts)
   opts = opts or {}
-  local settings = pr_source_settings()
+  local settings = source_settings("pr")
   local workspace_path = resolve_workspace_path(settings.workspace)
   local probe_gate = effective_probe_gate(settings.gate)
   local remotes = read_config().remotes or { "origin", "upstream" }
@@ -537,25 +542,156 @@ local function request_pr_probe(source_name, source_module_name, opts)
   return true
 end
 
+local function request_my_pr_probe(source_name, source_module_name, opts)
+  opts = opts or {}
+  local settings = source_settings("my_pr")
+  local workspace_path = resolve_workspace_path(settings.workspace)
+  local probe_gate = effective_probe_gate(settings.gate)
+  local remotes = read_config().remotes or { "origin", "upstream" }
+  local branch, _ = repo.current_branch({ cwd = workspace_path })
+  local branch_key = type(branch) == "string" and vim.trim(branch) or ""
+  if branch_key == "" then
+    branch_key = "__no_branch__"
+  end
+
+  local key = probe_cache_key(workspace_path, probe_gate, remotes) .. "::gh_my_pr::" .. branch_key
+  local cached = workspace_probe_cache[key]
+
+  if cached and cached.status == "resolved" and opts.force ~= true then
+    handle_pr_probe_result(key, source_name, source_module_name, opts, cached.result)
+    return true
+  end
+
+  if cached and cached.status == "inflight" then
+    if opts.pending_open == true then
+      pending_open[source_name] = {
+        probe_key = key,
+        opts = opts,
+      }
+    end
+    return true
+  end
+
+  workspace_probe_cache[key] = {
+    status = "inflight",
+  }
+
+  if opts.pending_open == true then
+    pending_open[source_name] = {
+      probe_key = key,
+      opts = opts,
+    }
+  end
+
+  repo.probe_workspace_async({
+    cwd = workspace_path,
+    gate = probe_gate,
+    remotes = remotes,
+  }, function(result)
+    if type(result) ~= "table" then
+      result = {
+        eligible = false,
+        status = "error",
+      }
+    end
+
+    if result.eligible ~= true then
+      workspace_probe_cache[key] = {
+        status = "resolved",
+        result = result,
+      }
+      handle_pr_probe_result(key, source_name, source_module_name, opts, result)
+      return
+    end
+
+    if type(result.repository) ~= "table" then
+      local no_repo_result = vim.tbl_extend("force", result, {
+        eligible = false,
+        status = "no_github_remote",
+      })
+      workspace_probe_cache[key] = {
+        status = "resolved",
+        result = no_repo_result,
+      }
+      handle_pr_probe_result(key, source_name, source_module_name, opts, no_repo_result)
+      return
+    end
+
+    local git_root = type(result.git_root) == "string" and result.git_root ~= "" and result.git_root or workspace_path
+    repo.current_branch_async({ cwd = git_root }, function(resolved_branch, branch_err)
+      resolved_branch = type(resolved_branch) == "string" and vim.trim(resolved_branch) or ""
+      if resolved_branch == "" then
+        local no_branch_result = vim.tbl_extend("force", result, {
+          eligible = false,
+          status = "no_branch",
+          branch = nil,
+          error = branch_err,
+        })
+        workspace_probe_cache[key] = {
+          status = "resolved",
+          result = no_branch_result,
+        }
+        handle_pr_probe_result(key, source_name, source_module_name, opts, no_branch_result)
+        return
+      end
+
+      pr_service.find_pr_for_branch_async(resolved_branch, {
+        repository = result.repository,
+      }, function(pr, pr_err)
+        local final_result = nil
+        if not pr then
+          final_result = vim.tbl_extend("force", result, {
+            eligible = false,
+            status = "no_matching_pr",
+            branch = resolved_branch,
+            error = pr_err,
+          })
+        else
+          final_result = vim.tbl_extend("force", result, {
+            eligible = true,
+            status = "eligible",
+            branch = resolved_branch,
+            pr = pr,
+          })
+        end
+
+        workspace_probe_cache[key] = {
+          status = "resolved",
+          result = final_result,
+        }
+        handle_pr_probe_result(key, source_name, source_module_name, opts, final_result)
+      end)
+    end)
+  end)
+
+  return true
+end
+
 function M.open_source(source_name, source_module_name, opts)
   opts = opts or {}
   source_name = source_name or "gh_pr"
   source_module_name = source_module_name or source_name
 
-  if source_name == "gh_pr" then
+  if source_name == "gh_pr" or source_name == "gh_my_pr" then
     local neo_tree = maybe_get_neotree(true)
     if not neo_tree then
       return false
     end
 
-    local settings = pr_source_settings()
-    return request_pr_probe(source_name, source_module_name, {
+    local source_key = source_name == "gh_my_pr" and "my_pr" or "pr"
+    local settings = source_settings(source_key)
+    local request_probe = source_name == "gh_my_pr" and request_my_pr_probe or request_pr_probe
+    return request_probe(source_name, source_module_name, {
       action = type(opts.action) == "string" and opts.action or (source_is_visible(source_name) and "focus" or "show"),
       toggle = false,
       position = type(opts.position) == "string" and opts.position or "left",
       on_error = opts.on_error,
       auto_managed = settings.gate ~= "manual" and settings.auto_register == true,
       pending_open = true,
+      status_messages = source_name == "gh_my_pr" and {
+        no_branch = "My PR requires a local branch in the current repository",
+        no_matching_pr = "No pull request matches the current branch in this repository",
+      } or nil,
     })
   end
 
@@ -576,11 +712,17 @@ function M.refresh_sources()
   if type(review_source) == "table" and type(review_source.request_refresh) == "function" then
     pcall(review_source.request_refresh, nil, { force = true, notify_error = false })
   end
+
+  local my_pr_source = registry.get("gh_my_pr")
+  if type(my_pr_source) == "table" and type(my_pr_source.request_refresh) == "function" then
+    pcall(my_pr_source.request_refresh, nil, { force = true, notify_error = false })
+  end
 end
 
-function M.refresh_pr_source_availability(opts)
+function M.refresh_source_availability(source_key, opts)
   opts = opts or {}
-  local settings = pr_source_settings()
+  source_key = source_key == "my_pr" and "my_pr" or "pr"
+  local settings = source_settings(source_key)
   if settings.gate == "manual" or settings.auto_register == false then
     return false
   end
@@ -589,11 +731,25 @@ function M.refresh_pr_source_availability(opts)
     return false
   end
 
-  return request_pr_probe("gh_pr", "gh_pr", {
+  local source_name = source_key == "my_pr" and "gh_my_pr" or "gh_pr"
+  local request_probe = source_key == "my_pr" and request_my_pr_probe or request_pr_probe
+  return request_probe(source_name, source_name, {
     force = opts.force == true,
     auto_managed = true,
     pending_open = false,
+    status_messages = source_key == "my_pr" and {
+      no_branch = "My PR requires a local branch in the current repository",
+      no_matching_pr = "No pull request matches the current branch in this repository",
+    } or nil,
   })
+end
+
+function M.refresh_pr_source_availability(opts)
+  return M.refresh_source_availability("pr", opts)
+end
+
+function M.refresh_my_pr_source_availability(opts)
+  return M.refresh_source_availability("my_pr", opts)
 end
 
 function M.handle_neotree_filetype(_)
@@ -602,6 +758,7 @@ function M.handle_neotree_filetype(_)
   end
 
   M.refresh_pr_source_availability()
+  M.refresh_my_pr_source_availability()
 end
 
 function M.handle_dir_changed(_)
@@ -610,6 +767,16 @@ function M.handle_dir_changed(_)
   end
 
   M.refresh_pr_source_availability({ force = true })
+  M.refresh_my_pr_source_availability({ force = true })
+end
+
+function M.handle_focus_event(_)
+  if not maybe_get_neotree(false) then
+    return
+  end
+
+  M.refresh_pr_source_availability()
+  M.refresh_my_pr_source_availability()
 end
 
 return M

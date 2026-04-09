@@ -93,6 +93,13 @@ Commands
     the annotation line and paints that check's annotations over codediff.
     `Open check details` keeps direct browser access to the original check URL.
     In `Security > Code scanning`, `<CR>` lazy-loads
+
+:GhPrMyPr
+    Opens `gh_my_pr` when the current local branch matches a PR head in the
+    same GitHub repository.
+    `gh_my_pr` renders the same sections and mappings as `gh_pr_review`.
+    In `Files`, codediff opens the GitHub base side against the real local
+    worktree file on the modified side, so the head buffer stays editable.
     `file -> alert`. In alert nodes, `<CR>` opens the PR diff on the
     modified side at the alert line and paints loaded security findings
     for that file over codediff.
@@ -508,6 +515,7 @@ disabled by default.
 <Plug>(gh-pr-comments)        Open comments tree (:GhPrComments)
 <Plug>(gh-pr-start-review)    Start PR review flow (:GhPrStartReview)
 <Plug>(gh-pr-review-tree)     Toggle PR Review source (:GhPrReviewTree)
+<Plug>(gh-pr-my-pr)           Open My PR source (:GhPrMyPr)
 <Plug>(gh-pr-refresh)         Refresh (:GhPrRefresh)
 <Plug>(gh-pr-review-refresh)  Force refresh PR Review data (:GhPrReviewRefresh)
 <Plug>(gh-pr-overview)        Open PR overview (:GhPrOverview)
@@ -557,7 +565,10 @@ gh_pr PR rows      Keep `#number + title` as primary text and render a
 `c` (gh_pr_review) Publish regular PR comment (`gh pr comment`)
 `zt` (gh_pr_review) Toggle Files list/tree mode (persisted globally)
 `/`/`z/`/`zs`/`ze`/`zn`/`z.`/`zu`/`zw`/`zh`/`zd`/`zr` (gh_pr_review) Session file filters
-`<space>` (gh_pr/gh_pr_review) Not bound by default (keeps `<leader>` free)
+`gh_my_pr`       Same sections/mappings as `gh_pr_review`, but only for the
+                 current branch-matched PR and with local editable head diffs
+                 in `Files`
+`<space>` (gh_pr/gh_pr_review/gh_my_pr) Not bound by default (keeps `<leader>` free)
 PR sources prioritize PR-specific mappings over generic Neo-tree mappings
 
 Configuration
@@ -693,9 +704,15 @@ Call `require("gh-pr").setup({ ... })` with:
 - `cache.gh_pr_review.max_cache_age_seconds` (`900`)
 - `cache.gh_pr_review.show_stale_badge` (`true`)
 - `cache.gh_pr_review.sync_visible_buffers` (`true`)
+- `cache.gh_my_pr.enabled` (`true`)
+- `cache.gh_my_pr.ttl_seconds` (`30`)
+- `cache.gh_my_pr.auto_refresh_when_focused` (`true`)
+- `cache.gh_my_pr.max_cache_age_seconds` (`300`)
+- `cache.gh_my_pr.show_stale_badge` (`true`)
+- `cache.gh_my_pr.sync_visible_buffers` (`true`)
 - `follow_current_file.enabled` (`true`)
 - `follow_current_file.debounce_ms` (`60`)
-- `follow_current_file.sources.pr|pr_review` (`true|true`)
+- `follow_current_file.sources.pr|pr_review|my_pr` (`true|true|true`)
 - `diff_view.mode` (`"vertical"`, also `"horizontal"` / `"unified"`)
 - `diff_view.ignore_whitespace_mode` (`"none"`, also `"trim"` / `"eol"` /
   `"blank_lines"`)
@@ -784,6 +801,9 @@ Call `require("gh-pr").setup({ ... })` with:
 - `ui.neotree_sources.pr.auto_register` (`true`)
 - `ui.neotree_sources.pr.gate` (`"github_repo"`, also `"git_repo"` / `"manual"`)
 - `ui.neotree_sources.pr.workspace` (`"cwd"`, also `"buffer_repo"` / `"neotree_root"`)
+- `ui.neotree_sources.my_pr.auto_register` (`true`)
+- `ui.neotree_sources.my_pr.gate` (`"github_repo"`, also `"git_repo"` / `"manual"`)
+- `ui.neotree_sources.my_pr.workspace` (`"cwd"`, also `"buffer_repo"` / `"neotree_root"`)
 - `mappings.global.enabled` (`false`; set `true` to enable default `<leader>gh*` maps)
 - `mappings.global.keys.open|list|comments|refresh|overview|checkout|open_diff|review_tree|toggle_reviewed|next_change|prev_change`
   (defaults to `<leader>gho|ghl|ghm|ghr|ghv|ghc|ghd|ghx|ght|ghn|ghp`)
@@ -795,6 +815,7 @@ gh-pr exposes these Neo-tree sources:
 
 - `gh_pr` (`lua/gh_pr.lua`)
 - `gh_pr_review` (`lua/gh_pr_review.lua`)
+- `gh_my_pr` (`lua/gh_my_pr.lua`)
 
 `gh_pr` registration is lazy and auto-managed by default:
 
@@ -812,6 +833,11 @@ gh-pr exposes these Neo-tree sources:
 - Registering `gh_pr` does not fetch PRs. The first fetch starts when
   Neo-tree navigates that source.
 - `:GhPrReviewTree` keeps toggle behavior for `gh_pr_review`.
+- `gh_my_pr` is auto-managed independently from `gh_pr`: it appears only
+  when the current branch matches a PR head in the same repository.
+- `gh_my_pr > Files` opens codediff with the GitHub base on one side and the
+  real local worktree file on the modified side, so the head buffer remains
+  editable.
 
 Query Placeholders
 ==================

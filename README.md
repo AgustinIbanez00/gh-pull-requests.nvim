@@ -15,6 +15,7 @@ Quick links: [Installation](#installation) · [Quick Start](#quick-start) · [Co
 ## Table of Contents
 
 - [Features](#features)
+- [Screenshots](#screenshots)
 - [Requirements](#requirements)
 - [Validation](#validation)
 - [Installation](#installation)
@@ -24,6 +25,10 @@ Quick links: [Installation](#installation) · [Quick Start](#quick-start) · [Co
 - [Keymaps](#keymaps)
 - [Troubleshooting](#troubleshooting)
 - [Consolidated architecture](#consolidated-architecture)
+- [Neo-tree source](#neo-tree-source)
+- [Highlights](#highlights)
+- [Notes](#notes)
+- [Overview API](#overview-api)
 - [Neo-tree source](#neo-tree-source)
 - [Highlights](#highlights)
 - [Notes](#notes)
@@ -39,6 +44,7 @@ Quick links: [Installation](#installation) · [Quick Start](#quick-start) · [Co
 ### 🧠 Review Workspace
 
 - Dedicated review workspace source (`gh_pr_review`) with sections: Overview, Labels, Files, Reviewers, Commits, Checks, Security, Comments, Drafts.
+- Branch-aware personal review source (`gh_my_pr`) that appears only when the current local branch matches a PR head in the same repository.
 - Start review flow from PR nodes (`r`) with optional GitHub pending-review creation.
 - Review actions: approve, request changes, comment, merge (`merge/squash/rebase`).
 
@@ -73,6 +79,11 @@ Quick links: [Installation](#installation) · [Quick Start](#quick-start) · [Co
 - PR checkout via `gh pr checkout`.
 
 </details>
+
+## Screenshots
+
+Release screenshot assets should live under [`assets/screenshots/`](assets/screenshots/).
+Use the tracked [screenshot capture guide](assets/screenshots/README.md) to keep filenames, scope, and privacy checks consistent before embedding PNGs in this section.
 
 ## Requirements
 
@@ -338,6 +349,14 @@ Validation prerequisites:
         show_stale_badge = true,
         sync_visible_buffers = true,
       },
+      gh_my_pr = {
+        enabled = true,
+        ttl_seconds = 30,
+        auto_refresh_when_focused = true,
+        max_cache_age_seconds = 300,
+        show_stale_badge = true,
+        sync_visible_buffers = true,
+      },
     },
     follow_current_file = {
       enabled = true,
@@ -345,6 +364,7 @@ Validation prerequisites:
       sources = {
         pr = true,
         pr_review = true,
+        my_pr = true,
       },
     },
     diff_view = {
@@ -461,6 +481,11 @@ Validation prerequisites:
           gate = "github_repo", -- "github_repo" | "git_repo" | "manual"
           workspace = "cwd", -- "cwd" | "buffer_repo" | "neotree_root"
         },
+        my_pr = {
+          auto_register = true,
+          gate = "github_repo", -- "github_repo" | "git_repo" | "manual"
+          workspace = "cwd", -- "cwd" | "buffer_repo" | "neotree_root"
+        },
       },
     },
     mappings = {
@@ -560,6 +585,7 @@ lives under `lua/gh-pr/ui/overview/*`.
 | `:GhPrOpen` | Focus/open PR UI (idempotent; Neo-tree first, Telescope fallback) | Start or refocus a PR browsing session |
 | `:GhPrStartReview [number]` | Start review flow for selected PR | Enter review workspace quickly and warm textual diffs in background |
 | `:GhPrReviewTree` | Toggle PR Review source | Jump between list and review tree |
+| `:GhPrMyPr` | Open current-branch personal PR source | Review your own branch-matched PR with local editable diffs |
 | `:GhPrOverview` | Open active PR overview panes | Inspect summary/activity and collaboration |
 | `:GhPrOpenDiff` | Open selected file diff or non-text preview | Review code and assets |
 | `:GhPrOpenCommitPatch` | Open selected commit diff in codediff | Inspect commit-level changes |
@@ -585,6 +611,7 @@ lives under `lua/gh-pr/ui/overview/*`.
 - `:GhPrOverview` open active PR overview panes (Summary + Activity / Collaboration).
 - `:GhPrOverviewRefresh` refresh active overview panes.
 - `:GhPrOverviewMore <checks|commits|comments|reviews|threads> [count]` load more section items.
+- `:GhPrMyPr` open `My PR` source for the current branch when it matches a PR in the current repository.
 - `:GhPrCheckout [number]` checkout PR branch.
 - `:GhPrOpenDiff` open selected file in codediff for text, or dedicated gh-pr preview for non-text.
 - `:GhPrOpenOriginal` open selected file and focus base side in codediff when possible, or dedicated base-side preview for non-text.
@@ -620,6 +647,7 @@ Top-level mappings are exposed through `<Plug>` and global `<leader>` mappings a
 | `<Plug>(gh-pr-comments)` | Open PR comments tree |
 | `<Plug>(gh-pr-start-review)` | Start PR review flow |
 | `<Plug>(gh-pr-review-tree)` | Toggle PR Review source |
+| `<Plug>(gh-pr-my-pr)` | Open My PR source |
 | `<Plug>(gh-pr-refresh)` | Refresh PR data |
 | `<Plug>(gh-pr-review-refresh)` | Force refresh PR Review data |
 | `<Plug>(gh-pr-overview)` | Open PR overview |
@@ -725,8 +753,10 @@ require("gh-pr").setup({
 - `zh` toggles `Files` hide-viewed for the current session.
 - `zd` toggles `Files` hide-deleted for the current session.
 - `zr` resets all session file filters.
-- `gh_pr` and `gh_pr_review` do not bind `<space>` by default (keeps `<leader>` available when `mapleader = " "`).
-- `gh_pr` and `gh_pr_review` prioritize PR-specific mappings over generic Neo-tree filesystem mappings.
+- `gh_my_pr` reuses the same sections and mappings as `gh_pr_review`, but it only appears when the current local branch matches a PR head in the same repository.
+- In `gh_my_pr > Files`, codediff opens the GitHub base side against the real local worktree file on the modified side, so the right-hand buffer stays editable.
+- `gh_pr`, `gh_pr_review`, and `gh_my_pr` do not bind `<space>` by default (keeps `<leader>` available when `mapleader = " "`).
+- `gh_pr`, `gh_pr_review`, and `gh_my_pr` prioritize PR-specific mappings over generic Neo-tree filesystem mappings.
 - Opening `Overview` from Neo-tree reuses/focuses existing overview session for that PR and triggers silent background refresh.
 
 Inside the overview buffer:
@@ -893,7 +923,7 @@ Non-text preview options (`diff_view.non_text`):
 - `auto_preview` (`true`; image and generic binary files bypass codediff fallback prompts)
 - `show_metadata` (`true`; render metadata/action cards for non-text preview buffers)
 
-Inside `gh_pr_review` Neo-tree source:
+Inside `gh_pr_review` and `gh_my_pr` Neo-tree review sources:
 - Root node shows active PR (`PR #N - title`) for current repository.
 - Sections: `Overview`, `Labels`, `Files`, `Reviewers`, `Commits`, `Checks`, `Security`, `Comments`, `Drafts`.
 - `Drafts` groups pending-review comments as `file -> thread -> draft comment` and opens the diff location for those draft items.
@@ -961,6 +991,7 @@ Inside `gh_pr_review` Neo-tree source:
 - `zr` reset all session file filters.
 - `zG` expand `Comments > Global` (including subgroups).
 - `zg` collapse `Comments > Global` (including subgroups).
+- `gh_my_pr` differs only in how it is selected and how `Files` opens text diffs: it resolves the PR from the current branch automatically and uses the local worktree file as codediff head when possible.
 
 </details>
 
@@ -969,6 +1000,7 @@ Inside `gh_pr_review` Neo-tree source:
 The plugin exposes source modules:
 - `gh_pr` (`lua/gh_pr.lua`)
 - `gh_pr_review` (`lua/gh_pr_review.lua`)
+- `gh_my_pr` (`lua/gh_my_pr.lua`)
 
 `GhPrOpen` auto-manages `gh_pr` lazily:
 
@@ -977,6 +1009,8 @@ The plugin exposes source modules:
 - If the workspace probe is still running, `GhPrOpen` queues the open and completes it when the probe resolves.
 - Registering `gh_pr` does not fetch PR data. The first fetch starts when Neo-tree navigates that source.
 - `GhPrReviewTree` keeps toggle behavior for `gh_pr_review`.
+- `gh_my_pr` is auto-managed independently from `gh_pr`: it appears only when the current branch matches a PR head in the same repository, and it disappears again when that match no longer exists.
+- `gh_my_pr` shares the same review UI as `gh_pr_review`, but `Files` opens text diffs against the local worktree file on the modified side, so the head buffer remains editable.
 
 Public config for PR source registration:
 
@@ -985,6 +1019,11 @@ require("gh-pr").setup({
   ui = {
     neotree_sources = {
       pr = {
+        auto_register = true,
+        gate = "github_repo", -- "github_repo" | "git_repo" | "manual"
+        workspace = "cwd", -- "cwd" | "buffer_repo" | "neotree_root"
+      },
+      my_pr = {
         auto_register = true,
         gate = "github_repo", -- "github_repo" | "git_repo" | "manual"
         workspace = "cwd", -- "cwd" | "buffer_repo" | "neotree_root"
@@ -998,6 +1037,7 @@ require("gh-pr").setup({
 - `gate = "git_repo"` exposes `gh_pr` for any git repository.
 - `gate = "manual"` disables auto-registration and preserves explicit source insertion only.
 - `workspace = "cwd"` is the default. `buffer_repo` probes from the current buffer path, and `neotree_root` probes from the active Neo-tree root when available.
+- `my_pr` uses the same gate/workspace options, but it still requires a GitHub repository and a current local branch that matches a PR head to become eligible.
 
 ## Highlights
 
@@ -1025,7 +1065,7 @@ vim.api.nvim_create_autocmd("ColorScheme", {
 - `setup({ diff_view = ... })` defines the default diff prefs; when `state.json` contains `prefs.diff_view`, those persisted runtime choices override the Lua defaults on later sessions.
 - Per-open diff overrides do not rewrite `state.json`; only the runtime diff actions persist updated diff prefs.
 - `diff_view.shortcuts.*` remain Lua-configured and opt-in; they are not read from or written to `state.json`.
-- Cache entries are scoped per source and repository key (`gh_pr` and `gh_pr_review`).
-- File content is fetched from GitHub API through `gh api` and opened in readonly buffers.
+- Cache entries are scoped per source and repository key (`gh_pr`, `gh_pr_review`, and `gh_my_pr`).
+- File content is fetched from GitHub API through `gh api` and opened in readonly buffers, except `gh_my_pr > Files` where the modified side uses the local worktree file when available.
 - Read-only gh-pr UI buffers are kept `nomodified` and should not require save confirmation when closing Neovim.
 - File open in PR views no longer falls back to patch (`@@`) buffers when content fetch fails; commit patch views remain explicit.

@@ -122,6 +122,7 @@ local function reset_ghpr_modules()
     if name:match("^gh%-pr")
       or name == "gh_pr"
       or name == "gh_pr_review"
+      or name == "gh_my_pr"
       or name == "gh_pr_comments"
       or name == "gh_pr_diff_comments"
       or name == "neo-tree"
@@ -150,6 +151,7 @@ local function install_neotree_stubs(state)
         },
         gh_pr = { window = { position = "left" } },
         gh_pr_review = { window = { position = "left" } },
+        gh_my_pr = { window = { position = "left" } },
         gh_pr_comments = { window = { position = "left" } },
         gh_pr_diff_comments = { window = { position = "bottom" } },
       },
@@ -158,7 +160,7 @@ local function install_neotree_stubs(state)
     function neo_tree.ensure_config()
       state.ensure_config_calls = (state.ensure_config_calls or 0) + 1
       for _, source_name in ipairs(neo_tree.config.sources or {}) do
-        if type(source_name) == "string" and source_name:match("^gh_pr") then
+        if source_name == "gh_my_pr" or (type(source_name) == "string" and source_name:match("^gh_pr")) then
           local module = require(source_name)
           local source_config = neo_tree.config[source_name] or {}
           source_config.components = module.components or require(source_name .. ".components")
@@ -803,6 +805,7 @@ local function case_eager_entry_module()
 
   require("gh_pr")
   require("gh_pr_review")
+  require("gh_my_pr")
   require("gh_pr_comments")
 
   assert_equals(package.loaded["gh-pr.actions"], nil, "gh_pr loaded actions eagerly")
@@ -824,7 +827,7 @@ local function case_external_source_contract()
   install_neotree_stubs(state)
 
   local neo_tree = require("neo-tree")
-  neo_tree.config.sources = { "filesystem", "gh_pr", "gh_pr_review", "gh_pr_comments" }
+  neo_tree.config.sources = { "filesystem", "gh_pr", "gh_pr_review", "gh_my_pr", "gh_pr_comments" }
   neo_tree.ensure_config()
 
   assert_equals(state.ensure_config_calls, 1, "neo-tree ensure_config should be exercised once")
@@ -832,6 +835,8 @@ local function case_external_source_contract()
   assert_true(type(neo_tree.config.gh_pr.commands) == "table", "gh_pr wrapper must expose commands")
   assert_true(type(neo_tree.config.gh_pr_review.components) == "table", "gh_pr_review wrapper must expose components")
   assert_true(type(neo_tree.config.gh_pr_review.commands) == "table", "gh_pr_review wrapper must expose commands")
+  assert_true(type(neo_tree.config.gh_my_pr.components) == "table", "gh_my_pr wrapper must expose components")
+  assert_true(type(neo_tree.config.gh_my_pr.commands) == "table", "gh_my_pr wrapper must expose commands")
   assert_true(type(neo_tree.config.gh_pr_comments.components) == "table", "gh_pr_comments wrapper must expose components")
   assert_true(type(neo_tree.config.gh_pr_comments.commands) == "table", "gh_pr_comments wrapper must expose commands")
   assert_equals(package.loaded["gh-pr.actions"], nil, "top-level neo-tree wrapper contract should stay lazy for actions")
@@ -860,6 +865,11 @@ local function case_open_pending_and_idempotent()
         pr = {
           auto_register = true,
           gate = "github_repo",
+          workspace = "cwd",
+        },
+        my_pr = {
+          auto_register = false,
+          gate = "manual",
           workspace = "cwd",
         },
       },
@@ -921,6 +931,11 @@ local function case_github_gate_hides_source()
           gate = "github_repo",
           workspace = "cwd",
         },
+        my_pr = {
+          auto_register = false,
+          gate = "manual",
+          workspace = "cwd",
+        },
       },
     },
   })
@@ -965,6 +980,11 @@ local function case_manual_gate_skips_auto_registration()
           gate = "manual",
           workspace = "cwd",
         },
+        my_pr = {
+          auto_register = false,
+          gate = "manual",
+          workspace = "cwd",
+        },
       },
     },
   })
@@ -1001,6 +1021,11 @@ local function case_neotree_manager_fast_events_are_scheduled()
       neotree_sources = {
         pr = {
           auto_register = true,
+          gate = "manual",
+          workspace = "cwd",
+        },
+        my_pr = {
+          auto_register = false,
           gate = "manual",
           workspace = "cwd",
         },
@@ -1077,6 +1102,94 @@ local function case_review_tree_keeps_toggle()
   assert_equals(#state.command_calls, 1, "GhPrReviewTree should execute neo-tree command")
   assert_equals(state.command_calls[1].source, "gh_pr_review", "GhPrReviewTree should target gh_pr_review")
   assert_true(state.command_calls[1].toggle, "GhPrReviewTree must keep toggle=true")
+end
+
+local function case_my_pr_auto_registers_on_branch_match()
+  reset_ghpr_modules()
+  local state = {
+    manager_setups = {},
+    manager_refreshes = {},
+    command_calls = {},
+    redraws = 0,
+    modules_by_source = {},
+    window_states = {},
+  }
+  install_neotree_stubs(state)
+
+  local gh = require("gh-pr")
+  gh.setup({
+    ui = {
+      use_neotree = true,
+      telescope_fallback = false,
+      neotree_sources = {
+        my_pr = {
+          auto_register = true,
+          gate = "github_repo",
+          workspace = "cwd",
+        },
+      },
+    },
+  })
+
+  local repo_mod = require("gh-pr.repo")
+  local pr_service = require("gh-pr.pr_service")
+  local branch_name = "feature/my-pr"
+  local has_matching_pr = true
+
+  repo_mod.current_branch = function()
+    return branch_name, nil
+  end
+  repo_mod.current_branch_async = function(_, callback)
+    callback(branch_name, nil)
+  end
+  repo_mod.probe_workspace_async = function(_, callback)
+    callback({
+      eligible = true,
+      status = "eligible",
+      git_root = vim.fn.getcwd(),
+      repository = {
+        owner = "owner",
+        name = "repo",
+        full_name = "owner/repo",
+      },
+    })
+  end
+  pr_service.find_pr_for_branch_async = function(resolved_branch, _, callback)
+    if has_matching_pr then
+      callback({
+        number = 77,
+        title = "My branch PR",
+        state = "OPEN",
+        headRefName = resolved_branch,
+        headRepository = {
+          nameWithOwner = "owner/repo",
+        },
+      }, nil)
+      return
+    end
+
+    callback(nil, "No pull request matches the current branch in this repository")
+  end
+
+  require("neo-tree")
+  local neotree = require("gh-pr.integrations.neotree")
+  neotree.handle_neotree_filetype({})
+
+  assert_true(contains_source(state.neo_tree.config.sources, "gh_my_pr"), "gh_my_pr should auto-register on branch match")
+  assert_true(
+    contains_source(state.neo_tree.config.source_selector.sources, "gh_my_pr"),
+    "source selector should include gh_my_pr on branch match"
+  )
+
+  branch_name = "feature/no-pr"
+  has_matching_pr = false
+  neotree.handle_focus_event({})
+
+  assert_false(contains_source(state.neo_tree.config.sources, "gh_my_pr"), "gh_my_pr should disappear when branch stops matching a PR")
+  assert_false(
+    contains_source(state.neo_tree.config.source_selector.sources, "gh_my_pr"),
+    "source selector should hide gh_my_pr when branch stops matching a PR"
+  )
 end
 
 local function case_diff_comments_tree_opens_bottom()
@@ -2202,6 +2315,7 @@ case_github_gate_hides_source()
 case_manual_gate_skips_auto_registration()
 case_neotree_manager_fast_events_are_scheduled()
 case_review_tree_keeps_toggle()
+case_my_pr_auto_registers_on_branch_match()
 case_diff_comments_tree_opens_bottom()
 case_refresh_outside_focus_avoids_render()
 case_initial_navigate_renders_without_live_state()

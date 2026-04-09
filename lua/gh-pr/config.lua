@@ -231,6 +231,14 @@ local defaults = {
       show_stale_badge = true,
       sync_visible_buffers = true,
     },
+    gh_my_pr = {
+      enabled = true,
+      ttl_seconds = 30,
+      auto_refresh_when_focused = true,
+      max_cache_age_seconds = 300,
+      show_stale_badge = true,
+      sync_visible_buffers = true,
+    },
   },
   follow_current_file = {
     enabled = true,
@@ -238,6 +246,7 @@ local defaults = {
     sources = {
       pr = true,
       pr_review = true,
+      my_pr = true,
     },
   },
   diff_view = {
@@ -365,6 +374,11 @@ local defaults = {
     telescope_fallback = true,
     neotree_sources = {
       pr = {
+        auto_register = true,
+        gate = "github_repo",
+        workspace = "cwd",
+      },
+      my_pr = {
         auto_register = true,
         gate = "github_repo",
         workspace = "cwd",
@@ -985,6 +999,7 @@ local function sanitize_cache(cache_options)
   local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.cache), cache_options)
   result.gh_pr = type(result.gh_pr) == "table" and result.gh_pr or {}
   result.gh_pr_review = type(result.gh_pr_review) == "table" and result.gh_pr_review or {}
+  result.gh_my_pr = type(result.gh_my_pr) == "table" and result.gh_my_pr or {}
 
   if type(result.gh_pr.enabled) ~= "boolean" then
     result.gh_pr.enabled = defaults.cache.gh_pr.enabled
@@ -1031,6 +1046,31 @@ local function sanitize_cache(cache_options)
 
   if type(result.gh_pr_review.sync_visible_buffers) ~= "boolean" then
     result.gh_pr_review.sync_visible_buffers = defaults.cache.gh_pr_review.sync_visible_buffers
+  end
+
+  if type(result.gh_my_pr.enabled) ~= "boolean" then
+    result.gh_my_pr.enabled = defaults.cache.gh_my_pr.enabled
+  end
+
+  result.gh_my_pr.ttl_seconds = sanitize_positive_integer(
+    result.gh_my_pr.ttl_seconds,
+    defaults.cache.gh_my_pr.ttl_seconds
+  )
+  result.gh_my_pr.max_cache_age_seconds = sanitize_positive_integer(
+    result.gh_my_pr.max_cache_age_seconds,
+    defaults.cache.gh_my_pr.max_cache_age_seconds
+  )
+
+  if type(result.gh_my_pr.auto_refresh_when_focused) ~= "boolean" then
+    result.gh_my_pr.auto_refresh_when_focused = defaults.cache.gh_my_pr.auto_refresh_when_focused
+  end
+
+  if type(result.gh_my_pr.show_stale_badge) ~= "boolean" then
+    result.gh_my_pr.show_stale_badge = defaults.cache.gh_my_pr.show_stale_badge
+  end
+
+  if type(result.gh_my_pr.sync_visible_buffers) ~= "boolean" then
+    result.gh_my_pr.sync_visible_buffers = defaults.cache.gh_my_pr.sync_visible_buffers
   end
 
   return result
@@ -1102,6 +1142,9 @@ local function sanitize_follow_current_file(follow_current_file)
   if type(result.sources.pr_review) ~= "boolean" then
     result.sources.pr_review = defaults.follow_current_file.sources.pr_review
   end
+  if type(result.sources.my_pr) ~= "boolean" then
+    result.sources.my_pr = defaults.follow_current_file.sources.my_pr
+  end
 
   return result
 end
@@ -1135,6 +1178,7 @@ local function sanitize_neotree_sources(neotree_sources)
 
   local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.ui.neotree_sources), neotree_sources)
   result.pr = type(result.pr) == "table" and result.pr or {}
+  result.my_pr = type(result.my_pr) == "table" and result.my_pr or {}
 
   if type(result.pr.auto_register) ~= "boolean" then
     result.pr.auto_register = defaults.ui.neotree_sources.pr.auto_register
@@ -1146,6 +1190,18 @@ local function sanitize_neotree_sources(neotree_sources)
 
   if result.pr.workspace ~= "cwd" and result.pr.workspace ~= "buffer_repo" and result.pr.workspace ~= "neotree_root" then
     result.pr.workspace = defaults.ui.neotree_sources.pr.workspace
+  end
+
+  if type(result.my_pr.auto_register) ~= "boolean" then
+    result.my_pr.auto_register = defaults.ui.neotree_sources.my_pr.auto_register
+  end
+
+  if result.my_pr.gate ~= "github_repo" and result.my_pr.gate ~= "git_repo" and result.my_pr.gate ~= "manual" then
+    result.my_pr.gate = defaults.ui.neotree_sources.my_pr.gate
+  end
+
+  if result.my_pr.workspace ~= "cwd" and result.my_pr.workspace ~= "buffer_repo" and result.my_pr.workspace ~= "neotree_root" then
+    result.my_pr.workspace = defaults.ui.neotree_sources.my_pr.workspace
   end
 
   return result

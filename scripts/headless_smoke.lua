@@ -26,6 +26,11 @@ do
   local pr_explorer = cfg.diff_view.pr_explorer or {}
   local comments_panel = cfg.diff_view.comments_panel or {}
   local non_text = cfg.diff_view.non_text or {}
+  local cache = cfg.cache or {}
+  local follow_current_file = cfg.follow_current_file or {}
+  local follow_sources = follow_current_file.sources or {}
+  local neotree_sources = ((cfg.ui or {}).neotree_sources or {})
+  local my_pr_source = neotree_sources.my_pr or {}
   local overview_activity = (((cfg.overview or {}).panes or {}).activity or {})
   local overview_threads = overview_activity.threads or {}
   local overview_thread_diff = overview_threads.diff or {}
@@ -38,9 +43,11 @@ do
 
   assert(vim.fn.exists(":GhPrOpen") == 2, "Missing :GhPrOpen command")
   assert(vim.fn.exists(":GhPrReviewRefresh") == 2, "Missing :GhPrReviewRefresh command")
+  assert(vim.fn.exists(":GhPrMyPr") == 2, "Missing :GhPrMyPr command")
   assert(vim.fn.exists(":GhPRReviewRefresh") == 2, "Missing :GhPRReviewRefresh alias")
   assert(vim.fn.maparg("<Plug>(gh-pr-open)", "n") ~= "", "Missing <Plug>(gh-pr-open)")
   assert(vim.fn.maparg("<Plug>(gh-pr-review-refresh)", "n") ~= "", "Missing <Plug>(gh-pr-review-refresh)")
+  assert(vim.fn.maparg("<Plug>(gh-pr-my-pr)", "n") ~= "", "Missing <Plug>(gh-pr-my-pr)")
   assert(prefetch.enabled == true, "Missing diff_view.prefetch.enabled")
   assert(prefetch.concurrency == 2, "Missing diff_view.prefetch.concurrency")
   assert(prefetch.text_extensions[1] == "lua" and prefetch.text_extensions[2] == "md",
@@ -59,6 +66,17 @@ do
   assert(overview_thread_diff.context_before == 2 and overview_thread_diff.context_after == 2,
     "Missing overview activity diff context defaults")
   assert(overview_thread_diff.max_lines == 12, "Missing overview activity diff.max_lines default")
+  assert(type(require("gh-pr").open_my_pr_tree) == "function", "Missing open_my_pr_tree facade")
+  assert(type(cache.gh_my_pr) == "table" and cache.gh_my_pr.enabled == true, "Missing cache.gh_my_pr.enabled")
+  assert(cache.gh_my_pr.ttl_seconds == 30, "Missing cache.gh_my_pr.ttl_seconds default")
+  assert(cache.gh_my_pr.max_cache_age_seconds == 300, "Missing cache.gh_my_pr.max_cache_age_seconds default")
+  assert(cache.gh_my_pr.auto_refresh_when_focused == true, "Missing cache.gh_my_pr.auto_refresh_when_focused")
+  assert(cache.gh_my_pr.show_stale_badge == true, "Missing cache.gh_my_pr.show_stale_badge")
+  assert(cache.gh_my_pr.sync_visible_buffers == true, "Missing cache.gh_my_pr.sync_visible_buffers")
+  assert(follow_sources.my_pr == true, "Missing follow_current_file.sources.my_pr default")
+  assert(my_pr_source.auto_register == true, "Missing ui.neotree_sources.my_pr.auto_register")
+  assert(my_pr_source.gate == "github_repo", "Missing ui.neotree_sources.my_pr.gate")
+  assert(my_pr_source.workspace == "cwd", "Missing ui.neotree_sources.my_pr.workspace")
   assert(type(virtual_files.classify_file) == "function", "Missing virtual_files.classify_file")
   assert(virtual_files.classify_file({ path = "a.png", patch = "" }) == "image", "Expected image classification")
   assert(virtual_files.classify_file({ path = "a.zip", patch = "" }) == "asset", "Expected asset classification")
@@ -89,6 +107,8 @@ do
   assert(type(pr_service.fetch_dependency_review) == "function", "Missing pr_service.fetch_dependency_review")
   assert(type(pr_service.fetch_dependency_review_async) == "function",
     "Missing pr_service.fetch_dependency_review_async")
+  assert(type(pr_service.find_pr_for_branch) == "function", "Missing pr_service.find_pr_for_branch")
+  assert(type(pr_service.find_pr_for_branch_async) == "function", "Missing pr_service.find_pr_for_branch_async")
   assert(ok_annotations == true, "Missing gh-pr.check_annotations module")
   assert(ok_security_annotations == true, "Missing gh-pr.security_annotations module")
   assert(ok_security_section == true, "Missing gh-pr.neotree.review_sections.security module")

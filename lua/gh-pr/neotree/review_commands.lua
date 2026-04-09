@@ -11,8 +11,37 @@ local function get_config()
   return require("gh-pr.config")
 end
 
-local function get_source()
-  return require("gh-pr.neotree.review_source")
+local function resolve_source_name(state)
+  local source_name = type(state) == "table" and type(state.name) == "string" and state.name or nil
+  if type(source_name) == "string" and source_name ~= "" then
+    return source_name
+  end
+
+  local bufnr = type(state) == "table" and tonumber(state.bufnr) or nil
+  if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
+    bufnr = vim.api.nvim_get_current_buf()
+  end
+
+  local buffer_source = type(vim.b[bufnr]) == "table" and vim.b[bufnr].neo_tree_source or nil
+  if type(buffer_source) == "string" and buffer_source ~= "" then
+    return buffer_source
+  end
+
+  return "gh_pr_review"
+end
+
+local function get_source(state)
+  local registry = require("gh-pr.neotree.registry")
+  local source_name = resolve_source_name(state)
+  return registry.get(source_name) or require("gh-pr.neotree.review_source")
+end
+
+local function source_label(state)
+  local source = get_source(state)
+  if type(source) == "table" and type(source.source_label) == "function" then
+    return source.source_label()
+  end
+  return "PR Review"
 end
 
 local function get_runtime_state()
@@ -111,7 +140,7 @@ local STATUS_FILTER_CHOICES = {
 }
 
 local function current_file_filters(state)
-  local source = get_source()
+  local source = get_source(state)
   if type(source.get_file_filters) ~= "function" then
     return {
       path_query = "",
@@ -128,15 +157,15 @@ local function current_file_filters(state)
 end
 
 local function update_file_filters(state, updates)
-  local source = get_source()
+  local source = get_source(state)
   if type(source.update_file_filters) ~= "function" then
-    vim.notify("PR Review file filters are unavailable", vim.log.levels.WARN)
+    vim.notify(source_label(state) .. " file filters are unavailable", vim.log.levels.WARN)
     return false, nil
   end
 
   local ok, err, filters = source.update_file_filters(state, updates)
   if not ok then
-    vim.notify(err or "Unable to update PR Review file filters", vim.log.levels.ERROR)
+    vim.notify(err or ("Unable to update " .. source_label(state) .. " file filters"), vim.log.levels.ERROR)
     return false, nil
   end
 
@@ -144,19 +173,19 @@ local function update_file_filters(state, updates)
 end
 
 local function reset_file_filters(state)
-  local source = get_source()
+  local source = get_source(state)
   if type(source.reset_file_filters) ~= "function" then
-    vim.notify("PR Review file filters are unavailable", vim.log.levels.WARN)
+    vim.notify(source_label(state) .. " file filters are unavailable", vim.log.levels.WARN)
     return false
   end
 
   local ok, err = source.reset_file_filters(state)
   if not ok then
-    vim.notify(err or "Unable to reset PR Review file filters", vim.log.levels.ERROR)
+    vim.notify(err or ("Unable to reset " .. source_label(state) .. " file filters"), vim.log.levels.ERROR)
     return false
   end
 
-  vim.notify("PR Review file filters reset", vim.log.levels.INFO)
+  vim.notify(source_label(state) .. " file filters reset", vim.log.levels.INFO)
   return true
 end
 
@@ -521,7 +550,7 @@ end
 M.noop = function() end
 
 M.refresh = function(state)
-  get_source().request_refresh(state, {
+  get_source(state).request_refresh(state, {
     force = true,
     refresh_context = {
       mode = "ui-refresh",
@@ -577,7 +606,7 @@ M.gh_pr_review_open = function(state)
   end
 
   if kind == "check" then
-    local loaded, load_err = get_source().request_check_annotations(state, node)
+    local loaded, load_err = get_source(state).request_check_annotations(state, node)
     if not loaded then
       vim.notify(load_err or "Unable to load check annotations", vim.log.levels.ERROR)
       return
@@ -593,7 +622,7 @@ M.gh_pr_review_open = function(state)
   end
 
   if kind == "security_code_scanning" then
-    local loaded, load_err = get_source().request_security_code_scanning(state, node)
+    local loaded, load_err = get_source(state).request_security_code_scanning(state, node)
     if not loaded then
       vim.notify(load_err or "Unable to load code scanning findings", vim.log.levels.ERROR)
       return
@@ -604,7 +633,7 @@ M.gh_pr_review_open = function(state)
   end
 
   if kind == "security_dependency_review" then
-    local loaded, load_err = get_source().request_security_dependency_review(state, node)
+    local loaded, load_err = get_source(state).request_security_dependency_review(state, node)
     if not loaded then
       vim.notify(load_err or "Unable to load dependency review findings", vim.log.levels.ERROR)
       return
@@ -943,9 +972,9 @@ M.filter_files_by_path = function(state)
     }))
     if ok then
       if query == "" then
-        vim.notify("PR Review file path filter cleared", vim.log.levels.INFO)
+        vim.notify(source_label(state) .. " file path filter cleared", vim.log.levels.INFO)
       else
-        vim.notify("PR Review file path filter: " .. query, vim.log.levels.INFO)
+        vim.notify(source_label(state) .. " file path filter: " .. query, vim.log.levels.INFO)
       end
     end
   end)
@@ -956,14 +985,14 @@ M.clear_file_path_filter = function(state)
     path_query = "",
   }))
   if ok then
-    vim.notify("PR Review file path filter cleared", vim.log.levels.INFO)
+    vim.notify(source_label(state) .. " file path filter cleared", vim.log.levels.INFO)
   end
 end
 
 M.select_file_status_filter = function(state)
   local filters = current_file_filters(state)
   vim.ui.select(STATUS_FILTER_CHOICES, {
-    prompt = "PR Review file status filter:",
+    prompt = source_label(state) .. " file status filter:",
     format_item = function(item)
       local label = type(item) == "table" and item.label or tostring(item)
       local value = type(item) == "table" and item.value or ""
@@ -981,7 +1010,7 @@ M.select_file_status_filter = function(state)
       status = choice.value,
     })
     if ok then
-      vim.notify("PR Review file status filter: " .. (next_filters.status or "all"), vim.log.levels.INFO)
+      vim.notify(source_label(state) .. " file status filter: " .. (next_filters.status or "all"), vim.log.levels.INFO)
     end
   end)
 end
@@ -1002,9 +1031,9 @@ M.filter_files_by_extension = function(state)
     }))
     if ok then
       if extension == "" then
-        vim.notify("PR Review file extension filter cleared", vim.log.levels.INFO)
+        vim.notify(source_label(state) .. " file extension filter cleared", vim.log.levels.INFO)
       else
-        vim.notify("PR Review file extension filter: " .. extension, vim.log.levels.INFO)
+        vim.notify(source_label(state) .. " file extension filter: " .. extension, vim.log.levels.INFO)
       end
     end
   end)
@@ -1016,7 +1045,7 @@ M.toggle_no_extension_filter = function(state)
     no_extension = not (filters.no_extension == true),
   })
   if ok then
-    vim.notify("PR Review no-extension filter: " .. ((next_filters.no_extension == true) and "on" or "off"), vim.log.levels.INFO)
+    vim.notify(source_label(state) .. " no-extension filter: " .. ((next_filters.no_extension == true) and "on" or "off"), vim.log.levels.INFO)
   end
 end
 
@@ -1026,7 +1055,7 @@ M.toggle_dotfiles_filter = function(state)
     dotfiles = not (filters.dotfiles == true),
   })
   if ok then
-    vim.notify("PR Review dotfiles filter: " .. ((next_filters.dotfiles == true) and "on" or "off"), vim.log.levels.INFO)
+    vim.notify(source_label(state) .. " dotfiles filter: " .. ((next_filters.dotfiles == true) and "on" or "off"), vim.log.levels.INFO)
   end
 end
 
@@ -1037,7 +1066,7 @@ M.toggle_unviewed_only_filter = function(state)
     viewed_state = next_value,
   })
   if ok then
-    vim.notify("PR Review viewed filter: " .. (next_filters.viewed_state or "all"), vim.log.levels.INFO)
+    vim.notify(source_label(state) .. " viewed filter: " .. (next_filters.viewed_state or "all"), vim.log.levels.INFO)
   end
 end
 
@@ -1048,7 +1077,7 @@ M.toggle_viewed_only_filter = function(state)
     viewed_state = next_value,
   })
   if ok then
-    vim.notify("PR Review viewed filter: " .. (next_filters.viewed_state or "all"), vim.log.levels.INFO)
+    vim.notify(source_label(state) .. " viewed filter: " .. (next_filters.viewed_state or "all"), vim.log.levels.INFO)
   end
 end
 
@@ -1061,7 +1090,7 @@ M.toggle_hide_viewed_filter = function(state)
   })
   if ok then
     vim.notify(
-      "PR Review hide viewed: " .. ((next_filters.hide_viewed == true) and "on" or "off"),
+      source_label(state) .. " hide viewed: " .. ((next_filters.hide_viewed == true) and "on" or "off"),
       vim.log.levels.INFO
     )
   end
@@ -1074,7 +1103,7 @@ M.toggle_hide_deleted_filter = function(state)
   })
   if ok then
     vim.notify(
-      "PR Review hide deleted: " .. ((next_filters.hide_deleted == true) and "on" or "off"),
+      source_label(state) .. " hide deleted: " .. ((next_filters.hide_deleted == true) and "on" or "off"),
       vim.log.levels.INFO
     )
   end
@@ -1084,7 +1113,7 @@ M.reset_file_filters = function(state)
   reset_file_filters(state)
 end
 
-M.toggle_files_flat_mode = function()
+M.toggle_files_flat_mode = function(state)
   local next_mode = not effective_review_files_flat_mode()
   local runtime_state = get_runtime_state()
   if type(runtime_state.set_pr_review_files_flat_pref) == "function" then
@@ -1092,8 +1121,8 @@ M.toggle_files_flat_mode = function()
   end
 
   local label = next_mode and "list" or "tree"
-  vim.notify("PR Review Files mode: " .. label, vim.log.levels.INFO)
-  get_source().render_cached_states()
+  vim.notify(source_label(state) .. " Files mode: " .. label, vim.log.levels.INFO)
+  get_source(state).render_cached_states()
 end
 
 cc._add_common_commands(M)

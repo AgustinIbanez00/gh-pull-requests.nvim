@@ -33,6 +33,12 @@ function M.build()
         callback = safe_neotree_callback("handle_dir_changed"),
       },
     },
+    {
+      event = { "BufEnter", "WinEnter", "FocusGained" },
+      opts = {
+        callback = safe_neotree_callback("handle_focus_event"),
+      },
+    },
   }
 end
 

@@ -34,7 +34,8 @@ local function resolve_commit(commit)
   end
 
   local bufnr = vim.api.nvim_get_current_buf()
-  if buffer_filetype(bufnr) == "neo-tree" and vim.b[bufnr].neo_tree_source == "gh_pr_review" then
+  if buffer_filetype(bufnr) == "neo-tree"
+    and (vim.b[bufnr].neo_tree_source == "gh_pr_review" or vim.b[bufnr].neo_tree_source == "gh_my_pr") then
     local manager_ok, manager = pcall(require, "neo-tree.sources.manager")
     if manager_ok and type(manager.get_state_for_window) == "function" then
       local winid = vim.api.nvim_get_current_win()
@@ -255,6 +256,8 @@ function codediff_file_runtime.register(open_result, payload)
     check_annotations_ctx = vim.deepcopy(type(payload) == "table" and payload.check_annotations_ctx or nil),
     security_annotations_ctx = vim.deepcopy(type(payload) == "table" and payload.security_annotations_ctx or nil),
     file_mode = type(payload) == "table" and safe_string(payload.file_mode, "") or "",
+    source_name = type(payload) == "table" and safe_string(payload.source_name, "") or "",
+    local_head_path = type(payload) == "table" and safe_string(payload.local_head_path, "") or "",
     version = version + 1,
     applied = type(existing) == "table" and existing.applied or nil,
   }
@@ -486,6 +489,10 @@ local function apply_codediff_buffer_metadata(bufnr, pr, details, path, side, fi
   vim.b[bufnr].gh_pr_file_mode = type(file_mode) == "string" and file_mode ~= "" and file_mode or nil
   vim.b[bufnr].gh_pr_diff_backend = "codediff"
   vim.b[bufnr].gh_pr_codediff_layout = layout
+  vim.b[bufnr].gh_pr_source_name = type(opts.source_name) == "string" and opts.source_name ~= "" and opts.source_name or nil
+  vim.b[bufnr].gh_pr_local_head_path = type(opts.local_head_path) == "string" and opts.local_head_path ~= ""
+      and opts.local_head_path
+    or nil
   vim.b[bufnr].gh_pr_is_image = false
   vim.b[bufnr].gh_pr_is_non_text = false
   vim.b[bufnr].gh_pr_asset_kind = nil
@@ -576,6 +583,8 @@ local function apply_codediff_open_result_context(pr, details, file, open_result
       file_kind = "base",
       comment_side = "base",
       layout = layout,
+      source_name = opts.source_name,
+      local_head_path = opts.local_head_path,
     })
     local base_win = resolve_codediff_window(open_result.base_win, base_buf)
     if base_win then
@@ -604,6 +613,8 @@ local function apply_codediff_open_result_context(pr, details, file, open_result
       file_kind = layout == "inline" and "unified" or "head",
       comment_side = "head",
       layout = layout,
+      source_name = opts.source_name,
+      local_head_path = opts.local_head_path,
     })
     local head_win = resolve_codediff_window(open_result.head_win, head_buf)
     if head_win then
@@ -667,6 +678,8 @@ local function apply_codediff_open_result_context(pr, details, file, open_result
       check_annotations_ctx = check_annotations_ctx,
       security_annotations_ctx = security_annotations_ctx,
       file_mode = file_mode,
+      source_name = opts.source_name,
+      local_head_path = opts.local_head_path,
     })
   end
 end
@@ -704,6 +717,8 @@ function codediff_file_runtime.rehydrate(tabpage)
     comments_ctx = entry.comments_ctx,
     check_annotations_ctx = entry.check_annotations_ctx,
     security_annotations_ctx = entry.security_annotations_ctx,
+    source_name = entry.source_name,
+    local_head_path = entry.local_head_path,
     register_runtime = false,
   })
 

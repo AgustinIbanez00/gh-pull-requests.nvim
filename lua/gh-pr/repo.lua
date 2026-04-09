@@ -88,6 +88,38 @@ function M.git_root_async(opts, callback)
   end)
 end
 
+function M.current_branch(opts)
+  local output, err = gh.run_command({ "git", "branch", "--show-current" }, command_opts(opts))
+  if not output then
+    return nil, err
+  end
+
+  local branch = vim.trim(output)
+  if branch == "" then
+    return nil, "Detached HEAD or current branch is unavailable"
+  end
+
+  return branch, nil
+end
+
+function M.current_branch_async(opts, callback)
+  callback = type(callback) == "function" and callback or function() end
+  gh.run_command_async({ "git", "branch", "--show-current" }, command_opts(opts), function(output, err)
+    if not output then
+      callback(nil, err)
+      return
+    end
+
+    local branch = vim.trim(output)
+    if branch == "" then
+      callback(nil, "Detached HEAD or current branch is unavailable")
+      return
+    end
+
+    callback(branch, nil)
+  end)
+end
+
 function M.resolve_repository(remotes, opts)
   remotes = remotes or { "origin", "upstream" }
 

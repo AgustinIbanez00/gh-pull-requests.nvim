@@ -793,6 +793,155 @@ function M.list_queries_with_results_async(callback, opts)
   load_next()
 end
 
+local function normalize_branch_pr_summary(item)
+  if type(item) ~= "table" then
+    return nil
+  end
+
+  local head = type(item.head) == "table" and item.head or {}
+  local base = type(item.base) == "table" and item.base or {}
+  local user = type(item.user) == "table" and item.user or {}
+  local head_repo = type(head.repo) == "table" and head.repo or {}
+
+  local number = tonumber(item.number)
+  if not number then
+    return nil
+  end
+
+  return {
+    number = number,
+    title = normalize_string(item.title, "(no title)"),
+    state = normalize_string(item.state, ""),
+    isDraft = item.draft == true,
+    author = {
+      login = normalize_login(user, "unknown"),
+    },
+    updatedAt = normalize_string(item.updated_at, ""),
+    reviewDecision = normalize_string(item.review_decision, ""),
+    url = normalize_string(item.html_url, ""),
+    headRefName = normalize_string(head.ref, ""),
+    baseRefName = normalize_string(base.ref, ""),
+    headRepository = normalize_repo(head_repo.full_name or head_repo.nameWithOwner),
+    headRepositoryOwner = {
+      login = normalize_string(type(head_repo.owner) == "table" and head_repo.owner.login or "", ""),
+    },
+  }
+end
+
+local function select_best_branch_pr(prs)
+  local open_candidate = nil
+  for _, pr in ipairs(type(prs) == "table" and prs or {}) do
+    if type(pr) == "table" and normalize_string(pr.state, ""):upper() == "OPEN" then
+      open_candidate = pr
+      break
+    end
+  end
+
+  if open_candidate then
+    return open_candidate
+  end
+
+  return type(prs) == "table" and prs[1] or nil
+end
+
+local function branch_pr_api_args(repository, branch)
+  return {
+    "api",
+    string.format("repos/%s/%s/pulls", repository.owner, repository.name),
+    "-f",
+    "head=" .. repository.owner .. ":" .. branch,
+    "-f",
+    "state=all",
+    "-f",
+    "sort=updated",
+    "-f",
+    "direction=desc",
+    "-F",
+    "per_page=20",
+  }
+end
+
+local function filter_branch_pr_candidates(repository, branch, payload)
+  local matches = {}
+  local full_name = type(repository) == "table" and repository.full_name or ""
+  for _, item in ipairs(type(payload) == "table" and payload or {}) do
+    local normalized = normalize_branch_pr_summary(item)
+    local head_repository = repository.name_with_owner(normalized and normalized.headRepository or nil)
+    if normalized
+      and normalized.headRefName == branch
+      and head_repository == full_name then
+      matches[#matches + 1] = normalized
+    end
+  end
+  return matches
+end
+
+function M.find_pr_for_branch(branch, opts)
+  opts = type(opts) == "table" and opts or {}
+  branch = normalize_string(branch, "")
+  if branch == "" then
+    return nil, "Current branch is unavailable"
+  end
+
+  local repository = normalize_repository_filter(opts.repository)
+  if not repository then
+    local resolved, repo_err = M.resolve_repository()
+    if not resolved then
+      return nil, repo_err
+    end
+    repository = resolved
+  end
+
+  local payload, err = gh.run_json(branch_pr_api_args(repository, branch))
+  if not payload then
+    return nil, err
+  end
+
+  local matches = filter_branch_pr_candidates(repository, branch, payload)
+  local selected = select_best_branch_pr(matches)
+  if not selected then
+    return nil, "No pull request matches the current branch in this repository"
+  end
+
+  return selected, nil
+end
+
+function M.find_pr_for_branch_async(branch, opts, callback)
+  opts = type(opts) == "table" and opts or {}
+  callback = type(callback) == "function" and callback or function() end
+  branch = normalize_string(branch, "")
+  if branch == "" then
+    callback(nil, "Current branch is unavailable")
+    return
+  end
+
+  local repository = normalize_repository_filter(opts.repository)
+  if not repository then
+    local resolved, repo_err = M.resolve_repository()
+    if not resolved then
+      callback(nil, repo_err)
+      return
+    end
+    repository = resolved
+  end
+
+  gh.run_json_async(branch_pr_api_args(repository, branch), nil, function(payload, err)
+    if not payload then
+      callback(nil, err)
+      return
+    end
+
+    local matches = filter_branch_pr_candidates(repository, branch, payload)
+    local selected = select_best_branch_pr(matches)
+    if not selected then
+      callback(nil, "No pull request matches the current branch in this repository")
+      return
+    end
+
+    callback(selected, nil)
+  end)
+end
+
 function M.fetch_details(number)
   local details, err = gh.run_json({
     "pr",

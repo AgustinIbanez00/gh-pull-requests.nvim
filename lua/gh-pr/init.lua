@@ -132,6 +132,17 @@ local function open_review_view(opts)
   })
 end
 
+local function open_my_pr_view(opts)
+  opts = opts or {}
+  if not get_repo().ensure_git_repo() then
+    return false
+  end
+
+  return open_neotree("gh_my_pr", "gh_my_pr", {
+    toggle = opts.toggle ~= false,
+  })
+end
+
 local function refresh_views()
   get_neotree().refresh_sources()
 end
@@ -257,6 +268,13 @@ function M.open_review_tree(opts)
   opts = opts or {}
   return with_runtime(function()
     return open_review_view(opts)
+  end)
+end
+
+function M.open_my_pr_tree(opts)
+  opts = opts or {}
+  return with_runtime(function()
+    return open_my_pr_view(opts)
   end)
 end
 

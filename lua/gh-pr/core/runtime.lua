@@ -23,10 +23,12 @@ local function start_auto_refresh_timer()
   local cache_config = ((config.get() or {}).cache or {})
   local gh_pr_cache_options = type(cache_config.gh_pr) == "table" and cache_config.gh_pr or {}
   local gh_pr_review_cache_options = type(cache_config.gh_pr_review) == "table" and cache_config.gh_pr_review or {}
+  local gh_my_pr_cache_options = type(cache_config.gh_my_pr) == "table" and cache_config.gh_my_pr or {}
 
   local gh_pr_enabled = gh_pr_cache_options.auto_refresh_when_focused ~= false
   local gh_pr_review_enabled = gh_pr_review_cache_options.auto_refresh_when_focused ~= false
-  if not gh_pr_enabled and not gh_pr_review_enabled then
+  local gh_my_pr_enabled = gh_my_pr_cache_options.auto_refresh_when_focused ~= false
+  if not gh_pr_enabled and not gh_pr_review_enabled and not gh_my_pr_enabled then
     return
   end
 
@@ -36,6 +38,9 @@ local function start_auto_refresh_timer()
   end
   if gh_pr_review_enabled then
     intervals[#intervals + 1] = tonumber(gh_pr_review_cache_options.ttl_seconds) or 60
+  end
+  if gh_my_pr_enabled then
+    intervals[#intervals + 1] = tonumber(gh_my_pr_cache_options.ttl_seconds) or 60
   end
 
   local interval = intervals[1] or 60
@@ -82,6 +87,20 @@ local function start_auto_refresh_timer()
         },
       })
     end
+
+    local my_pr_source = registry.get("gh_my_pr")
+    if gh_my_pr_enabled and type(my_pr_source) == "table" and type(my_pr_source.request_refresh) == "function" then
+      local focused = type(my_pr_source.is_focused) == "function" and my_pr_source.is_focused() == true
+      pcall(my_pr_source.request_refresh, nil, {
+        force = false,
+        notify_error = false,
+        refresh_context = {
+          mode = focused and "ui-refresh" or "cache-only",
+          reason = "timer",
+          notify = focused,
+        },
+      })
+    end
   end))
 end
 
@@ -99,6 +118,7 @@ local function follow_current_file_options()
     debounce_ms = debounce_ms,
     source_pr = sources.pr ~= false,
     source_pr_review = sources.pr_review ~= false,
+    source_my_pr = sources.my_pr ~= false,
   }
 end
 
@@ -128,6 +148,13 @@ local function schedule_follow_current_file()
       local source = registry.get("gh_pr")
       if type(source) == "table" and type(source.follow_current_file_if_visible) == "function" then
         pcall(source.follow_current_file_if_visible, { reason = "autocmd" })
+      end
+    end
+
+    if options.source_my_pr then
+      local my_pr_source = registry.get("gh_my_pr")
+      if type(my_pr_source) == "table" and type(my_pr_source.follow_current_file_if_visible) == "function" then
+        pcall(my_pr_source.follow_current_file_if_visible, { reason = "autocmd" })
       end
     end
   end, options.debounce_ms)

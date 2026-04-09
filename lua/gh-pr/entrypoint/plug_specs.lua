@@ -13,6 +13,7 @@ return {
   { lhs = "<Plug>(gh-pr-open-modified)", rhs = "<Cmd>GhPrOpenModified<CR>", desc = "Open PR file head version" },
   { lhs = "<Plug>(gh-pr-open-commit-patch)", rhs = "<Cmd>GhPrOpenCommitPatch<CR>", desc = "Open selected commit patch" },
   { lhs = "<Plug>(gh-pr-review-tree)", rhs = "<Cmd>GhPrReviewTree<CR>", desc = "Toggle PR Review source" },
+  { lhs = "<Plug>(gh-pr-my-pr)", rhs = "<Cmd>GhPrMyPr<CR>", desc = "Toggle My PR source" },
   { lhs = "<Plug>(gh-pr-toggle-reviewed)", rhs = "<Cmd>GhPrToggleReviewed<CR>", desc = "Toggle viewed" },
   { lhs = "<Plug>(gh-pr-next-change)", rhs = "<Cmd>GhPrNextChange<CR>", desc = "Next diff change" },
   { lhs = "<Plug>(gh-pr-prev-change)", rhs = "<Cmd>GhPrPrevChange<CR>", desc = "Previous diff change" },

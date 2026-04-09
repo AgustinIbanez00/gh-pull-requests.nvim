@@ -384,9 +384,9 @@ local function resolve_lifecycle_windows()
   }
 end
 
-local function resolve_file_open_result(base_temp_path, head_temp_path)
-  local base_buf = find_buffer_for_path(base_temp_path)
-  local head_buf = find_buffer_for_path(head_temp_path)
+local function resolve_file_open_result(base_open_path, head_open_path)
+  local base_buf = find_buffer_for_path(base_open_path)
+  local head_buf = find_buffer_for_path(head_open_path)
   local base_win = nil
   local head_win = nil
 
@@ -434,8 +434,8 @@ local function resolve_file_open_result(base_temp_path, head_temp_path)
     head_buf = head_buf,
     base_win = base_win,
     head_win = head_win,
-    base_temp_path = base_temp_path,
-    head_temp_path = head_temp_path,
+    base_temp_path = base_open_path,
+    head_temp_path = head_open_path,
   }, nil
 end
 
@@ -1465,6 +1465,20 @@ function M.open_pr_file_diff(opts)
     return nil, prepare_err
   end
 
+  local head_open_path = prepared.head_temp_path
+  local local_head_path = safe_string(opts.local_head_path)
+  if local_head_path ~= "" and safe_string(prepared.data.file_mode) ~= "removed_single" then
+    local absolute_local_head = vim.fn.fnamemodify(local_head_path, ":p")
+    if absolute_local_head ~= "" and (vim.fn.filereadable(absolute_local_head) == 1 or vim.fn.bufexists(absolute_local_head) == 1) then
+      head_open_path = absolute_local_head
+      local_head_path = absolute_local_head
+    else
+      local_head_path = ""
+    end
+  else
+    local_head_path = ""
+  end
+
   local layout = normalize_layout(opts.layout)
   local layout_flag = "--side-by-side"
   if layout == "inline" then
@@ -1479,7 +1493,7 @@ function M.open_pr_file_diff(opts)
   local command = string.format(
     "CodeDiff file %s %s %s",
     vim.fn.fnameescape(prepared.base_temp_path),
-    vim.fn.fnameescape(prepared.head_temp_path),
+    vim.fn.fnameescape(head_open_path),
     layout_flag
   )
   local ok_open, open_err = run_codediff_command(command)
@@ -1487,7 +1501,7 @@ function M.open_pr_file_diff(opts)
     return nil, open_err
   end
 
-  local opened, resolve_err = resolve_file_open_result(prepared.base_temp_path, prepared.head_temp_path)
+  local opened, resolve_err = resolve_file_open_result(prepared.base_temp_path, head_open_path)
   if not opened then
     return nil, resolve_err
   end
@@ -1501,6 +1515,8 @@ function M.open_pr_file_diff(opts)
   opened.base_path = safe_string(prepared.data.base_path)
   opened.head_path = safe_string(prepared.data.head_path)
   opened.layout = layout
+  opened.source_name = safe_string(opts.source_name)
+  opened.local_head_path = local_head_path ~= "" and local_head_path or nil
 
   M.focus_side_and_line(opened, opts)
   return opened, nil

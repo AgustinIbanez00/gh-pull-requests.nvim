@@ -1,8 +1,3 @@
-local M = {
-  name = "gh_pr_review",
-  display_name = "GH PR Review",
-}
-
 local cache_store = require("gh-pr.cache_store")
 local comments_source = require("gh-pr.neotree.comments_source")
 local config = require("gh-pr.config")
@@ -24,73 +19,159 @@ local virtual_files = require("gh-pr.virtual_files")
 
 local renderer = require("neo-tree.ui.renderer")
 
-local DEFAULT_RENDERERS = {
-  folder = {
-    { "indent", with_expanders = true },
-    { "kind_icon" },
-    { "container", width = "100%", content = { { "folder_viewed_badge", zindex = 10 }, { "name", zindex = 11 } } },
-  },
-  files = {
-    { "indent", with_expanders = true },
-    { "kind_icon" },
-    { "container", width = "100%", content = { { "name", zindex = 10 } } },
-  },
-  overview = {
-    { "indent", with_expanders = false },
-    { "kind_icon" },
-    { "container", width = "100%", content = { { "name", zindex = 10 } } },
-  },
-  directory = {
-    { "indent", with_expanders = true },
-    { "kind_icon" },
-    { "container", width = "100%", content = { { "folder_viewed_badge", zindex = 10 }, { "name", zindex = 11 } } },
-  },
-  commit = {
-    { "indent", with_expanders = false },
-    { "kind_icon" },
-    { "container", width = "100%", content = { { "name", zindex = 10 } } },
-  },
-  file = {
-    { "indent", with_expanders = false },
-    { "kind_icon" },
-    {
-      "container",
-      width = "100%",
-      content = {
-        { "name", zindex = 10 },
-        { "file_parent_path", zindex = 10 },
-        { "file_review_badges", zindex = 20, align = "right" },
+local function create(provider)
+  provider = type(provider) == "table" and provider or {}
+
+  local source_name = type(provider.source_name) == "string" and provider.source_name ~= "" and provider.source_name
+    or "gh_pr_review"
+  local display_name = type(provider.display_name) == "string" and provider.display_name ~= "" and provider.display_name
+    or "GH PR Review"
+  local cache_key = type(provider.cache_key) == "string" and provider.cache_key ~= "" and provider.cache_key or source_name
+  local state_repo_key_field = type(provider.state_repo_key_field) == "string"
+      and provider.state_repo_key_field ~= ""
+      and provider.state_repo_key_field
+    or (source_name .. "_repo_key")
+  local id_prefix = type(provider.id_prefix) == "string" and provider.id_prefix ~= "" and provider.id_prefix
+    or source_name:gsub("_", "-")
+  local source_label = type(provider.source_label) == "string" and provider.source_label ~= "" and provider.source_label
+    or display_name
+  local loading_message = type(provider.loading_message) == "string" and provider.loading_message ~= ""
+      and provider.loading_message
+    or "Loading PR review..."
+  local stale_message = type(provider.stale_message) == "string" and provider.stale_message ~= ""
+      and provider.stale_message
+    or "Showing cached PR review while refreshing..."
+  local no_target_message = type(provider.no_target_message) == "string" and provider.no_target_message ~= ""
+      and provider.no_target_message
+    or "No active review for this repository. Use 'Start Review' from PR source."
+  local not_git_message = type(provider.not_git_message) == "string" and provider.not_git_message ~= ""
+      and provider.not_git_message
+    or "Open a git repository to use gh-pr review"
+  local repo_error_prefix = type(provider.repo_error_prefix) == "string" and provider.repo_error_prefix ~= ""
+      and provider.repo_error_prefix
+    or "Unable to resolve repository: "
+  local apply_provider_runtime_target
+  local sync_runtime = type(provider.sync_runtime) == "function" and provider.sync_runtime or nil
+  local apply_runtime_target = type(provider.apply_runtime_target) == "function" and provider.apply_runtime_target or nil
+  local resolve_target_async = type(provider.resolve_target_async) == "function" and provider.resolve_target_async or nil
+  local should_prefetch_review = type(provider.should_prefetch_review) == "function" and provider.should_prefetch_review or nil
+
+  if type(sync_runtime) ~= "function" then
+    sync_runtime = function(repo_full_name, details)
+      runtime_state.set_active_pr(details, details)
+      runtime_state.set_active_review(repo_full_name, details, details)
+    end
+  end
+
+  if type(apply_runtime_target) ~= "function" then
+    apply_runtime_target = function(_, repo_context)
+      if type(repo_context) ~= "table" or type(repo_context.repository) ~= "table" then
+        return nil
+      end
+
+      local pr, details = runtime_state.get_active_review(repo_context.repository.full_name)
+      if type(pr) ~= "table" then
+        return {
+          reason = no_target_message,
+        }
+      end
+
+      return {
+        pr = pr,
+        details = details or pr,
+      }
+    end
+  end
+
+  if type(resolve_target_async) ~= "function" then
+    resolve_target_async = function(repo_context, session, callback)
+      callback = type(callback) == "function" and callback or function() end
+      apply_provider_runtime_target(session, repo_context)
+      if type(session) ~= "table" or type(session.target_pr) ~= "table" then
+        callback(nil, nil)
+        return
+      end
+
+      callback({
+        pr = session.target_pr,
+        details = session.target_details or session.target_pr,
+        branch = session.branch_name,
+      }, nil)
+    end
+  end
+
+  local M = {
+    name = source_name,
+    display_name = display_name,
+  }
+
+  local DEFAULT_RENDERERS = {
+    folder = {
+      { "indent", with_expanders = true },
+      { "kind_icon" },
+      { "container", width = "100%", content = { { "folder_viewed_badge", zindex = 10 }, { "name", zindex = 11 } } },
+    },
+    files = {
+      { "indent", with_expanders = true },
+      { "kind_icon" },
+      { "container", width = "100%", content = { { "name", zindex = 10 } } },
+    },
+    overview = {
+      { "indent", with_expanders = false },
+      { "kind_icon" },
+      { "container", width = "100%", content = { { "name", zindex = 10 } } },
+    },
+    directory = {
+      { "indent", with_expanders = true },
+      { "kind_icon" },
+      { "container", width = "100%", content = { { "folder_viewed_badge", zindex = 10 }, { "name", zindex = 11 } } },
+    },
+    commit = {
+      { "indent", with_expanders = false },
+      { "kind_icon" },
+      { "container", width = "100%", content = { { "name", zindex = 10 } } },
+    },
+    file = {
+      { "indent", with_expanders = false },
+      { "kind_icon" },
+      {
+        "container",
+        width = "100%",
+        content = {
+          { "name", zindex = 10 },
+          { "file_parent_path", zindex = 10 },
+          { "file_review_badges", zindex = 20, align = "right" },
+        },
       },
     },
-  },
-  comment_file = {
-    { "indent", with_expanders = true },
-    { "kind_icon" },
-    { "container", width = "100%", content = { { "name", zindex = 10 } } },
-  },
-  message = {
-    { "indent", with_markers = false, with_expanders = false },
-    { "kind_icon" },
-    { "name", highlight = "NeoTreeMessage" },
-  },
-}
+    comment_file = {
+      { "indent", with_expanders = true },
+      { "kind_icon" },
+      { "container", width = "100%", content = { { "name", zindex = 10 } } },
+    },
+    message = {
+      { "indent", with_markers = false, with_expanders = false },
+      { "kind_icon" },
+      { "name", highlight = "NeoTreeMessage" },
+    },
+  }
 
-local runtime_cache = {
-  repos = {},
-  last_prune_at = 0,
-}
+  local runtime_cache = {
+    repos = {},
+    last_prune_at = 0,
+  }
 
-local REFRESH_MODE_UI = "ui-refresh"
-local REFRESH_MODE_CACHE_ONLY = "cache-only"
-local SOURCE_NAME = "gh_pr_review"
-local FILE_FILTER_STATUS = {
-  all = true,
-  added = true,
-  modified = true,
-  deleted = true,
-  renamed = true,
-  copied = true,
-}
+  local REFRESH_MODE_UI = "ui-refresh"
+  local REFRESH_MODE_CACHE_ONLY = "cache-only"
+  local SOURCE_NAME = source_name
+  local FILE_FILTER_STATUS = {
+    all = true,
+    added = true,
+    modified = true,
+    deleted = true,
+    renamed = true,
+    copied = true,
+  }
 
 local function default_file_filters()
   return {
@@ -283,7 +364,7 @@ end
 
 local function cache_options()
   local options = (config.get() or {}).cache or {}
-  local review_options = type(options.gh_pr_review) == "table" and options.gh_pr_review or {}
+  local review_options = type(options[cache_key]) == "table" and options[cache_key] or {}
   return review_options
 end
 
@@ -301,7 +382,7 @@ local function make_repo_key(repository, git_root)
 end
 
 local function persisted_cache_key(repo_key)
-  return tostring(repo_key) .. "::gh_pr_review"
+  return tostring(repo_key) .. "::" .. cache_key
 end
 
 local function resolve_repo_context()
@@ -401,6 +482,10 @@ local function new_repo_session(repo_context)
     repository = repo_context.repository,
     git_root = repo_context.git_root,
     states = {},
+    target_pr = nil,
+    target_details = nil,
+    target_reason = nil,
+    branch_name = nil,
     pr_number = nil,
     details = nil,
     updated_at = 0,
@@ -493,7 +578,7 @@ local function register_state(session, state)
 
   local key = tostring(state)
   session.states[key] = state
-  state.gh_pr_review_repo_key = session.key
+  state[state_repo_key_field] = session.key
 end
 
 local function ensure_follow_state(session)
@@ -628,7 +713,7 @@ local function build_commit_nodes(pr, details)
     if not seen_commit_ids[commit_key] then
       seen_commit_ids[commit_key] = true
       nodes[#nodes + 1] = {
-        id = string.format("ghpr-review:%d:commit:%s", pr.number, oid ~= "" and oid or tostring(#nodes + 1)),
+        id = string.format("%s:%d:commit:%s", id_prefix, pr.number, oid ~= "" and oid or tostring(#nodes + 1)),
         name = string.format("%s %s", short_sha(oid), headline),
         type = "commit",
         extra = {
@@ -652,7 +737,7 @@ local function build_commit_nodes(pr, details)
   if vim.tbl_isempty(nodes) then
     return {
       {
-        id = string.format("ghpr-review:%d:commits-empty", pr.number),
+        id = string.format("%s:%d:commits-empty", id_prefix, pr.number),
         name = "No commits found",
         type = "message",
         extra = {
@@ -865,7 +950,7 @@ local function build_label_nodes(pr, details)
     local name = type(label.name) == "string" and label.name or ""
     if name ~= "" then
       nodes[#nodes + 1] = {
-        id = string.format("ghpr-review:%d:label:%s:%d", pr.number, sanitize_node_id_component(name), index),
+        id = string.format("%s:%d:label:%s:%d", id_prefix, pr.number, sanitize_node_id_component(name), index),
         name = name,
         type = "file",
         extra = {
@@ -887,7 +972,7 @@ local function build_label_nodes(pr, details)
   if vim.tbl_isempty(nodes) then
     return {
       {
-        id = string.format("ghpr-review:%d:labels-empty", pr.number),
+        id = string.format("%s:%d:labels-empty", id_prefix, pr.number),
         name = "No labels",
         type = "message",
         extra = {
@@ -977,12 +1062,28 @@ local function message_node(id, text)
   }
 end
 
-local function active_review_for_repo(repo_context)
-  if type(repo_context) ~= "table" or type(repo_context.repository) ~= "table" then
-    return nil, nil
+apply_provider_runtime_target = function(session, repo_context)
+  if type(apply_runtime_target) ~= "function" or type(session) ~= "table" then
+    return
   end
 
-  return runtime_state.get_active_review(repo_context.repository.full_name)
+  local target = apply_runtime_target(session, repo_context)
+  if type(target) ~= "table" then
+    session.target_pr = nil
+    session.target_details = nil
+    session.target_reason = nil
+    return
+  end
+
+  session.target_pr = type(target.pr) == "table" and target.pr or target.details
+  session.target_details = type(target.details) == "table" and target.details or session.target_pr
+  session.target_reason = type(target.reason) == "string" and target.reason or nil
+  session.branch_name = type(target.branch) == "string" and target.branch or session.branch_name
+end
+
+local function active_target_for_repo(repo_context, session)
+  apply_provider_runtime_target(session, repo_context)
+  return session.target_pr, session.target_details
 end
 
 local function matching_details(session, review_pr)
@@ -1005,38 +1106,38 @@ end
 local function build_nodes(session, repo_context)
   local nodes = {}
   local show_stale_badge = cache_options().show_stale_badge ~= false
-  local review_pr, _ = active_review_for_repo(repo_context)
+  local review_pr, _ = active_target_for_repo(repo_context, session)
   local details = matching_details(session, review_pr)
 
   if session.last_error then
     nodes[#nodes + 1] = message_node(
-      "ghpr-review:refresh-error:" .. repo_context.key,
+      id_prefix .. ":refresh-error:" .. repo_context.key,
       "Refresh error: " .. tostring(session.last_error)
     )
   end
 
   if not review_pr then
     nodes[#nodes + 1] = message_node(
-      "ghpr-review:no-active:" .. repo_context.key,
-      "No active review for this repository. Use 'Start Review' from PR source."
+      id_prefix .. ":no-active:" .. repo_context.key,
+      session.target_reason or no_target_message
     )
     return nodes
   end
 
   if session.loading and not details then
-    nodes[#nodes + 1] = message_node("ghpr-review:loading:" .. repo_context.key, "Loading PR review...")
+    nodes[#nodes + 1] = message_node(id_prefix .. ":loading:" .. repo_context.key, loading_message)
     return nodes
   end
 
   if not details then
-    nodes[#nodes + 1] = message_node("ghpr-review:empty:" .. repo_context.key, "Loading PR review...")
+    nodes[#nodes + 1] = message_node(id_prefix .. ":empty:" .. repo_context.key, loading_message)
     return nodes
   end
 
   if show_stale_badge and session.stale then
     nodes[#nodes + 1] = message_node(
-      "ghpr-review:stale:" .. repo_context.key,
-      "Showing cached PR review while refreshing..."
+      id_prefix .. ":stale:" .. repo_context.key,
+      stale_message
     )
   end
 
@@ -1050,10 +1151,9 @@ local function render_state(state, session, repo_context, opts)
     return false
   end
 
-  local details = matching_details(session, active_review_for_repo(repo_context))
-  if details and opts.sync_runtime ~= false then
-    runtime_state.set_active_pr(details, details)
-    runtime_state.set_active_review(repo_context.repository.full_name, details, details)
+  local details = matching_details(session, active_target_for_repo(repo_context, session))
+  if details and opts.sync_runtime ~= false and type(sync_runtime) == "function" then
+    sync_runtime(repo_context.repository.full_name, details)
   end
 
   local ok = pcall(renderer.show_nodes, build_nodes(session, repo_context), state)
@@ -1063,7 +1163,7 @@ end
 local function visible_repo_states(repo_key)
   local visible = {}
   for _, state in ipairs(follow.visible_source_states(SOURCE_NAME)) do
-    if type(state) == "table" and state.gh_pr_review_repo_key == repo_key then
+    if type(state) == "table" and state[state_repo_key_field] == repo_key then
       visible[#visible + 1] = state
     end
   end
@@ -1075,7 +1175,7 @@ local function current_repo_state_is_focused(repo_key)
   if not focused or type(state) ~= "table" then
     return false
   end
-  return state.gh_pr_review_repo_key == repo_key
+  return state[state_repo_key_field] == repo_key
 end
 
 local function render_repo_states(repo_key)
@@ -1091,7 +1191,7 @@ local function render_repo_states(repo_key)
   }
 
   for state_key, state in pairs(session.states) do
-    if type(state) ~= "table" or state.gh_pr_review_repo_key ~= repo_key or not state_is_live(state) then
+    if type(state) ~= "table" or state[state_repo_key_field] ~= repo_key or not state_is_live(state) then
       session.states[state_key] = nil
       goto continue
     end
@@ -1136,7 +1236,8 @@ local function render_visible_repo_states(repo_key, opts)
 end
 
 local function resolve_repo_context_for_state(state)
-  local repo_key = type(state) == "table" and type(state.gh_pr_review_repo_key) == "string" and state.gh_pr_review_repo_key or nil
+  local repo_key = type(state) == "table" and type(state[state_repo_key_field]) == "string" and state[state_repo_key_field]
+    or nil
   local session = type(repo_key) == "string" and runtime_cache.repos[repo_key] or nil
   if type(session) == "table" and type(session.repository) == "table" then
     return {
@@ -1197,7 +1298,7 @@ end
 function M.update_file_filters(state, updates)
   local repo_context, session, err = resolve_repo_context_for_state(state)
   if not repo_context or type(session) ~= "table" then
-    return false, err or "Unable to resolve PR Review session"
+    return false, err or ("Unable to resolve " .. source_label .. " session")
   end
 
   session.file_filters = sanitize_file_filters(vim.tbl_extend("force", session.file_filters or {}, type(updates) == "table" and updates or {}))
@@ -1208,7 +1309,7 @@ end
 function M.reset_file_filters(state)
   local repo_context, session, err = resolve_repo_context_for_state(state)
   if not repo_context or type(session) ~= "table" then
-    return false, err or "Unable to resolve PR Review session"
+    return false, err or ("Unable to resolve " .. source_label .. " session")
   end
 
   session.file_filters = default_file_filters()
@@ -1217,7 +1318,14 @@ function M.reset_file_filters(state)
 end
 
 local function apply_runtime_cache(session)
-  local review_pr, review_details = runtime_state.get_active_review(session.repository.full_name)
+  apply_provider_runtime_target(session, {
+    repository = session.repository,
+    git_root = session.git_root,
+    key = session.key,
+  })
+
+  local review_pr = session.target_pr
+  local review_details = session.target_details
   local review_number = type(review_pr) == "table" and tonumber(review_pr.number) or nil
   if not review_number or not has_full_details(review_details) then
     return
@@ -1302,14 +1410,14 @@ local function reveal_last_node_in_state(state, session)
 end
 
 local function follow_current_file_if_visible(_)
-  local states = follow.visible_source_states("gh_pr_review")
+  local states = follow.visible_source_states(SOURCE_NAME)
   if vim.tbl_isempty(states) then
     return false
   end
 
   local context = follow.resolve_buffer_context()
   for _, state in ipairs(states) do
-    local repo_key = type(state) == "table" and state.gh_pr_review_repo_key or nil
+    local repo_key = type(state) == "table" and state[state_repo_key_field] or nil
     local session = type(repo_key) == "string" and runtime_cache.repos[repo_key] or nil
     if session then
       local revealed = false
@@ -1326,6 +1434,14 @@ local function follow_current_file_if_visible(_)
 end
 
 local start_background_refresh
+
+local function provider_prefetch_allowed(repo_context, session)
+  if type(should_prefetch_review) ~= "function" then
+    return true
+  end
+
+  return should_prefetch_review(repo_context, session) == true
+end
 
 local function finish_refresh(repo_context, payload)
   payload = type(payload) == "table" and payload or {}
@@ -1355,9 +1471,39 @@ local function finish_refresh(repo_context, payload)
     return
   end
 
+  if payload.no_target == true then
+    session.last_error = nil
+    session.target_pr = nil
+    session.target_details = nil
+    session.target_reason = type(payload.reason) == "string" and payload.reason or no_target_message
+    session.branch_name = type(payload.branch) == "string" and payload.branch or session.branch_name
+    session.loading = false
+    session.inflight = false
+    session.stale = false
+    if ui_refresh then
+      if current_repo_state_is_focused(repo_context.key) then
+        render_repo_states(repo_context.key)
+      else
+        render_visible_repo_states(repo_context.key, {
+          sync_runtime = false,
+        })
+      end
+    end
+
+    local pending = consume_pending_refresh(session)
+    if pending then
+      start_background_refresh(repo_context, pending)
+    end
+    return
+  end
+
   local previous_snapshot = build_review_snapshot(session.pr_number, session.details)
 
   session.last_error = nil
+  session.target_pr = type(payload.pr) == "table" and payload.pr or payload.details
+  session.target_details = type(payload.details) == "table" and payload.details or payload.pr
+  session.target_reason = nil
+  session.branch_name = type(payload.branch) == "string" and payload.branch or session.branch_name
   session.pr_number = payload.pr_number
   session.details = dedupe_details_files(payload.details)
   invalidate_check_annotation_cache(session)
@@ -1371,9 +1517,10 @@ local function finish_refresh(repo_context, payload)
   comments_source.invalidate_cache()
   persist_session(repo_context, session)
 
-  local review_pr, _ = active_review_for_repo(repo_context)
-  if type(review_pr) == "table" and tonumber(review_pr.number) == tonumber(session.pr_number) then
-    review_prefetch.prefetch_review(review_pr, session.details, {
+  if type(session.target_pr) == "table"
+    and tonumber(session.target_pr.number) == tonumber(session.pr_number)
+    and provider_prefetch_allowed(repo_context, session) then
+    review_prefetch.prefetch_review(session.target_pr, session.details, {
       source = "review_refresh",
     })
   end
@@ -1415,13 +1562,6 @@ local function finish_refresh(repo_context, payload)
     end
   end
 
-  if type(review_pr) == "table" and tonumber(review_pr.number) ~= tonumber(session.pr_number) then
-    queue_pending_refresh(session, {
-      force = true,
-      refresh_context = refresh_context,
-    })
-  end
-
   local pending = consume_pending_refresh(session)
   if pending then
     start_background_refresh(repo_context, pending)
@@ -1433,35 +1573,13 @@ start_background_refresh = function(repo_context, opts)
   opts.refresh_context = normalize_refresh_context(opts.refresh_context)
   local session = ensure_repo_session(repo_context)
   local ui_refresh = should_update_ui(opts.refresh_context) and not vim.tbl_isempty(visible_repo_states(repo_context.key))
-  local review_pr, _ = active_review_for_repo(repo_context)
-  local review_number = type(review_pr) == "table" and tonumber(review_pr.number) or nil
-  if not review_number then
-    session.loading = false
-    session.inflight = false
-    if ui_refresh then
-      if current_repo_state_is_focused(repo_context.key) then
-        render_repo_states(repo_context.key)
-      else
-        render_visible_repo_states(repo_context.key, {
-          sync_runtime = false,
-        })
-      end
-    end
-    return false
-  end
+  apply_provider_runtime_target(session, repo_context)
 
   if session.inflight then
     queue_pending_refresh(session, {
       force = true,
       refresh_context = opts.refresh_context,
     })
-    return false
-  end
-
-  local ttl = tonumber(cache_options().ttl_seconds) or 60
-  local age = now_seconds() - (tonumber(session.updated_at) or 0)
-  local has_matching = has_full_details(session.details) and tonumber(session.pr_number) == review_number
-  if not opts.force and has_matching and session.updated_at > 0 and age < ttl and not session_is_stale(session) then
     return false
   end
 
@@ -1481,14 +1599,55 @@ start_background_refresh = function(repo_context, opts)
     end
   end
 
-  pr_service.fetch_details_async(review_number, function(details, details_err)
-    if not details then
+  resolve_target_async(repo_context, session, function(target, target_err)
+    if not target then
       finish_refresh(repo_context, {
-        error = details_err or "Unable to fetch PR details",
+        no_target = target_err == nil,
+        error = target_err,
+        reason = session.target_reason,
+        branch = session.branch_name,
         refresh_context = opts.refresh_context,
       })
       return
     end
+
+    local review_pr = type(target.pr) == "table" and target.pr or target.details
+    local review_number = tonumber(type(review_pr) == "table" and review_pr.number or target.pr_number)
+    if not review_number then
+      finish_refresh(repo_context, {
+        error = "Unable to resolve pull request number for source refresh",
+        refresh_context = opts.refresh_context,
+      })
+      return
+    end
+
+    session.target_pr = review_pr
+    session.target_details = type(target.details) == "table" and target.details or review_pr
+    session.target_reason = nil
+    session.branch_name = type(target.branch) == "string" and target.branch or session.branch_name
+
+    local ttl = tonumber(cache_options().ttl_seconds) or 60
+    local age = now_seconds() - (tonumber(session.updated_at) or 0)
+    local has_matching = has_full_details(session.details) and tonumber(session.pr_number) == review_number
+    if not opts.force and has_matching and session.updated_at > 0 and age < ttl and not session_is_stale(session) then
+      finish_refresh(repo_context, {
+        pr = review_pr,
+        pr_number = review_number,
+        details = session.details,
+        branch = session.branch_name,
+        refresh_context = opts.refresh_context,
+      })
+      return
+    end
+
+    pr_service.fetch_details_async(review_number, function(details, details_err)
+      if not details then
+        finish_refresh(repo_context, {
+          error = details_err or "Unable to fetch PR details",
+          refresh_context = opts.refresh_context,
+        })
+        return
+      end
 
     local pending_requests = 2
     local function complete_refresh()
@@ -1498,8 +1657,10 @@ start_background_refresh = function(repo_context, opts)
       end
 
       finish_refresh(repo_context, {
+        pr = review_pr,
         pr_number = review_number,
         details = details,
+        branch = session.branch_name,
         refresh_context = opts.refresh_context,
       })
     end
@@ -1539,6 +1700,7 @@ start_background_refresh = function(repo_context, opts)
       details.pending_review_loaded = true
       complete_refresh()
     end
+    end)
   end)
 
   return true
@@ -1546,7 +1708,7 @@ end
 
 function M.request_check_annotations(state, node)
   if type(state) ~= "table" then
-    return false, "Unable to resolve PR Review state"
+    return false, "Unable to resolve " .. source_label .. " state"
   end
 
   local check_node = type(node) == "table" and node or (type(state.tree) == "table" and state.tree:get_node() or nil)
@@ -1564,7 +1726,7 @@ function M.request_check_annotations(state, node)
     return false, "Selected check is missing required metadata"
   end
 
-  local repo_key = type(state.gh_pr_review_repo_key) == "string" and state.gh_pr_review_repo_key or nil
+  local repo_key = type(state[state_repo_key_field]) == "string" and state[state_repo_key_field] or nil
   local session = type(repo_key) == "string" and runtime_cache.repos[repo_key] or nil
   if not session then
     local repo_context, context_err = resolve_repo_context()
@@ -1643,7 +1805,7 @@ end
 
 local function request_security_payload(state, node, request_kind)
   if type(state) ~= "table" then
-    return false, "Unable to resolve PR Review state"
+    return false, "Unable to resolve " .. source_label .. " state"
   end
 
   local security_node = type(node) == "table" and node or (type(state.tree) == "table" and state.tree:get_node() or nil)
@@ -1660,7 +1822,7 @@ local function request_security_payload(state, node, request_kind)
     return false, "Selected security section is missing pull request metadata"
   end
 
-  local repo_key = type(state.gh_pr_review_repo_key) == "string" and state.gh_pr_review_repo_key or nil
+  local repo_key = type(state[state_repo_key_field]) == "string" and state[state_repo_key_field] or nil
   local session = type(repo_key) == "string" and runtime_cache.repos[repo_key] or nil
   if not session then
     local repo_context, context_err = resolve_repo_context()
@@ -1776,13 +1938,13 @@ end
 
 M.navigate = function(state, path)
   if not repo.ensure_git_repo() then
-    show_message(state, "ghpr-review:not-git", "Open a git repository to use gh-pr review")
+    show_message(state, id_prefix .. ":not-git", not_git_message)
     return
   end
 
   local repo_context, context_err = resolve_repo_context()
   if not repo_context then
-    show_message(state, "ghpr-review:repo-error", "Unable to resolve repository: " .. tostring(context_err))
+    show_message(state, id_prefix .. ":repo-error", repo_error_prefix .. tostring(context_err))
     return
   end
 
@@ -1933,7 +2095,17 @@ M.setup = function(source_config, _)
   source_config.window.mappings = vim.tbl_deep_extend("force", source_config.window.mappings, default_mappings)
 end
 
-require("gh-pr.neotree.registry").register("gh_pr_review", M)
+  M.source_label = function()
+    return source_label
+  end
 
-return M
+  require("gh-pr.neotree.registry").register(SOURCE_NAME, M)
+
+  return M
+end
+
+local default_instance = create()
+default_instance._create = create
+
+return default_instance
 
