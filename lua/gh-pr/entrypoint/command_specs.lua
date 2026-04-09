@@ -66,6 +66,13 @@ function M.build(call, command_no_args)
       end,
       opts = { desc = "Toggle My PR source" },
     },
+    {
+      name = "GhPrMyPR",
+      callback = function()
+        call("open_my_pr_tree", { toggle = true })
+      end,
+      opts = { desc = "Toggle My PR source" },
+    },
     { name = "GhPrRefresh", callback = command_no_args("refresh"), opts = { desc = "Refresh pull request data" } },
     {
       name = "GhPRReviewRefresh",

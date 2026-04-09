@@ -24,6 +24,8 @@ function FileDiff.register(M, ctx)
   local open_review_tree_from_plugin = ctx.open_review_tree_from_plugin
   local persist_diff_view_preferences = ctx.persist_diff_view_preferences
   local positive_integer = ctx.positive_integer
+  local pr_service = ctx.pr_service
+  local repo = ctx.repo
   local refresh_pr_sources_after_state_change = ctx.refresh_pr_sources_after_state_change
   local require_virtual_diff_backend = ctx.require_virtual_diff_backend
   local resolve_active_pr = ctx.resolve_active_pr
@@ -75,9 +77,9 @@ function FileDiff.register(M, ctx)
     return nil
   end
 
-  local function resolve_my_pr_git_root()
-    local source_name = current_source_name()
-    if source_name ~= "gh_my_pr" then
+  local function resolve_source_git_root(source_name)
+    source_name = type(source_name) == "string" and source_name or current_source_name()
+    if source_name ~= "gh_my_pr" and source_name ~= "gh_pr_review" then
       return nil
     end
 
@@ -87,9 +89,8 @@ function FileDiff.register(M, ctx)
       local ok_state, tree_state = pcall(manager.get_state_for_window, winid)
       local tree_path = ok_state and type(tree_state) == "table" and tree_state.path or nil
       if type(tree_path) == "string" and tree_path ~= "" then
-        local repo_ok, repo_module = pcall(require, "gh-pr.repo")
-        if repo_ok and type(repo_module.git_root) == "function" then
-          local git_root = select(1, repo_module.git_root({ cwd = tree_path }))
+        if type(repo) == "table" and type(repo.git_root) == "function" then
+          local git_root = select(1, repo.git_root({ cwd = tree_path }))
           if type(git_root) == "string" and git_root ~= "" then
             return git_root
           end
@@ -97,12 +98,102 @@ function FileDiff.register(M, ctx)
       end
     end
 
-    local repo_ok, repo_module = pcall(require, "gh-pr.repo")
-    if repo_ok and type(repo_module.git_root) == "function" then
-      return select(1, repo_module.git_root())
+    if type(repo) == "table" and type(repo.git_root) == "function" then
+      return select(1, repo.git_root())
     end
 
     return nil
+  end
+
+  local function extract_login(entity)
+    if type(entity) == "string" and entity ~= "" then
+      return entity
+    end
+
+    if type(entity) ~= "table" then
+      return nil
+    end
+
+    if type(entity.login) == "string" and entity.login ~= "" then
+      return entity.login
+    end
+
+    if type(entity.author) == "table" and type(entity.author.login) == "string" and entity.author.login ~= "" then
+      return entity.author.login
+    end
+
+    return nil
+  end
+
+  local function repository_name_with_owner(repository)
+    if type(repository) ~= "table" then
+      return ""
+    end
+
+    if type(repository.nameWithOwner) == "string" and repository.nameWithOwner ~= "" then
+      return repository.nameWithOwner
+    end
+
+    local owner = type(repository.owner) == "table" and (repository.owner.login or repository.owner.name) or repository.owner
+    local name = repository.name
+    if type(owner) == "string" and owner ~= "" and type(name) == "string" and name ~= "" then
+      return owner .. "/" .. name
+    end
+
+    return ""
+  end
+
+  local function review_pr_matches_local_branch(pr, details, git_root)
+    if type(pr_service) ~= "table" or type(pr_service.get_current_user_login) ~= "function" then
+      return false
+    end
+
+    local login = select(1, pr_service.get_current_user_login())
+    if type(login) ~= "string" or login == "" then
+      return false
+    end
+
+    local author_login = extract_login(type(details) == "table" and details.author or nil)
+      or extract_login(type(pr) == "table" and pr.author or nil)
+    if author_login ~= login then
+      return false
+    end
+
+    if type(repo) ~= "table" then
+      return false
+    end
+
+    local branch = type(repo.current_branch) == "function" and select(1, repo.current_branch({ cwd = git_root })) or nil
+    if type(branch) ~= "string" or vim.trim(branch) == "" then
+      return false
+    end
+
+    local head_ref = safe_string(
+      type(details) == "table" and details.headRefName or (type(pr) == "table" and pr.headRefName or "")
+    )
+    if vim.trim(branch) ~= head_ref then
+      return false
+    end
+
+    local head_repository = repository_name_with_owner(type(details) == "table" and details.headRepository or nil)
+    if head_repository == "" and type(details) == "table" and details.isCrossRepository == false then
+      head_repository = repository_name_with_owner(details.baseRepository)
+    end
+    if head_repository == "" and type(pr) == "table" then
+      head_repository = repository_name_with_owner(pr.headRepository)
+    end
+    if head_repository == "" then
+      return false
+    end
+
+    local local_repository = nil
+    if type(repo.resolve_repository) == "function" then
+      local plugin_config = type(config.get()) == "table" and config.get() or {}
+      local remotes = type(plugin_config.remotes) == "table" and plugin_config.remotes or nil
+      local_repository = select(1, repo.resolve_repository(remotes, { cwd = git_root }))
+    end
+
+    return type(local_repository) == "table" and local_repository.full_name == head_repository
   end
 
   local function local_head_path_available(path)
@@ -114,17 +205,20 @@ function FileDiff.register(M, ctx)
     return vim.fn.filereadable(absolute) == 1 or vim.fn.bufexists(absolute) == 1
   end
 
-  local function resolve_my_pr_local_head_context(file)
+  local function resolve_local_editable_head_context(file, pr, details)
     local source_name = current_source_name()
-    if source_name == "gh_my_pr" then
+    if source_name == "gh_my_pr" or source_name == "gh_pr_review" then
       local status = safe_string(type(file) == "table" and file.status or ""):lower()
       if status == "removed" then
         return nil, source_name
       end
 
-      local git_root = resolve_my_pr_git_root()
+      local git_root = resolve_source_git_root(source_name)
       local relative_path = normalize_path(type(file) == "table" and (file.path or file.filename) or nil)
       if type(git_root) ~= "string" or git_root == "" or relative_path == "" then
+        return nil, source_name
+      end
+      if source_name == "gh_pr_review" and not review_pr_matches_local_branch(pr, details, git_root) then
         return nil, source_name
       end
 
@@ -139,7 +233,7 @@ function FileDiff.register(M, ctx)
     local bufnr = vim.api.nvim_get_current_buf()
     local stored_source_name = vim.b[bufnr].gh_pr_source_name
     local stored_local_head_path = vim.b[bufnr].gh_pr_local_head_path
-    if stored_source_name == "gh_my_pr"
+    if (stored_source_name == "gh_my_pr" or stored_source_name == "gh_pr_review")
       and type(stored_local_head_path) == "string"
       and stored_local_head_path ~= ""
       and local_head_path_available(stored_local_head_path) then
@@ -178,7 +272,7 @@ function FileDiff.register(M, ctx)
     })
 
     local explorer_err = nil
-    if pr_explorer_enabled() and open_opts.source_name ~= "gh_my_pr" then
+    if pr_explorer_enabled() and not (type(open_opts.local_head_path) == "string" and open_opts.local_head_path ~= "") then
       local opened_explorer, open_explorer_err = codediff_integration.open_pr_explorer_diff({
         pr_number = pr.number,
         details = details,
@@ -242,7 +336,7 @@ function M.open_diff(file, opts)
   end
 
   state.set_active_file(selected_file)
-  local local_head_path, source_name = resolve_my_pr_local_head_context(selected_file)
+  local local_head_path, source_name = resolve_local_editable_head_context(selected_file, pr, details)
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
 
@@ -333,7 +427,7 @@ function M.open_original(file, opts)
   end
 
   state.set_active_file(selected_file)
-  local local_head_path, source_name = resolve_my_pr_local_head_context(selected_file)
+  local local_head_path, source_name = resolve_local_editable_head_context(selected_file, pr, details)
   local target_line = positive_integer(opts.target_original_line, positive_integer(opts.target_line, nil))
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
@@ -403,7 +497,7 @@ function M.open_modified(file, opts)
   end
 
   state.set_active_file(selected_file)
-  local local_head_path, source_name = resolve_my_pr_local_head_context(selected_file)
+  local local_head_path, source_name = resolve_local_editable_head_context(selected_file, pr, details)
   local target_line = positive_integer(opts.target_line, positive_integer(opts.target_original_line, nil))
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
@@ -485,7 +579,7 @@ local function reopen_current_diff_with_preferences_impl(opts)
   end
 
   state.set_active_file(selected_file)
-  local local_head_path, source_name = resolve_my_pr_local_head_context(selected_file)
+  local local_head_path, source_name = resolve_local_editable_head_context(selected_file, pr, details)
   local uses_non_text_preview = non_text_preview.file_uses_non_text_preview(selected_file)
   local comments_ctx = uses_non_text_preview and nil or build_line_comment_context(pr.number)
   local function open_with_codediff(diff_view)

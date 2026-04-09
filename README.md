@@ -585,7 +585,7 @@ lives under `lua/gh-pr/ui/overview/*`.
 | `:GhPrOpen` | Focus/open PR UI (idempotent; Neo-tree first, Telescope fallback) | Start or refocus a PR browsing session |
 | `:GhPrStartReview [number]` | Start review flow for selected PR | Enter review workspace quickly and warm textual diffs in background |
 | `:GhPrReviewTree` | Toggle PR Review source | Jump between list and review tree |
-| `:GhPrMyPr` | Open current-branch personal PR source | Review your own branch-matched PR with local editable diffs |
+| `:GhPrMyPr` / `:GhPrMyPR` | Open current-branch personal PR source | Review your own branch-matched PR with local editable diffs |
 | `:GhPrOverview` | Open active PR overview panes | Inspect summary/activity and collaboration |
 | `:GhPrOpenDiff` | Open selected file diff or non-text preview | Review code and assets |
 | `:GhPrOpenCommitPatch` | Open selected commit diff in codediff | Inspect commit-level changes |
@@ -612,6 +612,7 @@ lives under `lua/gh-pr/ui/overview/*`.
 - `:GhPrOverviewRefresh` refresh active overview panes.
 - `:GhPrOverviewMore <checks|commits|comments|reviews|threads> [count]` load more section items.
 - `:GhPrMyPr` open `My PR` source for the current branch when it matches a PR in the current repository.
+- `:GhPrMyPR` alias for `:GhPrMyPr`.
 - `:GhPrCheckout [number]` checkout PR branch.
 - `:GhPrOpenDiff` open selected file in codediff for text, or dedicated gh-pr preview for non-text.
 - `:GhPrOpenOriginal` open selected file and focus base side in codediff when possible, or dedicated base-side preview for non-text.
@@ -755,6 +756,7 @@ require("gh-pr").setup({
 - `zr` resets all session file filters.
 - `gh_my_pr` reuses the same sections and mappings as `gh_pr_review`, but it only appears when the current local branch matches a PR head in the same repository.
 - In `gh_my_pr > Files`, codediff opens the GitHub base side against the real local worktree file on the modified side, so the right-hand buffer stays editable.
+- `gh_pr_review > Files` uses the same local editable head behavior when the active review PR is authored by the current GitHub user and the checkout is on that PR's head branch.
 - `gh_pr`, `gh_pr_review`, and `gh_my_pr` do not bind `<space>` by default (keeps `<leader>` available when `mapleader = " "`).
 - `gh_pr`, `gh_pr_review`, and `gh_my_pr` prioritize PR-specific mappings over generic Neo-tree filesystem mappings.
 - Opening `Overview` from Neo-tree reuses/focuses existing overview session for that PR and triggers silent background refresh.
@@ -992,6 +994,7 @@ Inside `gh_pr_review` and `gh_my_pr` Neo-tree review sources:
 - `zG` expand `Comments > Global` (including subgroups).
 - `zg` collapse `Comments > Global` (including subgroups).
 - `gh_my_pr` differs only in how it is selected and how `Files` opens text diffs: it resolves the PR from the current branch automatically and uses the local worktree file as codediff head when possible.
+- `gh_pr_review` also uses local editable head diffs for your own active review PR when your checkout is on the PR head branch.
 
 </details>
 

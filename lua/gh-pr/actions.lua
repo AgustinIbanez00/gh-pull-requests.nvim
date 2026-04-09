@@ -21,6 +21,7 @@ local gh = require("gh-pr.gh")
 local image_metadata = require("gh-pr.image_metadata")
 local line_comments = require("gh-pr.line_comments")
 local pr_service = require("gh-pr.pr_service")
+local repo = require("gh-pr.repo")
 local review_context = require("gh-pr.core.review_context")
 local state = require("gh-pr.state")
 local thread_popup = require("gh-pr.thread_popup")
@@ -1886,6 +1887,8 @@ file_diff_module.register(M, {
   open_review_tree_from_plugin = open_review_tree_from_plugin,
   persist_diff_view_preferences = persist_diff_view_preferences,
   positive_integer = positive_integer,
+  pr_service = pr_service,
+  repo = repo,
   refresh_pr_sources_after_state_change = refresh_pr_sources_after_state_change,
   require_virtual_diff_backend = require_virtual_diff_backend,
   resolve_active_pr = resolve_active_pr,

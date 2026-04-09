@@ -100,6 +100,9 @@ Commands
     `gh_my_pr` renders the same sections and mappings as `gh_pr_review`.
     In `Files`, codediff opens the GitHub base side against the real local
     worktree file on the modified side, so the head buffer stays editable.
+
+:GhPrMyPR
+    Alias for `:GhPrMyPr`.
     `file -> alert`. In alert nodes, `<CR>` opens the PR diff on the
     modified side at the alert line and paints loaded security findings
     for that file over codediff.
@@ -568,6 +571,8 @@ gh_pr PR rows      Keep `#number + title` as primary text and render a
 `gh_my_pr`       Same sections/mappings as `gh_pr_review`, but only for the
                  current branch-matched PR and with local editable head diffs
                  in `Files`
+`gh_pr_review`   Uses local editable head diffs in `Files` for your own active
+                 review PR when checked out on that PR's head branch
 `<space>` (gh_pr/gh_pr_review/gh_my_pr) Not bound by default (keeps `<leader>` free)
 PR sources prioritize PR-specific mappings over generic Neo-tree mappings
 
@@ -838,6 +843,9 @@ gh-pr exposes these Neo-tree sources:
 - `gh_my_pr > Files` opens codediff with the GitHub base on one side and the
   real local worktree file on the modified side, so the head buffer remains
   editable.
+- `gh_pr_review > Files` uses the same local editable head behavior when the
+  active review PR belongs to the current GitHub user and the checkout is on
+  that PR's head branch.
 
 Query Placeholders
 ==================

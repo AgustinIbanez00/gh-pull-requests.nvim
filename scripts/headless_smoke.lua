@@ -44,6 +44,7 @@ do
   assert(vim.fn.exists(":GhPrOpen") == 2, "Missing :GhPrOpen command")
   assert(vim.fn.exists(":GhPrReviewRefresh") == 2, "Missing :GhPrReviewRefresh command")
   assert(vim.fn.exists(":GhPrMyPr") == 2, "Missing :GhPrMyPr command")
+  assert(vim.fn.exists(":GhPrMyPR") == 2, "Missing :GhPrMyPR alias")
   assert(vim.fn.exists(":GhPRReviewRefresh") == 2, "Missing :GhPRReviewRefresh alias")
   assert(vim.fn.maparg("<Plug>(gh-pr-open)", "n") ~= "", "Missing <Plug>(gh-pr-open)")
   assert(vim.fn.maparg("<Plug>(gh-pr-review-refresh)", "n") ~= "", "Missing <Plug>(gh-pr-review-refresh)")
@@ -1316,6 +1317,8 @@ do
   local state = require("gh-pr.state")
   local actions = require("gh-pr.actions")
   local codediff = require("gh-pr.integrations.codediff")
+  local pr_service = require("gh-pr.pr_service")
+  local repo_mod = require("gh-pr.repo")
   local virtual_files = require("gh-pr.virtual_files")
   local helpers = actions._diff_view_helpers or {}
 
@@ -1336,9 +1339,17 @@ do
   local original_pr_explorer = codediff.open_pr_explorer_diff
   local original_codediff = codediff.open_pr_file_diff
   local original_virtual = virtual_files.open_diff
+  local original_git_root = repo_mod.git_root
+  local original_current_branch = repo_mod.current_branch
+  local original_resolve_repository = repo_mod.resolve_repository
+  local original_get_current_user_login = pr_service.get_current_user_login
   local calls = {}
 
   local last_open_result = nil
+  local tmp_root = vim.fn.tempname()
+  local local_file = tmp_root .. "/lua/gh-pr/actions.lua"
+  vim.fn.mkdir(tmp_root .. "/lua/gh-pr", "p")
+  vim.fn.writefile({ "local editable_head = true" }, local_file)
 
   local function make_open_result(opts)
     local base = vim.api.nvim_create_buf(false, true)
@@ -1468,6 +1479,75 @@ do
   assert(calls[1] and calls[1][1] == "virtual",
     "Blank-lines PR file diff should use virtual backend")
 
+  repo_mod.git_root = function()
+    return tmp_root, nil
+  end
+  repo_mod.current_branch = function()
+    return "feature", nil
+  end
+  repo_mod.resolve_repository = function()
+    return {
+      owner = "owner",
+      name = "repo",
+      full_name = "owner/repo",
+    }, nil
+  end
+  pr_service.get_current_user_login = function()
+    return "me", nil
+  end
+
+  local review_source_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_option_value("filetype", "neo-tree", { buf = review_source_buf })
+  vim.b[review_source_buf].neo_tree_source = "gh_pr_review"
+  vim.api.nvim_set_current_buf(review_source_buf)
+
+  local own_review_pr = vim.deepcopy(pr)
+  own_review_pr.author = { login = "me" }
+  own_review_pr.headRepository = { nameWithOwner = "owner/repo" }
+  own_review_pr.files[1].status = "modified"
+  state.set_active_pr(own_review_pr, own_review_pr)
+
+  calls = {}
+  assert(actions.open_diff(own_review_pr.files[1], { view_mode = "vertical", ignore_whitespace_mode = "none" }) == true,
+    "Own PR Review branch diff should open")
+  assert(calls[1] and calls[1][1] == "codediff_file",
+    "Own PR Review branch diff should bypass directory explorer for editable local head")
+  assert(calls[1][2].local_head_path == local_file,
+    "Own PR Review branch diff should pass local worktree head path")
+  assert(calls[1][2].source_name == "gh_pr_review",
+    "Own PR Review branch diff should preserve PR Review source metadata")
+
+  repo_mod.current_branch = function()
+    return "feature/other", nil
+  end
+  calls = {}
+  assert(actions.open_diff(own_review_pr.files[1], { view_mode = "vertical", ignore_whitespace_mode = "none" }) == true,
+    "Own PR Review diff on another branch should still open")
+  assert(calls[1] and calls[1][1] == "pr_explorer",
+    "Own PR Review diff on another branch should keep remote PR explorer")
+
+  repo_mod.current_branch = function()
+    return "feature", nil
+  end
+  local foreign_review_pr = vim.deepcopy(own_review_pr)
+  foreign_review_pr.author = { login = "other" }
+  state.set_active_pr(foreign_review_pr, foreign_review_pr)
+  calls = {}
+  assert(actions.open_diff(foreign_review_pr.files[1], { view_mode = "vertical", ignore_whitespace_mode = "none" }) == true,
+    "Foreign PR Review branch diff should still open")
+  assert(calls[1] and calls[1][1] == "pr_explorer",
+    "Foreign PR Review branch diff must not use editable local head")
+
+  own_review_pr.files[1].status = "removed"
+  state.set_active_pr(own_review_pr, own_review_pr)
+  calls = {}
+  assert(actions.open_diff(own_review_pr.files[1], { view_mode = "vertical", ignore_whitespace_mode = "none" }) == true,
+    "Removed own PR Review file should still open")
+  assert(calls[1] and calls[1][1] == "pr_explorer",
+    "Removed own PR Review file should not use local editable head")
+
+  state.set_active_pr(pr, pr)
+
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_current_buf(buf)
   vim.b[buf].gh_pr_file_kind = "head"
@@ -1520,6 +1600,11 @@ do
   codediff.open_pr_explorer_diff = original_pr_explorer
   codediff.open_pr_file_diff = original_codediff
   virtual_files.open_diff = original_virtual
+  repo_mod.git_root = original_git_root
+  repo_mod.current_branch = original_current_branch
+  repo_mod.resolve_repository = original_resolve_repository
+  pr_service.get_current_user_login = original_get_current_user_login
+  vim.fn.delete(tmp_root, "rf")
   package.loaded["gh-pr.diff_comments_panel"] = original_panel
 end
 
