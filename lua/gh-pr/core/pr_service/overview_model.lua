@@ -1,4 +1,5 @@
 local M = {}
+local reviewers = require("gh-pr.core.reviewers")
 
 function M.build(details, threads, limits, opts, ctx)
   opts = opts or {}
@@ -84,6 +85,7 @@ function M.build(details, threads, limits, opts, ctx)
     people = {
       assignees = normalized_assignees,
       review_requests = normalized_review_requests,
+      reviewers = reviewers.build(details),
     },
     labels = {
       items = normalized_labels,

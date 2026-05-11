@@ -76,6 +76,9 @@ local function build_overview_callbacks(pr_number, ctx)
     edit_stub = function(kind, payload)
       actions.overview_edit_stub(kind, payload)
     end,
+    rerequest_reviewer = function(payload)
+      actions.overview_edit_stub("rerequest_reviewer", payload)
+    end,
     more_section = function(section)
       actions.overview_more(section)
     end,

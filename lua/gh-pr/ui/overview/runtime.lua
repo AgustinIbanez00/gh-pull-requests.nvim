@@ -433,6 +433,13 @@ execute_action = function(session, action, variant)
     session.callbacks.edit_stub(action.edit_kind, type(action.payload) == "table" and action.payload or {})
     return
   end
+
+  if action.kind == "rerequest_reviewer"
+    and type(action.payload) == "table"
+    and type(session.callbacks.rerequest_reviewer) == "function" then
+    session.callbacks.rerequest_reviewer(action.payload)
+    return
+  end
 end
 render_session = function(session)
   capture_cursor_state(session)

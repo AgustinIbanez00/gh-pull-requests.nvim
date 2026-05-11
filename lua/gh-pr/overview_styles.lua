@@ -12,6 +12,13 @@ local REVIEW_HIGHLIGHT = {
   REVIEW_REQUIRED = "GhPrOverviewReviewPending",
 }
 
+local REVIEWER_HIGHLIGHT = {
+  APPROVED = "GhPrOverviewReviewerApproved",
+  PENDING = "GhPrOverviewReviewerPending",
+  CHANGES_REQUESTED = "GhPrOverviewReviewerChanges",
+  COMMENTED = "GhPrOverviewReviewerCommented",
+}
+
 local CHECK_HIGHLIGHT = {
   success = "GhPrOverviewCheckPass",
   failure = "GhPrOverviewCheckFail",
@@ -167,6 +174,13 @@ function M.review_highlight(decision, theme)
     return "GhPrOverviewBadge"
   end
   return REVIEW_HIGHLIGHT[utils.safe_string(decision, ""):upper()] or "GhPrOverviewBadge"
+end
+
+function M.reviewer_highlight(state, theme)
+  if not theme.state_colors then
+    return "GhPrOverviewBadge"
+  end
+  return REVIEWER_HIGHLIGHT[utils.safe_string(state, ""):upper()] or "GhPrOverviewBadge"
 end
 
 function M.check_marker(check, theme)

@@ -1,4 +1,5 @@
 local M = {}
+local reviewer_model = require("gh-pr.core.reviewers")
 
 local overview_edit_labels = {
   edit_title = "Edit title",
@@ -9,6 +10,7 @@ local overview_edit_labels = {
   edit_milestone = "Edit milestone",
   change_state = "Change state",
   change_draft = "Change draft status",
+  rerequest_reviewer = "Re-request reviewer",
 }
 
 local function positive_integer(value, fallback)
@@ -407,6 +409,36 @@ local function build_draft_change(choice, details, ctx)
   }, nil, false
 end
 
+local function build_rerequest_reviewer(payload, details, ctx)
+  local reviewers = reviewer_model.build(details)
+  local reviewer = reviewer_model.find(reviewers, payload)
+  if not reviewer then
+    return nil, "Reviewer is no longer available for re-request", false
+  end
+
+  if reviewer.can_rerequest ~= true then
+    return nil, "Reviewer is not eligible for re-request", false
+  end
+
+  local request_value = normalize_string(reviewer.request_value)
+  if request_value == "" then
+    return nil, "Missing reviewer request value", false
+  end
+
+  local display_name = normalize_string(reviewer.display_name)
+  if display_name == "" then
+    display_name = request_value
+  end
+
+  return {
+    summary = string.format("reviewer: %s", display_name),
+    success = string.format("Re-requested review from %s", display_name),
+    run = function(pr_number)
+      return ctx.pr_service.edit(pr_number, { add_reviewers = { request_value } })
+    end,
+  }, nil, false
+end
+
 local function build_overview_edit_operation(kind, choice, details, ctx)
   if kind == "edit_title" then
     return build_title_edit(choice, details, ctx)
@@ -437,6 +469,9 @@ local function build_overview_edit_operation(kind, choice, details, ctx)
   end
   if kind == "change_draft" then
     return build_draft_change(choice, details, ctx)
+  end
+  if kind == "rerequest_reviewer" then
+    return build_rerequest_reviewer(choice, details, ctx)
   end
 
   return nil, "Unsupported overview edit action", false
@@ -512,6 +547,36 @@ function M.run(kind, payload, ctx)
   local pr, details, err = ctx.resolve_active_pr(target_number)
   if not pr then
     return ctx.notify_error(err)
+  end
+
+  if kind == "rerequest_reviewer" then
+    local operation, build_err, noop = build_overview_edit_operation(kind, payload, details, ctx)
+    if noop then
+      ctx.notify_info(build_err or "No changes detected")
+      return
+    end
+    if not operation then
+      ctx.notify_error(build_err)
+      return
+    end
+
+    ctx.ui.confirm(pr.number, label, operation.summary or "", function(confirmed)
+      if not confirmed then
+        ctx.notify_info(label .. " cancelled")
+        return
+      end
+
+      local ok, op_err = operation.run(pr.number)
+      if not ok then
+        ctx.notify_error(op_err)
+        return
+      end
+
+      ctx.notify_info(operation.success or (label .. " completed"))
+      refresh_overview_after_edit(pr.number, overview_context, ctx)
+      ctx.refresh_pr_sources_after_state_change({ force = true })
+    end)
+    return
   end
 
   ctx.ui.pick(kind, payload, pr, details, label, function(choice)

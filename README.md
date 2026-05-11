@@ -715,6 +715,7 @@ require("gh-pr").setup({
 | `R` | Refresh overview |
 | `gp` | Preview markdown link under cursor (description) |
 | `<CR>` on metadata rows | Edit title / description / state / draft / labels / reviewers / assignees / milestone |
+| `<CR>` on actionable reviewer row | Re-request review when `· <CR> re-request` is visible |
 | `<CR>` on `## Description` | Edit description in multiline composer |
 | `<CR>` on description link line | Preview attachment or confirm-open link (multiple links => selector) |
 | `<CR>` on thread header | Open thread evolution diff (comment commit -> latest file) |
@@ -788,6 +789,9 @@ Inside the overview buffer:
 - `1..9` jump to tab
 - `<CR>` open selected row action
 - `<CR>` on metadata rows edits title/description/state/draft/labels/reviewers/assignees/milestone
+- `Collaboration > Reviewers` shows per-reviewer rows such as `@user [APPROVED]` and `org/team [PENDING]`.
+- reviewer state prefers current pending requests, then `latestReviews`, then `reviews` ordered by `submittedAt`; it does not use the old "most severe historical state" rule.
+- reviewer rows only expose `· <CR> re-request` when that reviewer is currently eligible for a GitHub re-request.
 - `<CR>` on `## Description` heading opens a large multiline composer preloaded with current body (`<C-s>` submit, `q`/`<Esc>` cancel)
 - `<CR>` on a description body line with a single markdown/http(s) link opens preview/link action for that link
 - `<CR>` on a description body line with multiple links opens a selector menu first
@@ -1064,6 +1068,7 @@ require("gh-pr").setup({
 
 - Baseline `GhPr*` highlight groups are defined as links to standard Neovim groups.
 - gh-pr re-applies those baseline links on every `ColorScheme` event.
+- Reviewer state tokens in `Overview > Collaboration` use `GhPrOverviewReviewerApproved`, `GhPrOverviewReviewerPending`, `GhPrOverviewReviewerChanges`, and `GhPrOverviewReviewerCommented`.
 - To override a group, set it in your own `ColorScheme` autocmd.
 
 ```lua

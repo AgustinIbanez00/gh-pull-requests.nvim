@@ -535,6 +535,381 @@ do
 end
 
 do
+  local reviewer_model = require("gh-pr.core.reviewers")
+  local reviewers = reviewer_model.build({
+    headRefOid = "head-2",
+    reviewRequests = {
+      { login = "pending-user" },
+      {
+        requestedReviewer = {
+          slug = "core",
+          organization = { login = "acme" },
+        },
+      },
+    },
+    latestReviews = {
+      {
+        author = { login = "approved-user" },
+        state = "APPROVED",
+        submittedAt = "2026-03-16T10:00:00Z",
+        commit = { oid = "head-1" },
+      },
+      {
+        author = { login = "commented-user" },
+        state = "COMMENTED",
+        submittedAt = "2026-03-16T09:00:00Z",
+        commit = { oid = "head-1" },
+      },
+    },
+    reviews = {
+      {
+        author = { login = "approved-user" },
+        state = "CHANGES_REQUESTED",
+        submittedAt = "2026-03-15T10:00:00Z",
+        commit = { oid = "head-0" },
+      },
+      {
+        author = { login = "fallback-user" },
+        state = "CHANGES_REQUESTED",
+        submittedAt = "2026-03-14T10:00:00Z",
+        commit = { oid = "head-0" },
+      },
+      {
+        author = { login = "fallback-user" },
+        state = "APPROVED",
+        submittedAt = "2026-03-15T10:00:00Z",
+        commit = { oid = "head-1" },
+      },
+      {
+        author = { login = "stale-user" },
+        state = "APPROVED",
+        submittedAt = "2026-03-15T09:00:00Z",
+        commit = { oid = "head-2" },
+      },
+      {
+        author = { login = "ignored-user" },
+        state = "DISMISSED",
+        submittedAt = "2026-03-15T08:00:00Z",
+        commit = { oid = "head-1" },
+      },
+    },
+  })
+
+  local by_name = {}
+  for _, reviewer in ipairs(reviewers) do
+    by_name[reviewer.display_name] = reviewer
+  end
+
+  assert(by_name["@approved-user"] and by_name["@approved-user"].state == "APPROVED",
+    "Latest review state should win over older, more severe history")
+  assert(by_name["@approved-user"].can_rerequest == true,
+    "Completed user reviews should allow re-request after head movement")
+  assert(by_name["@pending-user"] and by_name["@pending-user"].state == "PENDING",
+    "Active review requests should render as pending")
+  assert(by_name["@pending-user"].can_rerequest == false,
+    "Pending reviewers should not allow re-request")
+  assert(by_name["@commented-user"] and by_name["@commented-user"].state == "COMMENTED",
+    "COMMENTED latest reviews should be preserved for UI state")
+  assert(by_name["@fallback-user"] and by_name["@fallback-user"].state == "APPROVED",
+    "Fallback review history should use the latest submitted review")
+  assert(by_name["@stale-user"] and by_name["@stale-user"].can_rerequest == false,
+    "Re-request should stay disabled when the latest reviewed commit matches head")
+  assert(by_name["acme/core"] and by_name["acme/core"].kind == "team" and by_name["acme/core"].state == "PENDING",
+    "Team review requests should stay visible with pending state")
+  assert(by_name["acme/core"].request_value == "acme/core",
+    "Team review requests should derive org/slug request values when available")
+
+  local counts, total = reviewer_model.count_states(reviewers)
+  assert(total == 6, "Reviewer helper should only expose supported reviewer states")
+  assert((counts.APPROVED or 0) == 3 and (counts.PENDING or 0) == 2 and (counts.COMMENTED or 0) == 1,
+    "Reviewer helper state counts should track approved/pending/commented reviewers")
+
+  local neotree_reviewers = require("gh-pr.neotree.review_sections.reviewers")
+  local nodes = neotree_reviewers.build_nodes({ number = 42 }, {
+    headRefOid = "head-2",
+    reviewRequests = {
+      { login = "pending-user" },
+    },
+    latestReviews = {
+      {
+        author = { login = "approved-user" },
+        state = "APPROVED",
+        submittedAt = "2026-03-16T10:00:00Z",
+      },
+      {
+        author = { login = "commented-user" },
+        state = "COMMENTED",
+        submittedAt = "2026-03-16T09:00:00Z",
+      },
+    },
+    reviews = {
+      {
+        author = { login = "approved-user" },
+        state = "CHANGES_REQUESTED",
+        submittedAt = "2026-03-15T10:00:00Z",
+      },
+    },
+  })
+  local names = {}
+  for _, node in ipairs(nodes) do
+    names[#names + 1] = node.name
+  end
+  assert(table.concat(names, "\n"):find("@approved%-user %[APPROVED%]", 1) ~= nil,
+    "Neo-tree reviewer nodes should use the shared latest-review semantics")
+  assert(table.concat(names, "\n"):find("@commented%-user %[COMMENTED%]", 1) ~= nil,
+    "Neo-tree reviewer nodes should keep COMMENTED reviewer state")
+end
+
+do
+  local render = require("gh-pr.ui.overview.render")
+  local payloads = render.render({
+    model = {
+      number = 42,
+      title = "Reviewer rows",
+      description = "PR description line",
+      summary = {
+        state = "OPEN",
+        review_decision = "REVIEW_REQUIRED",
+        author = "octocat",
+        head_ref = "feature/reviewers",
+        base_ref = "main",
+        additions = 3,
+        deletions = 1,
+        files_changed = 2,
+        updated_at = "2026-03-16T10:00:00Z",
+        merge_state = "clean",
+        mergeable = "MERGEABLE",
+      },
+      people = {
+        review_requests = { "legacy-request" },
+        reviewers = {
+          {
+            id = "user:approved-user",
+            display_name = "@approved-user",
+            request_value = "approved-user",
+            kind = "user",
+            state = "APPROVED",
+            can_rerequest = true,
+          },
+          {
+            id = "user:pending-user",
+            display_name = "@pending-user",
+            request_value = "pending-user",
+            kind = "user",
+            state = "PENDING",
+            can_rerequest = false,
+          },
+          {
+            id = "user:changes-user",
+            display_name = "@changes-user",
+            request_value = "changes-user",
+            kind = "user",
+            state = "CHANGES_REQUESTED",
+            can_rerequest = true,
+          },
+          {
+            id = "user:commented-user",
+            display_name = "@commented-user",
+            request_value = "commented-user",
+            kind = "user",
+            state = "COMMENTED",
+            can_rerequest = true,
+          },
+        },
+        assignees = {},
+      },
+      labels = { items = {} },
+      comments = { total = 0 },
+      reviews = { total = 0 },
+      threads = { total = 0 },
+      commits = { items = {}, total = 0 },
+      timeline = { items = {} },
+      pr_changes = { total = 0 },
+    },
+    show = {
+      timeline = true,
+      comments = true,
+      reviews = true,
+      threads = true,
+      commits = true,
+      pr_changes = true,
+    },
+    activity = render.sanitize_activity_opts({}),
+    theme = {
+      state_colors = true,
+      labels = true,
+      timeline_kinds = true,
+    },
+    date_format = "%Y-%m-%d %H:%M",
+  })
+
+  local lines = payloads.meta.lines or {}
+  local actions = payloads.meta.actions or {}
+  local highlights = payloads.meta.highlights or {}
+  local approved_line = nil
+  local pending_line = nil
+  local changes_line = nil
+  local commented_line = nil
+  local heading_line = nil
+
+  for index, line in ipairs(lines) do
+    if line:find("^## Reviewers", 1) then
+      heading_line = index
+    elseif line:find("^%- @approved%-user %[APPROVED%]", 1) then
+      approved_line = index
+    elseif line:find("^%- @pending%-user %[PENDING%]", 1) then
+      pending_line = index
+    elseif line:find("^%- @changes%-user %[CHANGES_REQUESTED%]", 1) then
+      changes_line = index
+    elseif line:find("^%- @commented%-user %[COMMENTED%]", 1) then
+      commented_line = index
+    end
+  end
+
+  assert(type(heading_line) == "number" and actions[heading_line] and actions[heading_line].edit_kind == "edit_reviewers",
+    "Reviewers heading should keep the edit action")
+  assert(type(approved_line) == "number" and lines[approved_line]:find("re%-request", 1) ~= nil,
+    "Actionable reviewer rows should show the re-request hint")
+  assert(type(pending_line) == "number" and lines[pending_line]:find("re%-request", 1) == nil,
+    "Non-actionable reviewer rows should hide the re-request hint")
+  assert(actions[approved_line] and actions[approved_line].kind == "rerequest_reviewer",
+    "Actionable reviewer rows should expose rerequest_reviewer actions")
+  assert(actions[pending_line] == nil, "Pending reviewer rows should not expose a row action")
+  assert(actions[changes_line] and actions[commented_line],
+    "Completed non-pending reviewer rows should stay actionable")
+
+  local function find_highlight(line, group)
+    for _, item in ipairs(highlights) do
+      if item.line == line and item.group == group then
+        return item
+      end
+    end
+    return nil
+  end
+
+  local approved_hl = find_highlight(approved_line, "GhPrOverviewReviewerApproved")
+  local pending_hl = find_highlight(pending_line, "GhPrOverviewReviewerPending")
+  local changes_hl = find_highlight(changes_line, "GhPrOverviewReviewerChanges")
+  local commented_hl = find_highlight(commented_line, "GhPrOverviewReviewerCommented")
+  assert(approved_hl and approved_hl.start_col > 0 and approved_hl.end_col > approved_hl.start_col,
+    "Approved reviewer row should highlight only the state token")
+  assert(pending_hl and changes_hl and commented_hl,
+    "Reviewer rows should use dedicated state highlight groups")
+end
+
+do
+  local runtime = require("gh-pr.ui.overview.runtime")
+  local rerequested = {}
+  local edit_calls = {}
+  local session_id = runtime.open({
+    number = 42,
+    title = "Overview reviewer actions",
+    description = "Runtime body",
+    summary = {
+      state = "OPEN",
+      review_decision = "REVIEW_REQUIRED",
+      author = "octocat",
+      head_ref = "feature/runtime",
+      base_ref = "main",
+      additions = 1,
+      deletions = 0,
+      files_changed = 1,
+      updated_at = "2026-03-16T10:00:00Z",
+      merge_state = "clean",
+      mergeable = "MERGEABLE",
+    },
+    people = {
+      review_requests = {},
+      reviewers = {
+        {
+          id = "user:approved-user",
+          display_name = "@approved-user",
+          request_value = "approved-user",
+          kind = "user",
+          state = "APPROVED",
+          can_rerequest = true,
+        },
+        {
+          id = "user:pending-user",
+          display_name = "@pending-user",
+          request_value = "pending-user",
+          kind = "user",
+          state = "PENDING",
+          can_rerequest = false,
+        },
+      },
+      assignees = {},
+    },
+    labels = { items = {} },
+    timeline = { items = {} },
+    comments = { total = 0 },
+    reviews = { total = 0 },
+    threads = { total = 0 },
+    commits = { items = {}, total = 0 },
+    pr_changes = { total = 0 },
+  }, {
+    focus_role = "meta",
+    show = {
+      timeline = true,
+      comments = true,
+      reviews = true,
+      threads = true,
+      commits = true,
+      pr_changes = true,
+    },
+    activity = require("gh-pr.ui.overview.render").sanitize_activity_opts({}),
+    theme = {},
+    date_format = "%Y-%m-%d %H:%M",
+    actions = {
+      rerequest_reviewer = function(payload)
+        rerequested[#rerequested + 1] = payload
+      end,
+      edit_stub = function(kind, payload)
+        edit_calls[#edit_calls + 1] = { kind = kind, payload = payload }
+      end,
+    },
+  })
+
+  assert(type(session_id) == "number", "Overview runtime should open session for reviewer action smoke")
+  local meta_buf = vim.api.nvim_get_current_buf()
+  local lines = vim.api.nvim_buf_get_lines(meta_buf, 0, -1, false)
+  local heading_line = nil
+  local approved_line = nil
+  local pending_line = nil
+  for index, line in ipairs(lines) do
+    if not heading_line and line:find("^## Reviewers", 1) then
+      heading_line = index
+    elseif not approved_line and line:find("^%- @approved%-user %[APPROVED%]", 1) then
+      approved_line = index
+    elseif not pending_line and line:find("^%- @pending%-user %[PENDING%]", 1) then
+      pending_line = index
+    end
+  end
+
+  assert(type(heading_line) == "number" and type(approved_line) == "number" and type(pending_line) == "number",
+    "Reviewer runtime smoke should render heading and reviewer rows")
+
+  vim.api.nvim_win_set_cursor(0, { approved_line, 0 })
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+  vim.wait(20)
+  assert(#rerequested == 1 and rerequested[1].request_value == "approved-user",
+    "Pressing <CR> on an actionable reviewer should trigger the rerequest callback")
+
+  vim.api.nvim_win_set_cursor(0, { pending_line, 0 })
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+  vim.wait(20)
+  assert(#rerequested == 1, "Pressing <CR> on a non-actionable reviewer should do nothing")
+
+  vim.api.nvim_win_set_cursor(0, { heading_line, 0 })
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+  vim.wait(20)
+  assert(#edit_calls == 1 and edit_calls[1].kind == "edit_reviewers",
+    "Pressing <CR> on the Reviewers heading should still open edit_reviewers")
+
+  runtime.close(session_id)
+end
+
+do
   local popup = require("gh-pr.comment_popup")
   local comment_thread_actions = require("gh-pr.comment_thread_actions")
   local origin = vim.api.nvim_get_current_buf()

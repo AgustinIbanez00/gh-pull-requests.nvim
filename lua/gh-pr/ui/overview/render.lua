@@ -1627,6 +1627,47 @@ local function render_summary_with_activity(session)
   return append_payload(payload, activity_payload)
 end
 
+local function render_reviewer_row(payload, session, reviewer)
+  reviewer = type(reviewer) == "table" and reviewer or {}
+  local display_name = utils.safe_string(reviewer.display_name, "(unknown reviewer)")
+  local state = utils.safe_string(reviewer.state, "PENDING")
+  local action = nil
+  local hint = nil
+
+  if reviewer.can_rerequest == true then
+    action = {
+      kind = "rerequest_reviewer",
+      payload = {
+        id = reviewer.id,
+        display_name = display_name,
+        request_value = reviewer.request_value,
+        kind = reviewer.kind,
+        state = state,
+      },
+    }
+    hint = "· <CR> re-request"
+  end
+
+  local line = string.format("- %s [%s]", display_name, state)
+  local row
+  if action then
+    row = add_action_line(payload, line, nil, action, hint)
+  else
+    row = add_line(payload, line)
+  end
+
+  local name_start = line:find(display_name, 1, true)
+  if name_start then
+    add_span(payload, row, name_start - 1, name_start - 1 + #display_name, "GhPrOverviewReviewer")
+  end
+
+  local token = "[" .. state .. "]"
+  local token_start = line:find(token, 1, true)
+  if token_start then
+    add_span(payload, row, token_start - 1, token_start - 1 + #token, styles.reviewer_highlight(state, session.theme))
+  end
+end
+
 local function render_meta(session)
   local payload = new_payload()
   local model = session.model or {}
@@ -1661,12 +1702,12 @@ local function render_meta(session)
     { kind = "edit_stub", edit_kind = "edit_reviewers", payload = {} },
     "· <CR> edit"
   )
-  local reviewers = type(people.review_requests) == "table" and people.review_requests or {}
+  local reviewers = type(people.reviewers) == "table" and people.reviewers or {}
   if vim.tbl_isempty(reviewers) then
     add_line(payload, "- (none)", "GhPrOverviewMuted")
   else
     for _, reviewer in ipairs(reviewers) do
-      add_line(payload, "- @" .. utils.safe_string(reviewer, "unknown"), "GhPrOverviewReviewer")
+      render_reviewer_row(payload, session, reviewer)
     end
   end
   add_line(payload, "")
