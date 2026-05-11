@@ -126,6 +126,11 @@ function M.build(call, command_no_args)
     { name = "GhPrNextChange", callback = command_no_args("next_change"), opts = { desc = "Jump to next diff change" } },
     { name = "GhPrPrevChange", callback = command_no_args("prev_change"), opts = { desc = "Jump to previous diff change" } },
     {
+      name = "GhPrToggleChangesPanel",
+      callback = command_no_args("toggle_changes_panel"),
+      opts = { desc = "Toggle diff changes panel" },
+    },
+    {
       name = "GhPrApprove",
       callback = command_no_args("approve"),
       opts = { desc = "Approve active pull request (message + confirm)" },

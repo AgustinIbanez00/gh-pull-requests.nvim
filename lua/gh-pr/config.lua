@@ -277,6 +277,14 @@ local defaults = {
       highlight_group = "GhPrDiffEndline",
     },
     shortcuts = vim.deepcopy(diff_shortcuts.defaults),
+    changes_panel = {
+      enabled = true,
+      auto_open = true,
+      position = "right",
+      width = 34,
+      min_width = 24,
+      max_width = 50,
+    },
     comments_panel = {
       enabled = true,
       auto_open = "if_comments",
@@ -1490,6 +1498,48 @@ local function sanitize_diff_view(diff_view, raw_diff_view)
   end
 
   result.shortcuts = diff_shortcuts.resolve(result.shortcuts)
+
+  result.changes_panel = type(result.changes_panel) == "table" and result.changes_panel or {}
+  if type(result.changes_panel.enabled) ~= "boolean" then
+    result.changes_panel.enabled = defaults.diff_view.changes_panel.enabled
+  end
+  if type(result.changes_panel.auto_open) ~= "boolean" then
+    result.changes_panel.auto_open = defaults.diff_view.changes_panel.auto_open
+  end
+  local changes_panel_position = type(result.changes_panel.position) == "string"
+      and result.changes_panel.position:lower()
+    or defaults.diff_view.changes_panel.position
+  if changes_panel_position ~= "left" and changes_panel_position ~= "right" then
+    changes_panel_position = defaults.diff_view.changes_panel.position
+  end
+  result.changes_panel.position = changes_panel_position
+
+  local changes_panel_min_width = tonumber(result.changes_panel.min_width)
+  if type(changes_panel_min_width) ~= "number" then
+    changes_panel_min_width = defaults.diff_view.changes_panel.min_width
+  end
+  changes_panel_min_width = math.floor(changes_panel_min_width)
+  if changes_panel_min_width < 12 then
+    changes_panel_min_width = defaults.diff_view.changes_panel.min_width
+  end
+  result.changes_panel.min_width = changes_panel_min_width
+
+  local changes_panel_max_width = tonumber(result.changes_panel.max_width)
+  if type(changes_panel_max_width) ~= "number" then
+    changes_panel_max_width = defaults.diff_view.changes_panel.max_width
+  end
+  changes_panel_max_width = math.floor(changes_panel_max_width)
+  if changes_panel_max_width < changes_panel_min_width then
+    changes_panel_max_width = math.max(changes_panel_min_width, defaults.diff_view.changes_panel.max_width)
+  end
+  result.changes_panel.max_width = changes_panel_max_width
+
+  local changes_panel_width = tonumber(result.changes_panel.width)
+  if type(changes_panel_width) ~= "number" then
+    changes_panel_width = defaults.diff_view.changes_panel.width
+  end
+  changes_panel_width = math.floor(changes_panel_width)
+  result.changes_panel.width = math.max(changes_panel_min_width, math.min(changes_panel_max_width, changes_panel_width))
 
   result.comments_panel = type(result.comments_panel) == "table" and result.comments_panel or {}
   if type(result.comments_panel.enabled) ~= "boolean" then

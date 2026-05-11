@@ -90,6 +90,11 @@ local baseline_links = {
   { "GhPrOverviewMarkdownLink", "Underlined" },
   { "GhPrOverviewMarkdownRule", "Comment" },
   { "GhPrDiffCommentsMuted", "Comment" },
+  { "GhPrDiffChangesHeader", "Title" },
+  { "GhPrDiffChangesMuted", "Comment" },
+  { "GhPrDiffChangesAdd", "DiffAdd" },
+  { "GhPrDiffChangesDelete", "DiffDelete" },
+  { "GhPrDiffChangesLine", "Normal" },
   { "GhPrDiffWhitespace", "Whitespace" },
   { "GhPrDiffEndline", "Comment" },
 }

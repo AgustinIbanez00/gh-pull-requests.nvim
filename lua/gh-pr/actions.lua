@@ -1962,6 +1962,7 @@ M._diff_view_helpers = {
   apply_codediff_buffer_keymaps = thread_diff_module.apply_codediff_buffer_keymaps,
   apply_codediff_open_result_context = thread_diff_module.apply_codediff_open_result_context,
   build_codediff_inline_comment_line_map = thread_diff_module.codediff_file_runtime.build_inline_comment_line_map,
+  diff_hunks = require("gh-pr.core.diff_hunks"),
   rehydrate_codediff_file_runtime = thread_diff_module.codediff_file_runtime.rehydrate,
 }
 

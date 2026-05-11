@@ -17,6 +17,7 @@ return {
   { lhs = "<Plug>(gh-pr-toggle-reviewed)", rhs = "<Cmd>GhPrToggleReviewed<CR>", desc = "Toggle viewed" },
   { lhs = "<Plug>(gh-pr-next-change)", rhs = "<Cmd>GhPrNextChange<CR>", desc = "Next diff change" },
   { lhs = "<Plug>(gh-pr-prev-change)", rhs = "<Cmd>GhPrPrevChange<CR>", desc = "Previous diff change" },
+  { lhs = "<Plug>(gh-pr-toggle-changes-panel)", rhs = "<Cmd>GhPrToggleChangesPanel<CR>", desc = "Toggle diff changes panel" },
   { lhs = "<Plug>(gh-pr-approve)", rhs = "<Cmd>GhPrApprove<CR>", desc = "Approve active PR" },
   { lhs = "<Plug>(gh-pr-request-changes)", rhs = "<Cmd>GhPrRequestChanges<CR>", desc = "Request changes on active PR" },
   { lhs = "<Plug>(gh-pr-comment)", rhs = "<Cmd>GhPrComment<CR>", desc = "Comment on active PR" },

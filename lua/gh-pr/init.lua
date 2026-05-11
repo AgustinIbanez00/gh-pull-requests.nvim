@@ -419,6 +419,12 @@ function M.prev_change()
   end)
 end
 
+function M.toggle_changes_panel()
+  return with_runtime(function()
+    call_actions("toggle_diff_changes_panel")
+  end)
+end
+
 function M.approve()
   return with_runtime(function()
     call_actions("review", "approve")

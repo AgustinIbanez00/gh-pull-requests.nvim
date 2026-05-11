@@ -258,6 +258,21 @@ function FileDiff.register(M, ctx)
         local_head_path = extra_ctx.local_head_path,
       })
       sync_diff_comments_panel(pr, details, comments_ctx)
+      local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
+      if ok_changes and type(changes_panel.sync_for_diff) == "function" then
+        local origin_win = vim.api.nvim_get_current_win()
+        local origin_buf = vim.api.nvim_get_current_buf()
+        pcall(changes_panel.sync_for_diff, {
+          pr = pr,
+          details = details,
+          pr_number = pr.number,
+          origin_win = origin_win,
+          origin_buf = origin_buf,
+          file_path = normalize_path(vim.b[origin_buf].gh_pr_file_path or vim.b[origin_buf].gh_pr_path),
+          file_kind = vim.b[origin_buf].gh_pr_file_kind,
+          open_result = open_result,
+        })
+      end
     end
   end
 
@@ -383,6 +398,22 @@ function M.open_diff(file, opts)
     diff_view_runtime.focus_virtual_diff_result(diff_result, opts)
 
     sync_diff_comments_panel(pr, details, comments_ctx)
+    local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
+    if ok_changes and type(changes_panel.sync_for_diff) == "function" then
+      local origin_buf = vim.api.nvim_get_current_buf()
+      if vim.b[origin_buf].gh_pr_is_non_text ~= true then
+        pcall(changes_panel.sync_for_diff, {
+          pr = pr,
+          details = details,
+          pr_number = pr.number,
+          origin_win = vim.api.nvim_get_current_win(),
+          origin_buf = origin_buf,
+          file_path = normalize_path(vim.b[origin_buf].gh_pr_file_path or vim.b[origin_buf].gh_pr_path),
+          file_kind = vim.b[origin_buf].gh_pr_file_kind,
+          diff_result = diff_result,
+        })
+      end
+    end
     return true, nil
   end
 
@@ -617,6 +648,22 @@ local function reopen_current_diff_with_preferences_impl(opts)
       target_original_line = cursor[1],
     })
     sync_diff_comments_panel(pr, details, comments_ctx)
+    local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
+    if ok_changes and type(changes_panel.sync_for_diff) == "function" then
+      local origin_buf = vim.api.nvim_get_current_buf()
+      if vim.b[origin_buf].gh_pr_is_non_text ~= true then
+        pcall(changes_panel.sync_for_diff, {
+          pr = pr,
+          details = details,
+          pr_number = pr.number,
+          origin_win = vim.api.nvim_get_current_win(),
+          origin_buf = origin_buf,
+          file_path = normalize_path(vim.b[origin_buf].gh_pr_file_path or vim.b[origin_buf].gh_pr_path),
+          file_kind = vim.b[origin_buf].gh_pr_file_kind,
+          diff_result = diff_result,
+        })
+      end
+    end
     return true, nil
   end
 
@@ -718,6 +765,10 @@ function M.close_quick()
 
   local base_win, head_win = find_diff_pair_windows_for_current_file()
   if valid_window(base_win) and valid_window(head_win) then
+    local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
+    if ok_changes and type(changes_panel.close_current_tab) == "function" then
+      pcall(changes_panel.close_current_tab, { suppress_auto_open = true })
+    end
     local head_buf = vim.api.nvim_win_get_buf(head_win)
     close_window_if_valid(head_win)
     delete_buffer_if_valid(head_buf)
@@ -732,10 +783,19 @@ function M.close_quick()
   if ok_panel and type(panel.close_current_tab) == "function" then
     pcall(panel.close_current_tab)
   end
+  local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
+  if ok_changes and type(changes_panel.close_current_tab) == "function" then
+    pcall(changes_panel.close_current_tab, { suppress_auto_open = true })
+  end
   open_review_tree_after_close()
 end
 
 function M.close_all_and_open_review()
+  local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
+  if ok_changes and type(changes_panel.close_current_tab) == "function" then
+    pcall(changes_panel.close_current_tab, { suppress_auto_open = true })
+  end
+
   local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
   if ok_panel and type(panel.close_current_tab) == "function" then
     pcall(panel.close_current_tab, { respect_close_with_dq = true })
@@ -1164,6 +1224,7 @@ local function diff_shortcut_lines(bufnr)
   add_shortcut(lines, shortcuts.close_quick, "Quick close (or close head in 2-way diff)")
   add_shortcut(lines, shortcuts.close_all_open_review, "Close view(s) and open PR Review")
   add_shortcut(lines, shortcuts.toggle_comments_panel, "Toggle diff comments panel")
+  add_shortcut(lines, shortcuts.toggle_changes_panel, "Toggle diff changes panel")
 
   if backend ~= "codediff" and not is_non_text then
     add_shortcut(lines, shortcuts.toggle_render_whitespace, "Toggle leading/trailing space/tab symbols")

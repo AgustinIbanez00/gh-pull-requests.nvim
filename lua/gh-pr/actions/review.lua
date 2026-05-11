@@ -413,6 +413,42 @@ local function toggle_diff_comments_panel()
   end
 end
 
+local function toggle_diff_changes_panel()
+  local kind = vim.b.gh_pr_file_kind
+  if kind ~= "base" and kind ~= "head" and kind ~= "unified" then
+    return notify_error("Current buffer is not a gh-pr diff buffer")
+  end
+
+  local pr, details, err = resolve_active_pr(vim.b.gh_pr_number, { refresh = false })
+  if not pr then
+    return notify_error(err)
+  end
+
+  local ok_panel, panel = pcall(require, "gh-pr.diff_changes_panel")
+  if not ok_panel then
+    return notify_error("Unable to load diff changes panel: " .. tostring(panel))
+  end
+  if type(panel.toggle) ~= "function" then
+    return notify_error("Diff changes panel toggle is unavailable")
+  end
+
+  local ok_toggle, toggled, toggle_err = pcall(panel.toggle, {
+    pr = pr,
+    details = details,
+    pr_number = pr.number,
+    origin_win = vim.api.nvim_get_current_win(),
+    origin_buf = vim.api.nvim_get_current_buf(),
+    file_path = normalize_path(vim.b.gh_pr_file_path or vim.b.gh_pr_path),
+    file_kind = vim.b.gh_pr_file_kind,
+  })
+  if not ok_toggle then
+    return notify_error("Unable to toggle diff changes panel: " .. tostring(toggled))
+  end
+  if toggled ~= true and type(toggle_err) == "string" and toggle_err ~= "" then
+    return notify_warn(toggle_err)
+  end
+end
+
 local function start_review(number)
   local pr, details, err = resolve_active_pr(number, { refresh = number ~= nil })
   if not pr then
@@ -622,6 +658,7 @@ function ReviewActions.register(M, ctx)
   M.activate_review = activate_review
   M.toggle_review_tree = toggle_review_tree
   M.toggle_diff_comments_panel = toggle_diff_comments_panel
+  M.toggle_diff_changes_panel = toggle_diff_changes_panel
   M.start_review = start_review
 end
 

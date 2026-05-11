@@ -234,6 +234,10 @@ function codediff_file_runtime.ensure_autocmds()
     callback = function(event)
       local tabpage = type(event.data) == "table" and tonumber(event.data.tabpage) or nil
       codediff_file_runtime.clear(tabpage)
+      local ok_panel, panel = pcall(require, "gh-pr.diff_changes_panel")
+      if ok_panel and type(panel.close_current_tab) == "function" then
+        pcall(panel.close_current_tab)
+      end
     end,
   })
 end
@@ -451,6 +455,9 @@ local function apply_codediff_buffer_keymaps(bufnr)
   set_codediff_buffer_keymap(bufnr, "n", shortcuts.toggle_comments_panel, function()
     M.toggle_diff_comments_panel()
   end, "GH PR: toggle comments panel")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.toggle_changes_panel, function()
+    M.toggle_diff_changes_panel()
+  end, "GH PR: toggle changes panel")
   set_codediff_buffer_keymap(bufnr, "n", shortcuts.submit_pending_comment, function()
     M.submit_pending_comment_review()
   end, "GH PR: submit pending comment review")

@@ -25,6 +25,7 @@ do
   local prefetch = cfg.diff_view.prefetch or {}
   local pr_explorer = cfg.diff_view.pr_explorer or {}
   local comments_panel = cfg.diff_view.comments_panel or {}
+  local changes_panel = cfg.diff_view.changes_panel or {}
   local non_text = cfg.diff_view.non_text or {}
   local cache = cfg.cache or {}
   local follow_current_file = cfg.follow_current_file or {}
@@ -46,15 +47,22 @@ do
   assert(vim.fn.exists(":GhPrMyPr") == 2, "Missing :GhPrMyPr command")
   assert(vim.fn.exists(":GhPrMyPR") == 2, "Missing :GhPrMyPR alias")
   assert(vim.fn.exists(":GhPRReviewRefresh") == 2, "Missing :GhPRReviewRefresh alias")
+  assert(vim.fn.exists(":GhPrToggleChangesPanel") == 2, "Missing :GhPrToggleChangesPanel command")
   assert(vim.fn.maparg("<Plug>(gh-pr-open)", "n") ~= "", "Missing <Plug>(gh-pr-open)")
   assert(vim.fn.maparg("<Plug>(gh-pr-review-refresh)", "n") ~= "", "Missing <Plug>(gh-pr-review-refresh)")
   assert(vim.fn.maparg("<Plug>(gh-pr-my-pr)", "n") ~= "", "Missing <Plug>(gh-pr-my-pr)")
+  assert(vim.fn.maparg("<Plug>(gh-pr-toggle-changes-panel)", "n") ~= "",
+    "Missing <Plug>(gh-pr-toggle-changes-panel)")
   assert(prefetch.enabled == true, "Missing diff_view.prefetch.enabled")
   assert(prefetch.concurrency == 2, "Missing diff_view.prefetch.concurrency")
   assert(prefetch.text_extensions[1] == "lua" and prefetch.text_extensions[2] == "md",
     "Missing diff_view.prefetch.text_extensions")
   assert(pr_explorer.enabled == true, "Missing diff_view.pr_explorer.enabled")
   assert(comments_panel.position == "bottom", "Missing diff_view.comments_panel.position default")
+  assert(changes_panel.enabled == true and changes_panel.auto_open == true,
+    "Missing diff_view.changes_panel enabled/auto_open defaults")
+  assert(changes_panel.position == "right" and changes_panel.width == 34,
+    "Missing diff_view.changes_panel position/width defaults")
   assert(non_text.enabled == true, "Missing diff_view.non_text.enabled")
   assert(non_text.auto_preview == true, "Missing diff_view.non_text.auto_preview")
   assert(non_text.show_metadata == true, "Missing diff_view.non_text.show_metadata")
@@ -68,6 +76,7 @@ do
     "Missing overview activity diff context defaults")
   assert(overview_thread_diff.max_lines == 12, "Missing overview activity diff.max_lines default")
   assert(type(require("gh-pr").open_my_pr_tree) == "function", "Missing open_my_pr_tree facade")
+  assert(type(require("gh-pr").toggle_changes_panel) == "function", "Missing toggle_changes_panel facade")
   assert(type(cache.gh_my_pr) == "table" and cache.gh_my_pr.enabled == true, "Missing cache.gh_my_pr.enabled")
   assert(cache.gh_my_pr.ttl_seconds == 30, "Missing cache.gh_my_pr.ttl_seconds default")
   assert(cache.gh_my_pr.max_cache_age_seconds == 300, "Missing cache.gh_my_pr.max_cache_age_seconds default")
@@ -802,6 +811,52 @@ do
 end
 
 do
+  local diff_hunks = require("gh-pr.core.diff_hunks")
+
+  local codediff_hunks = diff_hunks.from_codediff_changes({
+    {
+      original = { start_line = 2, end_line = 4 },
+      modified = { start_line = 2, end_line = 5 },
+    },
+    {
+      original = { start_line = 8, end_line = 10 },
+      modified = { start_line = 8, end_line = 8 },
+    },
+  })
+  assert(#codediff_hunks == 2, "Codediff hunks should be built from change ranges")
+  assert(codediff_hunks[1].added == 3 and codediff_hunks[1].deleted == 2,
+    "Codediff modify hunk should keep add/delete counts")
+  assert(codediff_hunks[2].target_side == "base" and codediff_hunks[2].deleted == 2,
+    "Codediff delete-only hunk should target the base side")
+
+  local unified_hunks = diff_hunks.from_unified_line_map({
+    [1] = { kind = "context", head_line = 1, base_line = 1 },
+    [2] = { kind = "delete", base_line = 2 },
+    [3] = { kind = "add", head_line = 2 },
+    [4] = { kind = "context", head_line = 3, base_line = 3 },
+    [5] = { kind = "add", head_line = 4 },
+  })
+  assert(#unified_hunks == 2 and unified_hunks[1].target_side == "unified",
+    "Unified line-map hunks should group adjacent changed render lines")
+  assert(unified_hunks[1].added == 1 and unified_hunks[1].deleted == 1 and unified_hunks[1].target_line == 2,
+    "Unified mixed hunk should track counts and render target line")
+
+  local base_buf = vim.api.nvim_create_buf(false, true)
+  local head_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(base_buf, 0, -1, false, { "one", "two", "three" })
+  vim.api.nvim_buf_set_lines(head_buf, 0, -1, false, { "one", "TWO", "three", "four" })
+  local buffer_hunks = diff_hunks.from_buffers(base_buf, head_buf)
+  assert(#buffer_hunks >= 1, "Buffer hunks should be built with vim.diff")
+
+  local added_hunks = diff_hunks.from_single_buffer(head_buf, "added_single")
+  assert(#added_hunks == 1 and added_hunks[1].added == 4 and added_hunks[1].target_side == "head",
+    "Added single-buffer hunk should cover the full head buffer")
+  local removed_hunks = diff_hunks.from_single_buffer(base_buf, "removed_single")
+  assert(#removed_hunks == 1 and removed_hunks[1].deleted == 3 and removed_hunks[1].target_side == "base",
+    "Removed single-buffer hunk should cover the full base buffer")
+end
+
+do
   local config_mod = require("gh-pr.config")
   local actions = require("gh-pr.actions")
   local diff_shortcuts = require("gh-pr.diff_shortcuts")
@@ -828,7 +883,8 @@ do
   assert(diff_shortcuts.defaults.line_comments_popup == "<localleader>k"
       and diff_shortcuts.defaults.inline_comment == "<localleader>c"
       and diff_shortcuts.defaults.inline_suggestion == "<localleader>s"
-      and diff_shortcuts.defaults.toggle_comments_panel == "<localleader>C",
+      and diff_shortcuts.defaults.toggle_comments_panel == "<localleader>C"
+      and diff_shortcuts.defaults.toggle_changes_panel == "<localleader>o",
     "Inline comment defaults should use the short localleader mappings")
 
   local duplicate_shortcuts, duplicate_diags = diff_shortcuts.resolve_effective({
@@ -894,6 +950,8 @@ do
     "Virtual diff buffer should expose the short visual inline-comment mapping")
   assert(vim.fn.maparg(effective_defaults.toggle_comments_panel, "n", false, true).desc == "Toggle diff comments panel",
     "Virtual diff buffer should expose the short comments-panel mapping")
+  assert(vim.fn.maparg(effective_defaults.toggle_changes_panel, "n", false, true).desc == "Toggle diff changes panel",
+    "Virtual diff buffer should expose the short changes-panel mapping")
   assert(vim.fn.maparg(effective_defaults.line_comments_popup, "n", false, true).desc == "Show line comments popup",
     "Virtual diff buffer should expose the line-comments popup mapping")
   assert(vim.fn.maparg("<CR>", "n", false, true).desc == "Open line comments on commented lines",
@@ -940,6 +998,8 @@ do
     "codediff buffer should expose the short gh-pr help mapping")
   assert(vim.fn.maparg(effective_defaults.close_quick, "n", false, true).desc == "GH PR: quick close",
     "codediff buffer should expose the short gh-pr quick-close mapping")
+  assert(vim.fn.maparg(effective_defaults.toggle_changes_panel, "n", false, true).desc == "GH PR: toggle changes panel",
+    "codediff buffer should expose the short gh-pr changes-panel mapping")
   assert(vim.fn.maparg("q", "n") == "" and vim.fn.maparg("g?", "n") == "",
     "gh-pr should not override native codediff q/g? mappings")
 
@@ -2223,6 +2283,174 @@ do
   panel.close_current_tab()
   pr_service.fetch_review_threads_with_pending_async = original_fetch_async
   package.loaded["gh-pr.neotree.diff_comments_source"] = original_tree_source
+end
+
+do
+  local config_mod = require("gh-pr.config")
+  local panel = require("gh-pr.diff_changes_panel")
+
+  local function find_panel_window()
+    for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      local bufnr = vim.api.nvim_win_get_buf(winid)
+      if vim.bo[bufnr].filetype == "gh_pr_diff_changes" then
+        return winid, bufnr
+      end
+    end
+    return nil, nil
+  end
+
+  config_mod.setup({
+    diff_view = {
+      changes_panel = {
+        enabled = true,
+        auto_open = true,
+        position = "right",
+        width = 28,
+        min_width = 20,
+        max_width = 40,
+      },
+    },
+  })
+
+  vim.cmd("tabnew")
+  local diff_buf = vim.api.nvim_get_current_buf()
+  local diff_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_buf_set_lines(diff_buf, 0, -1, false, { "one", "two", "three", "four" })
+  vim.b[diff_buf].gh_pr_number = 601
+  vim.b[diff_buf].gh_pr_file_kind = "head"
+  vim.b[diff_buf].gh_pr_file_path = "lua/changes.lua"
+  vim.b[diff_buf].gh_pr_path = "lua/changes.lua"
+  vim.b[diff_buf].gh_pr_diff_backend = "virtual"
+
+  assert(panel.sync_for_diff({
+    pr = { number = 601 },
+    details = { number = 601 },
+    pr_number = 601,
+    origin_win = diff_win,
+    origin_buf = diff_buf,
+    file_path = "lua/changes.lua",
+    file_kind = "head",
+    hunks = {
+      {
+        index = 1,
+        target_side = "head",
+        target_line = 3,
+        base_start = 3,
+        head_start = 3,
+        added = 2,
+        deleted = 1,
+      },
+    },
+  }) == true, "Diff changes panel should auto-open for navigable hunks")
+
+  local panel_win, panel_buf = find_panel_window()
+  assert(type(panel_win) == "number" and panel_win > 0 and type(panel_buf) == "number" and panel_buf > 0,
+    "Diff changes panel should create a panel window")
+  assert(vim.api.nvim_get_current_win() == diff_win,
+    "Auto-opening the diff changes panel should keep focus in the diff window")
+  assert(vim.bo[panel_buf].buftype == "nofile" and vim.bo[panel_buf].filetype == "gh_pr_diff_changes",
+    "Diff changes panel should use nofile gh_pr_diff_changes buffers")
+  local lines = vim.api.nvim_buf_get_lines(panel_buf, 0, -1, false)
+  assert(lines[1] == "PR #601 changes" and lines[5]:find("+2", 1, true) ~= nil and lines[5]:find("-1", 1, true) ~= nil,
+    "Diff changes panel should render PR/path header and hunk counts")
+
+  vim.api.nvim_set_current_win(panel_win)
+  vim.api.nvim_win_set_cursor(panel_win, { 5, 0 })
+  local enter_map = vim.fn.maparg("<CR>", "n", false, true)
+  assert(type(enter_map.callback) == "function", "Diff changes panel should map Enter")
+  enter_map.callback()
+  assert(vim.api.nvim_get_current_win() == diff_win and vim.api.nvim_win_get_cursor(diff_win)[1] == 3,
+    "Pressing Enter in the diff changes panel should jump to the hunk")
+
+  vim.api.nvim_set_current_win(panel_win)
+  local close_map = vim.fn.maparg("q", "n", false, true)
+  assert(type(close_map.callback) == "function", "Diff changes panel should map q")
+  close_map.callback()
+  assert(panel.is_open_current_tab() == false, "Closing the changes panel should remove the panel")
+
+  assert(panel.sync_for_diff({
+    pr = { number = 601 },
+    details = { number = 601 },
+    pr_number = 601,
+    origin_win = diff_win,
+    origin_buf = diff_buf,
+    file_path = "lua/changes.lua",
+    file_kind = "head",
+    hunks = {
+      { index = 1, target_side = "head", target_line = 2, added = 1, deleted = 0 },
+    },
+  }) == false, "Manual close should suppress later auto-open in the same tab")
+
+  vim.api.nvim_set_current_win(diff_win)
+  assert(panel.toggle({
+    pr = { number = 601 },
+    details = { number = 601 },
+    pr_number = 601,
+    origin_win = diff_win,
+    origin_buf = diff_buf,
+    file_path = "lua/changes.lua",
+    file_kind = "head",
+    hunks = {
+      { index = 1, target_side = "head", target_line = 2, added = 1, deleted = 0 },
+    },
+  }) == true, "Manual toggle should reopen the changes panel")
+  panel_win = find_panel_window()
+  assert(vim.api.nvim_get_current_win() == panel_win,
+    "Manual toggle should focus the diff changes panel")
+  panel.close_current_tab()
+
+  vim.api.nvim_set_current_win(diff_win)
+  vim.b[diff_buf].gh_pr_is_non_text = true
+  local non_text_opened = panel.sync_for_diff({
+    pr = { number = 601 },
+    details = { number = 601 },
+    pr_number = 601,
+    origin_win = diff_win,
+    origin_buf = diff_buf,
+    file_path = "lua/changes.lua",
+    file_kind = "head",
+    non_text = true,
+    hunks = {
+      { index = 1, target_side = "head", target_line = 2, added = 1, deleted = 0 },
+    },
+  })
+  assert(non_text_opened == false and panel.is_open_current_tab() == false,
+    "Non-text previews should not auto-open the diff changes panel")
+  local toggled, toggle_err = panel.toggle({
+    pr = { number = 601 },
+    details = { number = 601 },
+    pr_number = 601,
+    origin_win = diff_win,
+    origin_buf = diff_buf,
+    file_path = "lua/changes.lua",
+    file_kind = "head",
+    non_text = true,
+  })
+  assert(toggled == nil and tostring(toggle_err):find("non%-text", 1) ~= nil,
+    "Manual toggle on non-text previews should report that hunk navigation is unavailable")
+
+  vim.b[diff_buf].gh_pr_is_non_text = false
+  config_mod.setup({
+    diff_view = {
+      changes_panel = {
+        enabled = false,
+      },
+    },
+  })
+  local disabled, disabled_err = panel.toggle({
+    pr = { number = 601 },
+    details = { number = 601 },
+    pr_number = 601,
+    origin_win = diff_win,
+    origin_buf = diff_buf,
+    file_path = "lua/changes.lua",
+    file_kind = "head",
+    hunks = {
+      { index = 1, target_side = "head", target_line = 2, added = 1, deleted = 0 },
+    },
+  })
+  assert(disabled == nil and tostring(disabled_err):find("disabled", 1, true) ~= nil,
+    "Disabled diff changes panel config should block manual toggle")
 end
 
 do

@@ -423,9 +423,18 @@ Validation prerequisites:
         discard_pending_review = "<localleader>rd",
         toggle_review_tree = "<localleader>rx",
         toggle_comments_panel = "<localleader>C",
+        toggle_changes_panel = "<localleader>o",
         image_default_action = "<localleader>io",
         image_fallback_menu = "<localleader>im",
         show_open_hint = true, -- show one-time "how to close diff" hint per diff buffer
+      },
+      changes_panel = {
+        enabled = true,
+        auto_open = true, -- opens beside textual PR file diffs without stealing focus
+        position = "right", -- "right" | "left"
+        width = 34,
+        min_width = 24,
+        max_width = 50,
       },
       comments_panel = {
         enabled = true,
@@ -590,6 +599,7 @@ lives under `lua/gh-pr/ui/overview/*`.
 | `:GhPrOpenDiff` | Open selected file diff or non-text preview | Review code and assets |
 | `:GhPrOpenCommitPatch` | Open selected commit diff in codediff | Inspect commit-level changes |
 | `:GhPrToggleReviewed` | Toggle viewed state | Track reviewed files |
+| `:GhPrToggleChangesPanel` | Toggle current diff hunk panel | Navigate file changes from a side pane |
 | `:GhPrRefresh` | Refresh data | Sync UI with latest PR state |
 | `:GhPRReviewRefresh` / `:GhPrReviewRefresh` | Force background refresh of active PR Review | Refresh stale review tree |
 | `:GhPrMerge [merge|squash|rebase]` | Merge active PR | Complete review flow |
@@ -621,6 +631,7 @@ lives under `lua/gh-pr/ui/overview/*`.
 - `:GhPrToggleReviewed` toggle viewed state (GitHub when available, local fallback otherwise).
 - `:GhPrNextChange` jump to next diff hunk.
 - `:GhPrPrevChange` jump to previous diff hunk.
+- `:GhPrToggleChangesPanel` toggle the side panel for current file hunks.
 - `:GhPrApprove` prompt review message and confirm before submit.
 - `:GhPrRequestChanges` prompt review message and confirm before submit.
 - `:GhPrComment` prompt review message and confirm before submit.
@@ -659,6 +670,7 @@ Top-level mappings are exposed through `<Plug>` and global `<leader>` mappings a
 | `<Plug>(gh-pr-open-commit-patch)` | Open selected commit patch |
 | `<Plug>(gh-pr-toggle-reviewed)` | Toggle viewed state |
 | `<Plug>(gh-pr-next-change)` / `<Plug>(gh-pr-prev-change)` | Jump diff hunks |
+| `<Plug>(gh-pr-toggle-changes-panel)` | Toggle current diff hunk panel |
 | `<Plug>(gh-pr-approve)` / `<Plug>(gh-pr-request-changes)` / `<Plug>(gh-pr-comment)` | Review decisions |
 | `<Plug>(gh-pr-review-submit)` / `<Plug>(gh-pr-review-approve)` / `<Plug>(gh-pr-review-request-changes)` / `<Plug>(gh-pr-review-discard)` | Pending review workflow |
 | `<Plug>(gh-pr-merge)` | Merge active PR |
@@ -847,6 +859,7 @@ Diff backend behavior:
 - Line comment indicators/authors are rendered in codediff side-by-side, codediff inline, and gh-pr virtual unified text diffs.
 - When Neo-tree is available, `<localleader>C` opens a temporary bottom comments tree scoped to the current diff file (`thread -> comment`) and isolated from the other Neo-tree sources; set `diff_view.comments_panel.position = "right"` if you prefer a side pane. Otherwise gh-pr falls back to the legacy bottom panel.
 - The diff comments UI renders lazily after codediff opens and only loads comments for the current file in the background. If the panel is already open, gh-pr keeps it visible, shows a muted `Loading comments for ...` state for the new file, and refreshes it without moving focus or following comment nodes automatically.
+- `<localleader>o` toggles a nofile side panel listing hunks for the active textual PR file diff. Auto-open is enabled by default, does not steal focus, and manual close suppresses auto-open in that tab until toggled again. Non-text previews do not auto-open the panel.
 - In codediff and virtual text diff buffers, pressing `<CR>` on a commented line opens the existing line comments popup for that line.
 - Inside line/thread comment popups, `r` opens a reply composer, `R` opens a quoted reply composer, `x` resolves/unresolves the selected thread, `e` edits your selected comment, `D` deletes it, and `+` / `-` open the emoji reactions picker for published comments. Draft comments in the current pending review support edit/delete but not reactions yet. Replies are added to the current pending review.
 - Popup reaction summaries render emoji chips (`👍 2*`, `❤️ 1`, `🚀 3`) instead of raw GitHub enum names.
@@ -870,6 +883,7 @@ Inside gh-pr virtual diff buffers (`GhPrOpenDiff`, `GhPrOpenOriginal`, `GhPrOpen
 - `<localleader>q` quick close: in 2-way diff closes `modified/head`; in single-buffer view closes and opens `PR Review`
 - `<localleader>Q` closes current diff view(s) and opens/focuses `PR Review`
 - `<localleader>C` toggles the diff comments panel
+- `<localleader>o` toggles the diff changes panel
 - `<localleader>c` adds an inline review comment at current line (`MODIFIED`/head or `unified`)
 - visual `<localleader>c` adds an inline review comment for the selected line range (`v`/`V`, `MODIFIED`/head or `unified`)
 - `<localleader>s` adds an inline suggestion comment at current line (`suggestion` template)
