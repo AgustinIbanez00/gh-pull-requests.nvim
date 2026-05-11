@@ -128,6 +128,57 @@ do
 end
 
 do
+  local runtime = require("gh-pr.core.runtime")
+  local codediff = require("gh-pr.integrations.codediff")
+  local virtual_files = require("gh-pr.virtual_files")
+  local helpers = codediff._temp_buffer_helpers or {}
+  local virtual_helpers = virtual_files._diff_view_helpers or {}
+
+  assert(type(helpers.mark_codediff_temp_buffer) == "function",
+    "Missing codediff transient buffer helper")
+  assert(type(virtual_helpers.mark_transient_buffer) == "function",
+    "Missing virtual transient buffer helper")
+
+  local cache_root = table.concat({ vim.fn.stdpath("cache"), "gh-pr", "codediff", "pairs", "smoke", "Example.cs" }, "/")
+  local codediff_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(codediff_buf, cache_root)
+  assert(helpers.mark_codediff_temp_buffer(codediff_buf) == true,
+    "codediff cache buffer should be marked as transient")
+  assert(vim.b[codediff_buf].gh_pr_lsp_exclude == true,
+    "codediff cache buffer should opt out of external LSP/workspace resolution")
+  assert(vim.b[codediff_buf].gh_pr_transient_diff_buffer == true,
+    "codediff cache buffer should expose the transient diff marker")
+  assert(vim.b[codediff_buf].gh_pr_codediff_temp == true,
+    "codediff cache buffer should expose the codediff temp marker")
+
+  local local_head_path = table.concat({ vim.fn.stdpath("cache"), "gh-pr-local-head-smoke.cs" }, "/")
+  local local_head_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(local_head_buf, local_head_path)
+  assert(helpers.mark_codediff_temp_buffer(local_head_buf) == false,
+    "real file buffers should not be marked as codediff temp buffers by default")
+  assert(vim.b[local_head_buf].gh_pr_lsp_exclude ~= true,
+    "real file buffers should keep LSP eligibility by default")
+
+  local virtual_diff_buf = vim.api.nvim_create_buf(false, true)
+  virtual_helpers.mark_transient_buffer(virtual_diff_buf)
+  assert(vim.b[virtual_diff_buf].gh_pr_lsp_exclude == true,
+    "virtual diff buffers should opt out of external LSP/workspace resolution")
+  assert(vim.b[virtual_diff_buf].gh_pr_transient_diff_buffer == true,
+    "virtual diff buffers should expose the transient diff marker")
+
+  runtime.ensure_initialized()
+  local ghpr_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(ghpr_buf, "ghpr://review/321/src/Example.cs")
+  vim.api.nvim_set_current_buf(ghpr_buf)
+  vim.api.nvim_exec_autocmds("BufEnter", {
+    buffer = ghpr_buf,
+    modeline = false,
+  })
+  assert(vim.b[ghpr_buf].gh_pr_lsp_exclude == true,
+    "ghpr URI buffers should opt out of external LSP/workspace resolution")
+end
+
+do
   local cfg = require("gh-pr.config").get()
   local actions = require("gh-pr.actions")
   local url_open = require("gh-pr.url_open")
@@ -1666,6 +1717,88 @@ do
   pr_service.get_current_user_login = original_get_current_user_login
   vim.fn.delete(tmp_root, "rf")
   package.loaded["gh-pr.diff_comments_panel"] = original_panel
+end
+
+do
+  local codediff = require("gh-pr.integrations.codediff")
+  local virtual_files = require("gh-pr.virtual_files")
+
+  local original_remote_pair_loader = virtual_files.load_remote_file_pair
+  local original_remote_pair_loader_async = virtual_files.load_remote_file_pair_async
+  local created_codediff_command = false
+  if vim.fn.exists(":CodeDiff") ~= 2 then
+    vim.api.nvim_create_user_command("CodeDiff", function() end, {})
+    created_codediff_command = true
+  end
+
+  local sync_loads = 0
+  local async_loads = 0
+  virtual_files.load_remote_file_pair = function()
+    sync_loads = sync_loads + 1
+    return nil, "sync loader should not be used"
+  end
+  virtual_files.load_remote_file_pair_async = function(_, file, callback)
+    async_loads = async_loads + 1
+    vim.defer_fn(function()
+      local path = file.path or file.filename
+      callback({
+        status = file.status or "modified",
+        file_mode = file.status == "added" and "added_single" or "diff_pair",
+        base_path = path,
+        head_path = path,
+        base_content = "base " .. path .. "\n",
+        head_content = "head " .. path .. "\n",
+      }, nil)
+    end, 10)
+  end
+
+  local details = {
+    baseRefName = "main",
+    headRefName = "feature/async",
+    files = {
+      { path = "async/a.lua", filename = "async/a.lua", status = "modified" },
+      { path = "async/b.lua", filename = "async/b.lua", status = "added" },
+      { path = "async/c.lua", filename = "async/c.lua", status = "modified" },
+    },
+  }
+
+  local not_ready = codediff.open_pr_explorer_diff({
+    pr_number = 991,
+    details = details,
+    files = details.files,
+    file = details.files[1],
+    only_if_cached = true,
+  })
+  assert(not_ready == nil, "Cold PR explorer only_if_cached open should not build synchronously")
+  assert(sync_loads == 0, "Cold PR explorer only_if_cached open must not call sync remote loader")
+
+  local completed = false
+  codediff.prepare_directory_snapshot_async({
+    details = details,
+    files = details.files,
+    target_path = details.files[1].path,
+    cache_scope = "async-smoke-991",
+  }, function() end, function(prepared, err)
+    assert(prepared ~= nil, err or "Async codediff snapshot should complete")
+    assert(prepared.included == 3, "Async codediff snapshot should include all textual files")
+    completed = true
+  end)
+
+  assert(completed == false, "Async codediff snapshot should not complete before yielding")
+  assert(sync_loads == 0, "Async codediff snapshot must not call sync remote loader")
+
+  vim.wait(500, function()
+    return completed
+  end)
+  assert(completed == true, "Async codediff snapshot did not complete")
+  assert(async_loads == 3, "Async codediff snapshot should load files through async loader")
+  assert(sync_loads == 0, "Async codediff snapshot should keep sync loader unused")
+
+  virtual_files.load_remote_file_pair = original_remote_pair_loader
+  virtual_files.load_remote_file_pair_async = original_remote_pair_loader_async
+  if created_codediff_command then
+    pcall(vim.api.nvim_del_user_command, "CodeDiff")
+  end
 end
 
 do

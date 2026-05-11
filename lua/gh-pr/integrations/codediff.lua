@@ -9,6 +9,7 @@ local temp_state = {
   file_cache = {},
   remote_pair_cache = {},
   dir_cache = {},
+  dir_jobs = {},
   pr_explorer_sessions = {},
   cleanup_attached = false,
   readonly_guard_attached = false,
@@ -256,8 +257,20 @@ local function is_codediff_temp_buffer(bufnr)
   return name:sub(1, #root) == root
 end
 
-local function apply_codediff_readonly_lock(bufnr)
+local function mark_codediff_temp_buffer(bufnr)
   local is_temp = is_codediff_temp_buffer(bufnr)
+  if not is_temp then
+    return false
+  end
+
+  vim.b[bufnr].gh_pr_lsp_exclude = true
+  vim.b[bufnr].gh_pr_transient_diff_buffer = true
+  vim.b[bufnr].gh_pr_codediff_temp = true
+  return true
+end
+
+local function apply_codediff_readonly_lock(bufnr)
+  local is_temp = mark_codediff_temp_buffer(bufnr)
   if not is_temp then
     return false
   end
@@ -304,6 +317,13 @@ local function ensure_readonly_guard_autocmd()
 
   temp_state.readonly_guard_attached = true
   local group = vim.api.nvim_create_augroup("GhPrCodediffReadonly", { clear = true })
+  vim.api.nvim_create_autocmd({ "BufAdd", "BufFilePost" }, {
+    group = group,
+    desc = "gh-pr: mark codediff temp buffers as transient",
+    callback = function(args)
+      mark_codediff_temp_buffer(tonumber(args.buf))
+    end,
+  })
   vim.api.nvim_create_autocmd({ "BufReadPost", "BufWinEnter" }, {
     group = group,
     desc = "gh-pr: keep codediff temp buffers readonly",
@@ -341,6 +361,74 @@ local function positive_integer(value, fallback)
     return fallback
   end
   return number
+end
+
+local function resolve_snapshot_concurrency()
+  local ok_config, config = pcall(require, "gh-pr.config")
+  if not ok_config or type(config) ~= "table" or type(config.get) ~= "function" then
+    return 4
+  end
+
+  local plugin_config = type(config.get()) == "table" and config.get() or {}
+  local diff_view = type(plugin_config.diff_view) == "table" and plugin_config.diff_view or {}
+  local prefetch = type(diff_view.prefetch) == "table" and diff_view.prefetch or {}
+  return positive_integer(prefetch.concurrency, 4)
+end
+
+local function schedule(callback, ...)
+  if type(callback) ~= "function" then
+    return
+  end
+
+  local args = { ... }
+  vim.schedule(function()
+    callback((table.unpack or unpack)(args))
+  end)
+end
+
+local function start_progress_notifier(total)
+  local timer = uv.new_timer()
+  local state = {
+    current = 0,
+    total = positive_integer(total, 0),
+    shown = false,
+    stopped = false,
+  }
+
+  if timer then
+    timer:start(350, 1000, vim.schedule_wrap(function()
+      if state.stopped then
+        return
+      end
+      state.shown = true
+      vim.notify(
+        string.format("gh-pr: Loading codediff explorer: %d/%d files", state.current, state.total),
+        vim.log.levels.INFO
+      )
+    end))
+  end
+
+  local function stop()
+    state.stopped = true
+    if timer then
+      timer:stop()
+      timer:close()
+    end
+  end
+
+  return {
+    update = function(current, next_total)
+      state.current = positive_integer(current, state.current)
+      state.total = positive_integer(next_total, state.total)
+    end,
+    finish = function(message, level)
+      stop()
+      if state.shown and type(message) == "string" and message ~= "" then
+        vim.notify(message, level or vim.log.levels.INFO)
+      end
+    end,
+    stop = stop,
+  }
 end
 
 local function find_buffer_for_path(path)
@@ -667,6 +755,106 @@ local function prepare_pair_from_remote_async(opts, callback)
   end)
 end
 
+local function directory_signature(opts, files)
+  local signature = { pair_scope(opts), "directory" }
+  for _, raw in ipairs(type(files) == "table" and files or {}) do
+    local file = type(raw) == "table" and raw or {}
+    signature[#signature + 1] = table.concat({
+      safe_string(file.path ~= "" and file.path or file.filename),
+      safe_string(file.previous_filename ~= "" and file.previous_filename or file.previousFilename),
+      safe_string(file.status),
+      safe_string(file.patch),
+    }, ":")
+  end
+  return sha256(table.concat(signature, "|"))
+end
+
+local function cached_directory_snapshot(dir_key)
+  local cached = temp_state.dir_cache[dir_key]
+  if type(cached) == "table"
+    and vim.fn.isdirectory(cached.base_dir or "") == 1
+    and vim.fn.isdirectory(cached.head_dir or "") == 1 then
+    return cached
+  end
+  return nil
+end
+
+local function target_candidate_set(target_path)
+  local target_candidates = {}
+  for _, candidate in ipairs(file_lookup_candidates({
+    path = target_path,
+    filename = target_path,
+  })) do
+    target_candidates[candidate] = true
+  end
+  return target_candidates
+end
+
+local function file_matches_candidates(file, target_candidates)
+  if next(target_candidates) == nil then
+    return false
+  end
+
+  for _, candidate in ipairs(file_lookup_candidates(file)) do
+    if target_candidates[candidate] then
+      return true
+    end
+  end
+  return false
+end
+
+local function status_letter(status, file_mode)
+  local mode = safe_string(file_mode)
+  if mode == "added_single" then
+    return "A"
+  end
+  if mode == "removed_single" then
+    return "D"
+  end
+
+  local value = safe_string(status):lower()
+  if value == "added" or value == "a" then
+    return "A"
+  end
+  if value == "removed" or value == "deleted" or value == "d" then
+    return "D"
+  end
+  if value == "renamed" or value == "r" then
+    return "R"
+  end
+  if value == "copied" or value == "c" then
+    return "C"
+  end
+  return "M"
+end
+
+local function snapshot_entry_from_data(data)
+  data = type(data) == "table" and data or {}
+  local file_mode = safe_string(data.file_mode)
+  local path = file_mode == "removed_single"
+      and sanitize_relative_path(data.base_path, "")
+    or sanitize_relative_path(data.head_path, "")
+  if path == "" then
+    path = sanitize_relative_path(data.base_path, "")
+  end
+  if path == "" then
+    return nil
+  end
+  return {
+    path = path,
+    status = status_letter(data.status, file_mode),
+    group = "unstaged",
+  }
+end
+
+local function status_result_from_entries(entries)
+  return {
+    conflicts = {},
+    unstaged = vim.deepcopy(type(entries) == "table" and entries or {}),
+    staged = {},
+  }
+end
+
 local function prepare_directory_snapshot(opts)
   opts = type(opts) == "table" and opts or {}
   local details = type(opts.details) == "table" and opts.details or nil
@@ -684,23 +872,14 @@ local function prepare_directory_snapshot(opts)
     return nil, root_err
   end
 
-  local signature = { pair_scope(opts), "directory" }
-  for _, raw in ipairs(files) do
-    local file = type(raw) == "table" and raw or {}
-    signature[#signature + 1] = table.concat({
-      safe_string(file.path ~= "" and file.path or file.filename),
-      safe_string(file.previous_filename ~= "" and file.previous_filename or file.previousFilename),
-      safe_string(file.status),
-      safe_string(file.patch),
-    }, ":")
-  end
-  local dir_key = sha256(table.concat(signature, "|"))
+  local dir_key = directory_signature(opts, files)
 
-  local cached = temp_state.dir_cache[dir_key]
-  if type(cached) == "table"
-    and vim.fn.isdirectory(cached.base_dir or "") == 1
-    and vim.fn.isdirectory(cached.head_dir or "") == 1 then
+  local cached = cached_directory_snapshot(dir_key)
+  if cached then
     return cached, nil
+  end
+  if opts.only_if_cached == true then
+    return nil, "codediff PR explorer snapshot is not ready yet"
   end
 
   local base_dir = joinpath(root, "dirs", dir_key, "base")
@@ -709,26 +888,15 @@ local function prepare_directory_snapshot(opts)
     return nil, "Unable to prepare codediff temporary directories"
   end
 
-  local target_candidates = {}
-  for _, candidate in ipairs(file_lookup_candidates({
-    path = opts.target_path,
-    filename = opts.target_path,
-  })) do
-    target_candidates[candidate] = true
-  end
+  local target_candidates = target_candidate_set(opts.target_path)
 
   local included = 0
+  local entries = {}
   local target_included = next(target_candidates) == nil
 
   for _, raw in ipairs(files) do
     local file = type(raw) == "table" and raw or {}
-    local matches_target = false
-    for _, candidate in ipairs(file_lookup_candidates(file)) do
-      if target_candidates[candidate] then
-        matches_target = true
-        break
-      end
-    end
+    local matches_target = file_matches_candidates(file, target_candidates)
 
     local scope = pair_scope({
       details = details,
@@ -785,6 +953,7 @@ local function prepare_directory_snapshot(opts)
     end
 
     included = included + 1
+    entries[#entries + 1] = snapshot_entry_from_data(data)
     if matches_target then
       target_included = true
     end
@@ -805,10 +974,237 @@ local function prepare_directory_snapshot(opts)
     head_dir = head_dir,
     key = dir_key,
     included = included,
+    entries = entries,
+    status_result = status_result_from_entries(entries),
   }
   temp_state.dir_cache[dir_key] = prepared
   ensure_cleanup_autocmd()
   return prepared, nil
+end
+
+local function prepare_directory_snapshot_async(opts, progress, callback)
+  if type(progress) == "function" and type(callback) ~= "function" then
+    callback = progress
+    progress = nil
+  end
+  callback = callback or function() end
+  opts = type(opts) == "table" and opts or {}
+  local details = type(opts.details) == "table" and opts.details or nil
+  local files = type(opts.files) == "table" and opts.files or nil
+  if not details or not files then
+    schedule(callback, nil, "Missing details/files payload for codediff directory open")
+    return
+  end
+
+  if vim.tbl_isempty(files) then
+    schedule(callback, nil, "Selected commit has no files to open in codediff")
+    return
+  end
+
+  local root, root_err = cache_root()
+  if not root then
+    schedule(callback, nil, root_err)
+    return
+  end
+
+  local dir_key = directory_signature(opts, files)
+  local cached = cached_directory_snapshot(dir_key)
+  if cached then
+    schedule(callback, cached, nil)
+    return
+  end
+
+  local running_job = temp_state.dir_jobs[dir_key]
+  if type(running_job) == "table" then
+    running_job.callbacks[#running_job.callbacks + 1] = callback
+    if type(progress) == "function" then
+      running_job.progress[#running_job.progress + 1] = progress
+    end
+    return
+  end
+
+  local base_dir = joinpath(root, "dirs", dir_key, "base")
+  local head_dir = joinpath(root, "dirs", dir_key, "head")
+  if not ensure_dir(base_dir) or not ensure_dir(head_dir) then
+    schedule(callback, nil, "Unable to prepare codediff temporary directories")
+    return
+  end
+
+  local job = {
+    callbacks = { callback },
+    progress = type(progress) == "function" and { progress } or {},
+    completed = 0,
+    included = 0,
+    entries = {},
+    failed = false,
+    target_included = next(target_candidate_set(opts.target_path)) == nil,
+  }
+  temp_state.dir_jobs[dir_key] = job
+
+  local target_candidates = target_candidate_set(opts.target_path)
+  local index = 0
+  local active = 0
+  local total = #files
+  local concurrency = math.min(resolve_snapshot_concurrency(), total)
+
+  local function notify_progress()
+    for _, on_progress in ipairs(job.progress) do
+      pcall(on_progress, {
+        completed = job.completed,
+        total = total,
+        included = job.included,
+      })
+    end
+  end
+
+  local function finish(prepared, err)
+    temp_state.dir_jobs[dir_key] = nil
+    for _, done in ipairs(job.callbacks) do
+      schedule(done, prepared, err)
+    end
+  end
+
+  local function fail(err)
+    if job.failed then
+      return
+    end
+    job.failed = true
+    finish(nil, err)
+  end
+
+  local function maybe_done()
+    if job.failed then
+      return
+    end
+    if job.completed < total then
+      return
+    end
+    if job.included < 1 then
+      finish(nil, fallback_error("No textual files are available for codediff explorer."))
+      return
+    end
+    if not job.target_included then
+      finish(nil, "Selected file is unavailable in codediff PR explorer")
+      return
+    end
+
+    local prepared = {
+      mode = "directory",
+      base_dir = base_dir,
+      head_dir = head_dir,
+      key = dir_key,
+      included = job.included,
+      entries = job.entries,
+      status_result = status_result_from_entries(job.entries),
+    }
+    temp_state.dir_cache[dir_key] = prepared
+    ensure_cleanup_autocmd()
+    finish(prepared, nil)
+  end
+
+  local pump
+  pump = function()
+    if job.failed then
+      return
+    end
+
+    while active < concurrency and index < total do
+      index = index + 1
+      active = active + 1
+      local file = type(files[index]) == "table" and files[index] or {}
+      local matches_target = file_matches_candidates(file, target_candidates)
+      local scope = pair_scope({
+        details = details,
+        file = file,
+      })
+      local cached_pair = temp_state.remote_pair_cache[scope]
+
+      local function handle_pair(data, data_err)
+        active = active - 1
+        job.completed = job.completed + 1
+
+        if not data then
+          if matches_target then
+            fail(data_err or "Unable to load commit file content from GitHub")
+            return
+          end
+          notify_progress()
+          pump()
+          maybe_done()
+          return
+        end
+
+        temp_state.remote_pair_cache[scope] = data
+        local textual_ok, textual_err = ensure_textual_remote_pair(data)
+        if not textual_ok then
+          if matches_target then
+            fail(textual_err)
+            return
+          end
+          notify_progress()
+          pump()
+          maybe_done()
+          return
+        end
+
+        local file_mode = safe_string(data.file_mode)
+        local include_base = file_mode ~= "added_single"
+        local include_head = file_mode ~= "removed_single"
+        if file_mode == "" then
+          local status = safe_string(data.status)
+          include_base = status ~= "added"
+          include_head = status ~= "removed"
+        end
+
+        if include_base then
+          local base_rel = sanitize_relative_path(data.base_path, "base.txt")
+          local base_path = joinpath(base_dir, base_rel)
+          local _, write_base_err = write_bytes(base_path, safe_string(data.base_content))
+          if write_base_err then
+            fail(write_base_err)
+            return
+          end
+        end
+
+        if include_head then
+          local head_rel = sanitize_relative_path(data.head_path, "head.txt")
+          local head_path = joinpath(head_dir, head_rel)
+          local _, write_head_err = write_bytes(head_path, safe_string(data.head_content))
+          if write_head_err then
+            fail(write_head_err)
+            return
+          end
+        end
+
+        job.included = job.included + 1
+        local entry = snapshot_entry_from_data(data)
+        if entry then
+          job.entries[#job.entries + 1] = entry
+        end
+        if matches_target then
+          job.target_included = true
+        end
+
+        notify_progress()
+        pump()
+        maybe_done()
+      end
+
+      if type(cached_pair) == "table" then
+        vim.schedule(function()
+          handle_pair(cached_pair, nil)
+        end)
+      else
+        local ok_async, async_err = pcall(virtual_files.load_remote_file_pair_async, details, file, handle_pair)
+        if not ok_async then
+          handle_pair(nil, tostring(async_err))
+        end
+      end
+    end
+  end
+
+  notify_progress()
+  pump()
 end
 
 local function resolve_tab_open_result(tabpage)
@@ -1339,19 +1735,30 @@ local function create_pr_explorer_session(opts)
     files = opts.files,
     cache_scope = opts.cache_scope,
     target_path = opts.target_path,
+    only_if_cached = opts.only_if_cached == true,
   })
   if not prepared then
     return nil, nil, prepare_err
   end
 
-  local ok_dir, dir_mod = pcall(require, "codediff.core.dir")
   local ok_view, view = pcall(require, "codediff.ui.view")
-  if not ok_dir or not ok_view or type(dir_mod.diff_directories) ~= "function" or type(view.create) ~= "function" then
+  if not ok_view or type(view.create) ~= "function" then
     return nil, nil, "codediff explorer internals are unavailable"
   end
 
-  local diff = dir_mod.diff_directories(prepared.base_dir, prepared.head_dir)
-  local status_result = type(diff) == "table" and type(diff.status_result) == "table" and diff.status_result or nil
+  local status_result = type(prepared.status_result) == "table" and prepared.status_result or nil
+  local root1 = prepared.base_dir
+  local root2 = prepared.head_dir
+  if type(status_result) ~= "table" then
+    local ok_dir, dir_mod = pcall(require, "codediff.core.dir")
+    if not ok_dir or type(dir_mod.diff_directories) ~= "function" then
+      return nil, nil, "codediff explorer internals are unavailable"
+    end
+    local diff = dir_mod.diff_directories(prepared.base_dir, prepared.head_dir)
+    status_result = type(diff) == "table" and type(diff.status_result) == "table" and diff.status_result or nil
+    root1 = type(diff) == "table" and diff.root1 or prepared.base_dir
+    root2 = type(diff) == "table" and diff.root2 or prepared.head_dir
+  end
   if type(status_result) ~= "table" then
     return nil, nil, "Unable to build codediff PR explorer snapshot"
   end
@@ -1363,8 +1770,8 @@ local function create_pr_explorer_session(opts)
   local session_config = {
     mode = "explorer",
     git_root = nil,
-    original_path = diff.root1,
-    modified_path = diff.root2,
+    original_path = root1,
+    modified_path = root2,
     original_revision = nil,
     modified_revision = nil,
     layout = normalize_layout(opts.layout),
@@ -1410,6 +1817,41 @@ local function create_pr_explorer_session(opts)
   }, nil
 end
 
+local function create_pr_explorer_session_from_prepared(opts, prepared)
+  opts = type(opts) == "table" and opts or {}
+  if type(prepared) ~= "table" then
+    return nil, nil, "Unable to build codediff PR explorer snapshot"
+  end
+
+  temp_state.dir_cache[prepared.key] = prepared
+  return create_pr_explorer_session(vim.tbl_extend("force", opts, {
+    only_if_cached = true,
+  }))
+end
+
+local function create_pr_explorer_session_async(opts, progress, callback)
+  if type(progress) == "function" and type(callback) ~= "function" then
+    callback = progress
+    progress = nil
+  end
+  callback = callback or function() end
+  opts = type(opts) == "table" and opts or {}
+  prepare_directory_snapshot_async({
+    details = opts.details,
+    files = opts.files,
+    cache_scope = opts.cache_scope,
+    target_path = opts.target_path,
+  }, progress, function(prepared, prepare_err)
+    if not prepared then
+      callback(nil, nil, prepare_err)
+      return
+    end
+
+    local session, opened, open_err = create_pr_explorer_session_from_prepared(opts, prepared)
+    callback(session, opened, open_err)
+  end)
+end
+
 local function resolve_focus_line(opts, side)
   if side == "base" then
     return positive_integer(opts.target_original_line, positive_integer(opts.target_line, nil))
@@ -1453,17 +1895,9 @@ function M.focus_side_and_line(opened, opts)
   return true, nil
 end
 
-function M.open_pr_file_diff(opts)
+local function open_prepared_file_diff(opts, prepared)
   opts = type(opts) == "table" and opts or {}
-  local guard_ok, guard_err = ensure_readonly_guard_autocmd()
-  if not guard_ok and guard_err then
-    return nil, guard_err
-  end
-
-  local prepared, prepare_err = prepare_pair_from_remote(opts)
-  if not prepared then
-    return nil, prepare_err
-  end
+  prepared = type(prepared) == "table" and prepared or {}
 
   local head_open_path = prepared.head_temp_path
   local local_head_path = safe_string(opts.local_head_path)
@@ -1520,6 +1954,41 @@ function M.open_pr_file_diff(opts)
 
   M.focus_side_and_line(opened, opts)
   return opened, nil
+end
+
+function M.open_pr_file_diff(opts)
+  opts = type(opts) == "table" and opts or {}
+  local guard_ok, guard_err = ensure_readonly_guard_autocmd()
+  if not guard_ok and guard_err then
+    return nil, guard_err
+  end
+
+  local prepared, prepare_err = prepare_pair_from_remote(opts)
+  if not prepared then
+    return nil, prepare_err
+  end
+
+  return open_prepared_file_diff(opts, prepared)
+end
+
+function M.open_pr_file_diff_async(opts, callback)
+  callback = callback or function() end
+  opts = type(opts) == "table" and opts or {}
+  local guard_ok, guard_err = ensure_readonly_guard_autocmd()
+  if not guard_ok and guard_err then
+    schedule(callback, nil, guard_err)
+    return
+  end
+
+  prepare_pair_from_remote_async(opts, function(prepared, prepare_err)
+    if not prepared then
+      callback(nil, prepare_err)
+      return
+    end
+
+    local opened, open_err = open_prepared_file_diff(opts, prepared)
+    callback(opened, open_err)
+  end)
 end
 
 function M.open_pr_explorer_diff(opts)
@@ -1608,12 +2077,120 @@ function M.open_pr_explorer_diff(opts)
       safe_string(details.baseRefName),
       safe_string(details.headRefName),
     }, "|"),
+    only_if_cached = opts.only_if_cached == true,
   })
   if not opened then
     return nil, open_err
   end
 
   return opened, nil
+end
+
+function M.open_pr_explorer_diff_async(opts, callback)
+  callback = callback or function() end
+  opts = type(opts) == "table" and opts or {}
+  local details = type(opts.details) == "table" and opts.details or nil
+  local file = type(opts.file) == "table" and opts.file or nil
+  if not details or not file then
+    schedule(callback, nil, "Missing details/file payload for codediff PR explorer")
+    return
+  end
+
+  local guard_ok, guard_err = ensure_readonly_guard_autocmd()
+  if not guard_ok and guard_err then
+    schedule(callback, nil, guard_err)
+    return
+  end
+  if not ensure_codediff_command() then
+    schedule(callback, nil, "codediff.nvim is unavailable (`:CodeDiff` not found)")
+    return
+  end
+
+  local focus_path = sanitize_relative_path(file.path or file.filename, "")
+  if focus_path == "" then
+    schedule(callback, nil, "Unable to resolve selected path for codediff PR explorer")
+    return
+  end
+
+  local opened_ready, ready_err = M.open_pr_explorer_diff(vim.tbl_extend("force", opts, {
+    only_if_cached = true,
+  }))
+  if opened_ready then
+    schedule(callback, opened_ready, nil)
+    return
+  end
+
+  apply_codediff_preferences({
+    layout = opts.layout,
+    ignore_trim_whitespace = opts.ignore_trim_whitespace == true,
+  })
+
+  local session_key = pr_explorer_session_key({
+    details = details,
+    pr_number = opts.pr_number,
+  })
+  create_pr_explorer_session_async({
+    session_key = session_key,
+    details = details,
+    files = type(opts.files) == "table" and opts.files or details.files,
+    target_path = focus_path,
+    layout = opts.layout,
+    target_side = opts.target_side,
+    target_line = opts.target_line,
+    target_original_line = opts.target_original_line,
+    on_selection = opts.on_selection,
+    cache_scope = table.concat({
+      session_key,
+      safe_string(details.baseRefName),
+      safe_string(details.headRefName),
+    }, "|"),
+  }, opts.progress, function(_, opened, open_err)
+    callback(opened, open_err or ready_err)
+  end)
+end
+
+function M.prepare_directory_snapshot_async(opts, progress, callback)
+  return prepare_directory_snapshot_async(opts, progress, callback)
+end
+
+function M.prefetch_pr_explorer_snapshot(opts, callback)
+  callback = callback or function() end
+  opts = type(opts) == "table" and opts or {}
+  local details = type(opts.details) == "table" and opts.details or nil
+  local file = type(opts.file) == "table" and opts.file or nil
+  if not details or not file then
+    schedule(callback, nil, "Missing details/file payload for codediff PR explorer")
+    return
+  end
+
+  local focus_path = sanitize_relative_path(file.path or file.filename, "")
+  local session_key = pr_explorer_session_key({
+    details = details,
+    pr_number = opts.pr_number,
+  })
+  local progress = start_progress_notifier(#(type(opts.files) == "table" and opts.files or details.files or {}))
+  prepare_directory_snapshot_async({
+    details = details,
+    files = type(opts.files) == "table" and opts.files or details.files,
+    cache_scope = table.concat({
+      session_key,
+      safe_string(details.baseRefName),
+      safe_string(details.headRefName),
+    }, "|"),
+    target_path = focus_path,
+  }, function(state)
+    progress.update(state.completed, state.total)
+  end, function(prepared, err)
+    if prepared then
+      progress.finish(
+        string.format("gh-pr: codediff PR explorer snapshot ready (%d files)", tonumber(prepared.included) or 0),
+        vim.log.levels.INFO
+      )
+    else
+      progress.finish("gh-pr: unable to prepare codediff PR explorer snapshot: " .. tostring(err), vim.log.levels.WARN)
+    end
+    callback(prepared, err)
+  end)
 end
 
 function M.prefetch_pr_file_pair(opts, callback)
@@ -1680,5 +2257,10 @@ end
 function M.open_compare_diff(opts)
   return M.open_commit_diff(opts)
 end
+
+M._temp_buffer_helpers = {
+  is_codediff_temp_buffer = is_codediff_temp_buffer,
+  mark_codediff_temp_buffer = mark_codediff_temp_buffer,
+}
 
 return M

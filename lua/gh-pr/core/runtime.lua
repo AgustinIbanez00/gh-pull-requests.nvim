@@ -185,8 +185,17 @@ local function has_ghpr_uri_name(bufnr)
   return name:sub(1, 7) == "ghpr://"
 end
 
-local function clear_modified_on_readonly_ghpr_buffer(bufnr)
+local function mark_transient_ghpr_buffer(bufnr)
   if not has_ghpr_uri_name(bufnr) then
+    return false
+  end
+
+  vim.b[bufnr].gh_pr_lsp_exclude = true
+  return true
+end
+
+local function clear_modified_on_readonly_ghpr_buffer(bufnr)
+  if not mark_transient_ghpr_buffer(bufnr) then
     return
   end
 
@@ -238,7 +247,7 @@ function M.ensure_initialized(opts)
 
   local setup_queries = opts.setup_queries
   if type(setup_queries) == "function" then
-    setup_queries(opts.skip_query_file_load == true)
+    setup_queries()
   end
 
   start_auto_refresh_timer()

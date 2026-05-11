@@ -57,6 +57,15 @@ local function ensure_virtual_buffer_cleanup(bufnr)
   })
 end
 
+local function apply_transient_virtual_buffer_contract(bufnr)
+  if type(bufnr) ~= "number" or bufnr < 1 or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  vim.b[bufnr].gh_pr_lsp_exclude = true
+  vim.b[bufnr].gh_pr_transient_diff_buffer = true
+end
+
 local function decode_base64_fallback(data)
   data = data:gsub("[^" .. base64_chars .. "=]", "")
 
@@ -1470,6 +1479,7 @@ local function open_buffer(content, path, kind, details, pr, repo_override, comm
   vim.api.nvim_buf_set_option(bufnr, "swapfile", false)
   vim.api.nvim_buf_set_option(bufnr, "readonly", true)
   vim.api.nvim_buf_set_option(bufnr, "filetype", ft)
+  apply_transient_virtual_buffer_contract(bufnr)
 
   if repository then
     if not existing and buffer_name then
@@ -2954,6 +2964,7 @@ local function update_virtual_buffer(bufnr, details, number, kind, path)
 
   local filetype = is_image_buffer and "markdown" or (kind == "unified" and "diff" or resolve_path_filetype(next_path))
   vim.api.nvim_buf_set_option(bufnr, "filetype", filetype)
+  apply_transient_virtual_buffer_contract(bufnr)
   vim.b[bufnr].gh_pr_path = next_path
   local canonical_path = normalize_path(file.path or file.filename)
   vim.b[bufnr].gh_pr_file_path = canonical_path ~= "" and canonical_path or nil
@@ -3068,6 +3079,7 @@ M._diff_view_helpers = {
   build_unified_comment_line_map = build_unified_comment_line_map,
   resolve_diff_view_options = M.resolve_diff_view_options,
   resolve_diff_view_shortcuts = resolve_diff_view_shortcuts,
+  mark_transient_buffer = apply_transient_virtual_buffer_contract,
   set_pr_buffer_keymaps = set_pr_buffer_keymaps,
 }
 

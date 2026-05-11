@@ -301,6 +301,7 @@ function FileDiff.register(M, ctx)
         on_selection = on_selection,
         reuse = open_opts.new_tab ~= true,
         force = open_opts.force ~= false,
+        only_if_cached = true,
       })
       if opened_explorer then
         return true, nil
@@ -308,7 +309,7 @@ function FileDiff.register(M, ctx)
       explorer_err = open_explorer_err
     end
 
-    local opened_result, codediff_err = codediff_integration.open_pr_file_diff({
+    local file_open_opts = {
       details = details,
       file = selected_file,
       cache_scope = string.format(
@@ -326,7 +327,37 @@ function FileDiff.register(M, ctx)
       target_original_line = open_opts.target_original_line,
       local_head_path = open_opts.local_head_path,
       source_name = open_opts.source_name,
-    })
+    }
+
+    local explorer_cache_cold = explorer_err == "codediff PR explorer snapshot is not ready yet"
+    if explorer_cache_cold
+      and not (type(open_opts.local_head_path) == "string" and open_opts.local_head_path ~= "")
+      and type(codediff_integration.open_pr_file_diff_async) == "function" then
+      codediff_integration.open_pr_file_diff_async(file_open_opts, function(opened_result, codediff_err)
+        if not opened_result then
+          notify_error(codediff_err or explorer_err or "Unable to open codediff file diff")
+          return
+        end
+        on_selection(selected_file, opened_result)
+      end)
+
+      if type(codediff_integration.prefetch_pr_explorer_snapshot) == "function" then
+        codediff_integration.prefetch_pr_explorer_snapshot({
+          pr_number = pr.number,
+          details = details,
+          files = details.files,
+          file = selected_file,
+        }, function(_, snapshot_err)
+          if snapshot_err then
+            notify_warn("Unable to prepare codediff PR explorer in background: " .. tostring(snapshot_err))
+          end
+        end)
+      end
+
+      return true, nil
+    end
+
+    local opened_result, codediff_err = codediff_integration.open_pr_file_diff(file_open_opts)
     if not opened_result then
       return nil, codediff_err or explorer_err
     end

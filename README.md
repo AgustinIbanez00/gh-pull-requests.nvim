@@ -567,6 +567,7 @@ Examples:
 | `PR` source tab is missing in Neo-tree | Does the current workspace have a GitHub remote? | Default `ui.neotree_sources.pr.gate = "github_repo"` hides `gh_pr` outside GitHub repos. Use a GitHub checkout, switch `workspace`, or set `gate = "git_repo"` / `manual`. |
 | `gh` errors / auth failures | `gh auth status` | Run `gh auth login` and retry. |
 | Neo-tree source not opening | Neo-tree installed and configured? | Use fallback `:GhPrTelescope` or install/enable Neo-tree dependency. |
+| Opening PR diffs triggers unrelated C#/Roslyn/LSP work | Does the other plugin respect `b:gh_pr_lsp_exclude` / `b:gh_pr_codediff_temp`? | Skip `ghpr://...` buffers and codediff cache snapshots from workspace/LSP resolution. |
 | Docs/commands seem out of sync | Health + validation | Run `:checkhealth gh-pr` and `pwsh -File scripts/validate.ps1`. |
 
 ## Consolidated architecture
@@ -844,6 +845,7 @@ Diff backend behavior:
 - For PR/commit file diffs, gh-pr downloads base/head content from GitHub and opens codediff without git fetch.
 - Starting or refreshing an active PR review warms textual PR file pairs in the background under the codediff temp cache, so later diff opens reuse local temp files.
 - With `diff_view.pr_explorer.enabled = true` (default), compatible PR text-file opens reuse a local codediff explorer session for the active PR snapshot, so later file switches stay local and faster.
+- On a cold PR explorer cache, gh-pr opens the selected file first and prepares the full PR explorer snapshot in the background with lightweight progress notifications. When the snapshot is ready, the next compatible file open reuses the explorer without stealing focus.
 - Text PR/commit file diffs stay in codediff whenever `diff_view.mode` is `vertical` or `unified` and `diff_view.ignore_whitespace_mode` is `none` or `trim` (or the legacy `ignore_whitespace = true|false` alias mapped to `trim|none`).
 - `vertical + none|trim` opens codediff side-by-side, `unified + none|trim` opens codediff inline, and `horizontal` or whitespace modes `eol` / `blank_lines` are rendered through gh-pr's virtual diff backend.
 - PR explorer mode applies only to compatible textual PR files; image/binary files and virtual-only layouts still use the existing non-text or virtual fallback paths.
@@ -851,10 +853,12 @@ Diff backend behavior:
 - `render_whitespace` and `render_endlines` remain virtual-backend-only markers; codediff buffers show that those markers are unavailable there.
 - codediff windows opened by gh-pr force `number = true` and `relativenumber = true`.
 - codediff temp buffers opened by gh-pr are forced readonly/non-modifiable (`nomodified`, `noswapfile`) to avoid save prompts on exit.
+- transient diff buffers also set `b:gh_pr_lsp_exclude = true` and `b:gh_pr_transient_diff_buffer = true`; codediff cache snapshots additionally set `b:gh_pr_codediff_temp = true` so external LSP/workspace resolvers can skip them safely.
 - gh-pr read-only URI buffers (`ghpr://...`, including virtual fallback diffs/overview preview surfaces) are kept `nomodified` via write guards + runtime safety-net to avoid accidental save prompts on exit.
 - Image and generic binary/non-renderable files bypass codediff fallback prompts and open dedicated gh-pr non-text preview buffers.
 - If codediff is unavailable or fails for a codediff-eligible diff, gh-pr prompts once per session to decide whether to use the virtual fallback backend for the rest of the session.
 - If fallback is rejected, diff open actions return explicit errors.
+- Neovim 0.10+ is recommended for non-blocking codediff GitHub fetches through `vim.system`; on older Neovim versions the compatibility fallback may still block while shelling out to `gh`.
 - Inline comments/suggestions and diff comments panel are available in codediff file diffs; codediff inline/unified buffers use the modified side for inline actions.
 - Line comment indicators/authors are rendered in codediff side-by-side, codediff inline, and gh-pr virtual unified text diffs.
 - When Neo-tree is available, `<localleader>C` opens a temporary bottom comments tree scoped to the current diff file (`thread -> comment`) and isolated from the other Neo-tree sources; set `diff_view.comments_panel.position = "right"` if you prefer a side pane. Otherwise gh-pr falls back to the legacy bottom panel.
