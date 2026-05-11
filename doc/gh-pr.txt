@@ -190,6 +190,11 @@ Commands
     Loads more items in a section (`checks`, `commits`, `comments`,
     `reviews`, `threads`).
 
+:GhPrToggleChangesPanel
+    Toggles a side `nofile` hunk list for the current textual PR file diff.
+    The panel uses filetype `gh_pr_diff_changes`; `<CR>` jumps to a hunk and
+    `q`/`<Esc>` closes the panel.
+
 Overview buffer keymaps:
     `a` approve review
     `d` request changes
@@ -205,6 +210,8 @@ Overview buffer keymaps:
     `<CR>` open selected row action
     `<CR>` on metadata rows edits title/description/state/draft/labels/
     reviewers/assignees/milestone contextually
+    `<CR>` on reviewer rows re-requests review only when
+    `· <CR> re-request` is visible
     `<CR>` on `## Description` heading opens multiline composer preloaded
     with current body
     (`<C-s>` submit, `q`/`<Esc>` cancel)
@@ -225,6 +232,9 @@ Overview buffer keymaps:
     the overview on success.
     In multi-select edits (`labels`/`reviewers`), deselected current items
     are interpreted as removals.
+    `Collaboration > Reviewers` shows per-reviewer rows such as
+    `@user [APPROVED]` / `org/team [PENDING]`; current pending requests win,
+    then `latestReviews`, then `reviews` ordered by `submittedAt`.
     PR description is rendered as markdown in `Summary`.
     In `overview.markdown.mode = "full"`, raw markdown and fenced code
     blocks are preserved (including `diff` snippets with syntax highlight).
@@ -312,6 +322,10 @@ Overview panes keymaps:
     With `diff_view.pr_explorer.enabled = v:true` (default), compatible PR
     text-file opens reuse a local codediff explorer session for the active PR
     snapshot, so subsequent file switches stay local and faster.
+    When that explorer snapshot is cold, gh-pr opens the selected file first
+    and prepares the full PR explorer snapshot in the background with progress
+    notifications. Once ready, the next compatible file open reuses the
+    explorer without moving focus.
     `vertical + none|trim` opens codediff side-by-side, `unified + none|trim`
     opens codediff inline, and `horizontal` or whitespace modes `eol` /
     `blank_lines` use gh-pr's virtual diff backend instead.
@@ -324,6 +338,10 @@ Overview panes keymaps:
     only and are unavailable in codediff buffers.
     gh-pr forces codediff temp buffers to readonly/non-modifiable
     (`nomodified`, `noswapfile`) to avoid save prompts when exiting.
+    transient diff buffers also set `b:gh_pr_lsp_exclude = true` and
+    `b:gh_pr_transient_diff_buffer = true`; codediff cache snapshots add
+    `b:gh_pr_codediff_temp = true` so external LSP/workspace resolvers can
+    skip them safely.
     gh-pr also keeps read-only `ghpr://...` buffers `nomodified`
     (virtual fallback diffs and readonly overview preview surfaces)
     to avoid save prompts on `:qall`.
@@ -334,6 +352,9 @@ Overview panes keymaps:
     If codediff is unavailable/fails, gh-pr prompts once per session:
       - use legacy virtual fallback backend for this session
       - or keep codediff-only mode (explicit error on diff opens)
+    Neovim 0.10+ is recommended for non-blocking codediff GitHub fetches via
+    `vim.system`; on older Neovim versions the compatibility fallback may
+    still block while shelling out to `gh`.
     Set `diff_view.debug.codediff_failures = true` to emit debug
     notifications with failure reason, fallback decisions, and review
     prefetch start/result events.
@@ -378,6 +399,10 @@ Overview panes keymaps:
       - in single-buffer views closes current buffer and opens PR Review
     Press `<localleader>Q` to close current diff view(s) and open/focus PR Review.
     Press `<localleader>C` to toggle diff comments in diff view.
+    Press `<localleader>o` to toggle the diff changes panel.
+    It auto-opens for textual PR file diffs by default without stealing focus.
+    Manual close suppresses auto-open in that tab until toggled again.
+    Non-text previews do not auto-open the panel.
     If panel open/refresh fails, gh-pr shows an explicit error notification.
     When Neo-tree is available, gh-pr opens a temporary bottom comments tree
     for the current diff file (`thread -> comment`) without showing the other
@@ -409,6 +434,7 @@ Overview panes keymaps:
       `<localleader>q` quick close
       `<localleader>Q` close diff view(s) and open PR Review
       `<localleader>C` toggle diff comments panel
+      `<localleader>o` toggle diff changes panel
       `<localleader>c` add inline comment at cursor (`MODIFIED`/head or `unified`)
       visual `<localleader>c` add inline comment for selected range (`v`/`V`, head or `unified`)
       `<localleader>s` add inline suggestion at cursor (`suggestion` template)
@@ -542,6 +568,7 @@ disabled by default.
 <Plug>(gh-pr-toggle-reviewed) Toggle viewed (:GhPrToggleReviewed)
 <Plug>(gh-pr-next-change)     Next diff hunk (:GhPrNextChange)
 <Plug>(gh-pr-prev-change)     Previous diff hunk (:GhPrPrevChange)
+<Plug>(gh-pr-toggle-changes-panel) Toggle diff changes panel (:GhPrToggleChangesPanel)
 <Plug>(gh-pr-approve)         Approve active PR (:GhPrApprove)
 <Plug>(gh-pr-request-changes) Request changes on active PR (:GhPrRequestChanges)
 <Plug>(gh-pr-comment)         Submit PR comment review (:GhPrComment)
@@ -779,9 +806,16 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.shortcuts.discard_pending_review` (`"<localleader>rd"`)
 - `diff_view.shortcuts.toggle_review_tree` (`"<localleader>rx"`)
 - `diff_view.shortcuts.toggle_comments_panel` (`"<localleader>C"`)
+- `diff_view.shortcuts.toggle_changes_panel` (`"<localleader>o"`)
 - `diff_view.shortcuts.image_default_action` (`"<localleader>io"`; default action for non-text preview buffers)
 - `diff_view.shortcuts.image_fallback_menu` (`"<localleader>im"`; preview actions menu for non-text preview buffers)
 - `diff_view.shortcuts.show_open_hint` (`true`)
+- `diff_view.changes_panel.enabled` (`true`)
+- `diff_view.changes_panel.auto_open` (`true`; opens beside textual PR file diffs without stealing focus)
+- `diff_view.changes_panel.position` (`"right"`; also `"left"`)
+- `diff_view.changes_panel.width` (`34`)
+- `diff_view.changes_panel.min_width` (`24`)
+- `diff_view.changes_panel.max_width` (`50`)
 - `diff_view.comments_panel.enabled` (`true`)
 - `diff_view.comments_panel.auto_open` (`"if_comments"` for current-file comments only, also `"never"` / `"always"`; boolean alias `true => "if_comments"`, `false => "never"`)
 - `diff_view.comments_panel.position` (`"bottom"`; also supports `"right"`)
@@ -884,6 +918,11 @@ Highlights
 - Baseline `GhPr*` highlight groups are defined as links to standard Neovim
   highlight groups.
 - gh-pr re-applies these baseline links on `ColorScheme`.
+- Reviewer state tokens in `Overview > Collaboration` use:
+  `GhPrOverviewReviewerApproved`,
+  `GhPrOverviewReviewerPending`,
+  `GhPrOverviewReviewerChanges`,
+  `GhPrOverviewReviewerCommented`.
 - To override plugin groups, define your own `ColorScheme` autocmd:
 >
   vim.api.nvim_create_autocmd("ColorScheme", {
@@ -897,7 +936,7 @@ Highlights
 Persistence
 ===========
 
-- Queries: `stdpath("state")/gh-pr/queries.json`
+- Queries: `stdpath("state")/gh-pr/queries.json` (v2 format, see below)
 - Viewed files: `stdpath("state")/gh-pr/state.json`
 - Diff view prefs (`mode`, `ignore_whitespace_mode`, legacy `ignore_whitespace`, `render_whitespace`, `render_endlines`): `stdpath("state")/gh-pr/state.json`
 - Image fallback default action: `stdpath("state")/gh-pr/state.json`

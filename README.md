@@ -133,7 +133,7 @@ Validation prerequisites:
 
 ```lua
 {
-  "agustinibanez/gh-pull-requests.nvim",
+  "AgustinIbanez00/gh-pull-requests.nvim",
   dependencies = {
     "nvim-lua/plenary.nvim",
     "nvim-neo-tree/neo-tree.nvim",
