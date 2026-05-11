@@ -4,7 +4,7 @@ local config = require("gh-pr.config")
 local runtime = require("gh-pr.core.runtime")
 
 local user_config_applied = false
-local skip_query_file_load = false
+local pending_lua_queries = nil
 
 local function notify_error(message)
   vim.notify(message, vim.log.levels.ERROR)
@@ -173,7 +173,6 @@ local function ensure_configured()
   end
 
   config.setup({})
-  skip_query_file_load = false
   user_config_applied = true
   get_mappings().apply_global_default_mappings(config.get())
 end
@@ -181,7 +180,6 @@ end
 local function ensure_runtime_initialized()
   ensure_configured()
   return runtime.ensure_initialized({
-    skip_query_file_load = skip_query_file_load,
     setup_highlights = function()
       require("gh-pr.highlights").setup()
     end,
@@ -189,8 +187,8 @@ local function ensure_runtime_initialized()
     setup_state = function()
       get_runtime_state().setup()
     end,
-    setup_queries = function(skip_load)
-      get_queries().setup(skip_load)
+    setup_queries = function()
+      get_queries().setup({ lua_queries = pending_lua_queries })
     end,
   })
 end
@@ -219,7 +217,7 @@ end
 function M.setup(opts)
   opts = opts or {}
   config.setup(opts)
-  skip_query_file_load = opts.queries ~= nil
+  pending_lua_queries = opts.queries
   user_config_applied = true
   get_mappings().apply_global_default_mappings(config.get())
 
@@ -478,6 +476,19 @@ end
 function M.merge(method)
   return with_runtime(function()
     call_actions("merge", method)
+  end)
+end
+
+function M.queries_prompt_reset()
+  return with_runtime(function()
+    get_queries().reset_prompt_choice()
+  end)
+end
+
+function M.queries_reload_lua()
+  return with_runtime(function()
+    get_queries().reload_from_lua()
+    refresh_views()
   end)
 end
 

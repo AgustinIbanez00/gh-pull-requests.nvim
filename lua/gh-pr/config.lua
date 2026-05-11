@@ -1767,6 +1767,10 @@ function M.get_path_render(source_name)
   return vim.deepcopy(path_render)
 end
 
+function M.get_default_queries()
+  return vim.deepcopy(defaults.queries)
+end
+
 function M.get_queries()
   return state.queries
 end

@@ -507,6 +507,17 @@ Overview panes keymaps:
 :GhPrQueryDelete
     Delete existing query definition.
 
+:GhPrQueriesPromptReset
+    Reset the conflict-resolution choice back to "ask". The next time Neovim
+    detects that queries in your Lua config differ from the persisted file, it
+    will show the conflict prompt again even if "No, recordar mi elección" was
+    previously chosen.
+
+:GhPrQueriesReloadLua
+    Force-adopt the queries from your current Lua config, discarding any local
+    manual edits. Useful after choosing "always_local" and then changing your
+    mind.
+
 Keymaps
 =======
 
@@ -900,4 +911,32 @@ Persistence
 - `diff_view.shortcuts.*` remain Lua-configured/opt-in and are not read from
   or written to `state.json`.
 - Cache is stored per source/repo key (`gh_pr` and `gh_pr_review`).
+
+Query persistence and conflict resolution ~
+
+`queries.json` (v2) stores a `meta` block alongside the query list:
+  `lua_signature`   canonical fingerprint of the Lua queries at last reconcile
+  `conflict_choice` `"ask"` | `"always_lua"` | `"always_local"`
+  `saved_at`        epoch seconds of the last write
+
+Reconciliation logic on startup:
+1. No file → save defaults (or Lua queries) as baseline.
+2. File exists, no Lua queries → local file always wins.
+3. File exists, Lua queries, signatures match → local edits preserved.
+4. File exists, Lua queries, signatures differ (conflict):
+   - `always_lua`: silently adopt Lua, overwrite local edits.
+   - `always_local`: silently keep local, update signature so only the *next*
+     Lua change re-triggers the check.
+   - `ask` (default): apply local while showing a `vim.ui.select` prompt asking
+     which side to keep and whether to remember the choice.
+
+Cancelling the prompt (Esc) leaves the local version applied and does not
+update `conflict_choice`; the prompt reappears next session.
+
+Use `:GhPrQueriesPromptReset` to revert a sticky "always" choice back to "ask".
+Use `:GhPrQueriesReloadLua` to force-adopt the current Lua queries, discarding
+any local manual edits.
+
+v1 files (`{"queries":[...]}` with no `version` field) are migrated in-memory
+on first load; the file is written in v2 on the next save.
 

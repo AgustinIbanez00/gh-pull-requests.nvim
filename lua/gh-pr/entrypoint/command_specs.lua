@@ -177,6 +177,16 @@ function M.build(call, command_no_args)
     { name = "GhPrQueryAdd", callback = command_no_args("add_query"), opts = { desc = "Add pull request query" } },
     { name = "GhPrQueryEdit", callback = command_no_args("edit_query"), opts = { desc = "Edit pull request query" } },
     { name = "GhPrQueryDelete", callback = command_no_args("delete_query"), opts = { desc = "Delete pull request query" } },
+    {
+      name = "GhPrQueriesPromptReset",
+      callback = command_no_args("queries_prompt_reset"),
+      opts = { desc = "Reset query conflict prompt choice back to 'ask'" },
+    },
+    {
+      name = "GhPrQueriesReloadLua",
+      callback = command_no_args("queries_reload_lua"),
+      opts = { desc = "Force reload queries from Lua config, discarding local edits" },
+    },
   }
 end
 
