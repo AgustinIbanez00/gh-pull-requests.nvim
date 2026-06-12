@@ -4,6 +4,14 @@ local uv = vim.uv or vim.loop
 
 local virtual_files = require("gh-pr.virtual_files")
 
+-- Lazy, dependency-free access to the file logger (codediff channel).
+local function log_codediff(level, message)
+  local ok, logger = pcall(require, "gh-pr.core.logger")
+  if ok then
+    logger.log("codediff", level, message)
+  end
+end
+
 local temp_state = {
   root = nil,
   file_cache = {},
@@ -87,6 +95,7 @@ local function cache_root()
 
   local root = joinpath(vim.fn.stdpath("cache"), "gh-pr", "codediff")
   if not ensure_dir(root) then
+    log_codediff("error", "Unable to prepare codediff cache directory: " .. root)
     return nil, "Unable to prepare codediff cache directory"
   end
 
@@ -341,11 +350,14 @@ end
 
 local function run_codediff_command(command)
   if not ensure_codediff_command() then
-    return nil, "codediff.nvim is unavailable (`:CodeDiff` not found)"
+    local message = "codediff.nvim is unavailable (`:CodeDiff` not found)"
+    log_codediff("error", message)
+    return nil, message
   end
 
   local ok, cmd_err = pcall(vim.cmd, command)
   if not ok then
+    log_codediff("error", string.format("CodeDiff command failed: %s -> %s", tostring(command), tostring(cmd_err)))
     return nil, tostring(cmd_err)
   end
   return true, nil
@@ -528,6 +540,7 @@ local function resolve_file_open_result(base_open_path, head_open_path)
 end
 
 local function fallback_error(message)
+  log_codediff("debug", "Falling back to virtual backend: " .. tostring(message))
   return {
     requires_virtual = true,
     message = message,

@@ -70,7 +70,9 @@ end
 
 local function panel_opts()
   local diff_view = (config.get() or {}).diff_view or {}
-  local src = type(diff_view.comments_panel) == "table" and diff_view.comments_panel or {}
+  local src = type(diff_view.comments_panel) == "table" and diff_view.comments_panel
+    or type(diff_view.review_panel) == "table" and diff_view.review_panel
+    or {}
 
   local auto_open = type(src.auto_open) == "string" and src.auto_open or "if_comments"
   if auto_open ~= "never" and auto_open ~= "if_comments" and auto_open ~= "always" then
@@ -538,7 +540,7 @@ local function apply_keymaps(session)
   configured = diff_shortcuts.resolve(configured)
   configured = diff_shortcuts.expand_localleader(configured)
   local close_all = type(configured.close_all_open_review) == "string" and configured.close_all_open_review or ",dQ"
-  local toggle = type(configured.toggle_comments_panel) == "string" and configured.toggle_comments_panel or ",dc"
+  local toggle = type(configured.toggle_review_panel) == "string" and configured.toggle_review_panel or ",dc"
 
   local function map(lhs, rhs, desc)
     if type(lhs) ~= "string" or lhs == "" then

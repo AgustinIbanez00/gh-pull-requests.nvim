@@ -1,17 +1,24 @@
 local M = {}
 
+local unpack_fn = table.unpack or unpack
+
 local config = require("gh-pr.config")
 local runtime = require("gh-pr.core.runtime")
+local notify = require("gh-pr.core.notify")
 
 local user_config_applied = false
 local pending_lua_queries = nil
 
 local function notify_error(message)
-  vim.notify(message, vim.log.levels.ERROR)
+  notify.error(message)
 end
 
 local function notify_info(message)
-  vim.notify(message, vim.log.levels.INFO)
+  notify.info(message)
+end
+
+local function notify_warn(message)
+  notify.warn(message)
 end
 
 local function get_actions()
@@ -44,6 +51,38 @@ end
 
 local function get_telescope()
   return require("gh-pr.integrations.telescope")
+end
+
+local with_runtime
+local call_actions
+
+-- Persist uncaught Lua errors (with traceback) to the `lua` log channel so
+-- failures that surface as a single notification can be reproduced afterwards.
+local function log_lua_error(label, message, traceback)
+  local ok, logger = pcall(require, "gh-pr.core.logger")
+  if ok then
+    logger.error("lua", string.format("%s: %s", label, tostring(message)), { traceback = traceback })
+  end
+end
+
+local function run_protected(label, handler, ...)
+  local n = select("#", ...)
+  local args = { ... }
+  local results
+  local ok, tb = xpcall(function()
+    results = { handler(unpack_fn(args, 1, n)) }
+  end, debug.traceback)
+
+  if not ok then
+    local first = tostring(tb):match("^[^\n]*") or tostring(tb)
+    log_lua_error(label, first, tb)
+    notify_error(string.format("gh-pr error in %s (see :GhPrLogOpen lua)", label))
+    return
+  end
+
+  if results then
+    return unpack_fn(results, 1, #results)
+  end
 end
 
 local function ensure_required_dependencies()
@@ -147,6 +186,26 @@ local function refresh_views()
   get_neotree().refresh_sources()
 end
 
+local function open_create_pull_request_wizard()
+  local pr_service = require("gh-pr.pr_service")
+  return require("gh-pr.ui.create_pull_request").open({
+    gh = require("gh-pr.gh"),
+    repo = get_repo(),
+    pr_service = pr_service,
+    notify_error = notify_error,
+    notify_info = notify_info,
+    notify_warn = notify_warn,
+    refresh_sources = function()
+      pcall(refresh_views)
+    end,
+    open_overview = function(number)
+      return with_runtime(function()
+        call_actions("open_overview", number, { refresh = true })
+      end)
+    end,
+  })
+end
+
 local function query_command_context()
   return {
     get_queries = get_queries,
@@ -193,17 +252,17 @@ local function ensure_runtime_initialized()
   })
 end
 
-local function with_runtime(handler, ...)
+function with_runtime(handler, ...)
   if type(handler) ~= "function" then
     return
   end
   if not ensure_runtime_initialized() then
     return
   end
-  return handler(...)
+  return run_protected("command", handler, ...)
 end
 
-local function call_actions(method, ...)
+function call_actions(method, ...)
   local actions = get_actions()
   local handler = actions[method]
   if type(handler) ~= "function" then
@@ -211,7 +270,7 @@ local function call_actions(method, ...)
     return
   end
 
-  return handler(...)
+  return run_protected("action:" .. tostring(method), handler, ...)
 end
 
 function M.setup(opts)
@@ -219,6 +278,9 @@ function M.setup(opts)
   config.setup(opts)
   pending_lua_queries = opts.queries
   user_config_applied = true
+  pcall(function()
+    require("gh-pr.core.logger").setup(config.get().log)
+  end)
   get_mappings().apply_global_default_mappings(config.get())
 
   if runtime.is_initialized() then
@@ -233,6 +295,16 @@ end
 function M.list_pull_requests()
   return with_runtime(open_telescope_fallback)
 end
+
+function M.create_pull_request()
+  ensure_configured()
+  if not get_repo().ensure_git_repo() then
+    return
+  end
+  return open_create_pull_request_wizard()
+end
+
+M.new_pull_request = M.create_pull_request
 
 function M.open_telescope()
   return with_runtime(open_telescope_fallback)
@@ -419,11 +491,13 @@ function M.prev_change()
   end)
 end
 
-function M.toggle_changes_panel()
+function M.toggle_review_panel()
   return with_runtime(function()
-    call_actions("toggle_diff_changes_panel")
+    call_actions("toggle_diff_review_panel")
   end)
 end
+
+M.toggle_changes_panel = M.toggle_review_panel
 
 function M.approve()
   return with_runtime(function()
@@ -483,6 +557,42 @@ function M.merge(method)
   return with_runtime(function()
     call_actions("merge", method)
   end)
+end
+
+function M.log_open(channel)
+  ensure_configured()
+  local logger = require("gh-pr.core.logger")
+  local ok, err = logger.open(channel ~= "" and channel or nil)
+  if not ok and err then
+    notify_error(err)
+  end
+end
+
+function M.log_clear(channel)
+  ensure_configured()
+  local logger = require("gh-pr.core.logger")
+  local ok, err = logger.clear(channel ~= "" and channel or nil)
+  if not ok then
+    notify_error(err or "Unable to clear gh-pr logs")
+    return
+  end
+  notify_info(channel and channel ~= "" and ("Cleared gh-pr log: " .. channel) or "Cleared all gh-pr logs")
+end
+
+function M.log_level(level)
+  ensure_configured()
+  local logger = require("gh-pr.core.logger")
+  if level == nil or level == "" then
+    notify_info("gh-pr log level: " .. logger.get_level())
+    return
+  end
+
+  local ok, err = logger.set_level(level)
+  if not ok then
+    notify_error(err or "Invalid log level")
+    return
+  end
+  notify_info("gh-pr log level set to: " .. logger.get_level())
 end
 
 function M.queries_prompt_reset()

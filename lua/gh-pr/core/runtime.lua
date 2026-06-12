@@ -230,6 +230,10 @@ function M.ensure_initialized(opts)
     return true
   end
 
+  pcall(function()
+    require("gh-pr.core.logger").setup((config.get() or {}).log)
+  end)
+
   local ensure_required_dependencies = opts.ensure_required_dependencies
   if type(ensure_required_dependencies) == "function" then
     ensure_required_dependencies()
@@ -272,6 +276,11 @@ function M.ensure_initialized(opts)
         clear_modified_on_readonly_ghpr_buffer(bufnr)
       end,
     })
+  end
+
+  local ok_ah, ah = pcall(require, "gh-pr.diff_review_active_hunk")
+  if ok_ah and type(ah.attach) == "function" then
+    pcall(ah.attach)
   end
 
   runtime_initialized = true

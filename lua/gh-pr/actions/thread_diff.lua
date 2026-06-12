@@ -1,4 +1,5 @@
 local ThreadDiff = {}
+local commentable_zones = require("gh-pr.commentable_zones")
 local repository = require("gh-pr.core.repository")
 
 function ThreadDiff.register(M, ctx)
@@ -234,9 +235,9 @@ function codediff_file_runtime.ensure_autocmds()
     callback = function(event)
       local tabpage = type(event.data) == "table" and tonumber(event.data.tabpage) or nil
       codediff_file_runtime.clear(tabpage)
-      local ok_panel, panel = pcall(require, "gh-pr.diff_changes_panel")
-      if ok_panel and type(panel.close_current_tab) == "function" then
-        pcall(panel.close_current_tab)
+      local ok_rev, rev = pcall(require, "gh-pr.neotree.diff_review_source")
+      if ok_rev and type(rev.close_current_tab) == "function" then
+        pcall(rev.close_current_tab)
       end
     end,
   })
@@ -262,6 +263,7 @@ function codediff_file_runtime.register(open_result, payload)
     file_mode = type(payload) == "table" and safe_string(payload.file_mode, "") or "",
     source_name = type(payload) == "table" and safe_string(payload.source_name, "") or "",
     local_head_path = type(payload) == "table" and safe_string(payload.local_head_path, "") or "",
+    commentable_zones = type(payload) == "table" and payload.commentable_zones == true,
     version = version + 1,
     applied = type(existing) == "table" and existing.applied or nil,
   }
@@ -373,6 +375,51 @@ local function default_codediff_enter()
   vim.api.nvim_feedkeys(prefix .. enter, "n", false)
 end
 
+local function maybe_notify_codediff_open_hint(bufnr, opts)
+  opts = type(opts) == "table" and opts or {}
+  if not is_valid_buf(bufnr) or vim.b[bufnr].gh_pr_diff_open_hint_shown == true then
+    return
+  end
+
+  local shortcuts = diff_view_shortcuts("codediff")
+  if shortcuts.show_open_hint == false then
+    return
+  end
+
+  vim.b[bufnr].gh_pr_diff_open_hint_shown = true
+  local parts = {}
+  local zones = (((config.get() or {}).diff_view or {}).commentable_zones or {})
+  local zone_key = type(zones.keymap) == "string" and zones.keymap or "+"
+  local zone_label = zones.enabled ~= false and opts.commentable_zones == true
+      and diff_view_runtime.display_keybinding(zone_key)
+    or ""
+  local comment_label = diff_view_runtime.display_keybinding(shortcuts.inline_comment)
+  local quick_label = diff_view_runtime.display_keybinding(shortcuts.close_quick)
+  local help_label = diff_view_runtime.display_keybinding(shortcuts.help)
+
+  if zone_label ~= "" then
+    parts[#parts + 1] = string.format("%s on marked lines", zone_label)
+  end
+  if comment_label ~= "" then
+    parts[#parts + 1] = string.format("%s at cursor", comment_label)
+  end
+  if quick_label ~= "" then
+    parts[#parts + 1] = string.format("%s close", quick_label)
+  end
+  if help_label ~= "" then
+    parts[#parts + 1] = string.format("%s help", help_label)
+  end
+  if vim.tbl_isempty(parts) then
+    return
+  end
+
+  vim.schedule(function()
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      notify_info("gh-pr codediff: " .. table.concat(parts, " | "))
+    end
+  end)
+end
+
 local function apply_codediff_buffer_keymaps(bufnr)
   if not is_valid_buf(bufnr) then
     return
@@ -435,6 +482,9 @@ local function apply_codediff_buffer_keymaps(bufnr)
   set_codediff_buffer_keymap(bufnr, "n", shortcuts.inline_comment, function()
     M.add_inline_comment()
   end, "GH PR: add inline comment")
+  commentable_zones.apply_keymap(bufnr, function()
+    M.add_inline_comment()
+  end)
   set_codediff_buffer_keymap(bufnr, "x", shortcuts.inline_comment, function()
     M.add_inline_comment_visual()
   end, "GH PR: add inline comment (selection)")
@@ -452,12 +502,9 @@ local function apply_codediff_buffer_keymaps(bufnr)
       default_codediff_enter()
     end
   end, "GH PR: open line comments on commented lines")
-  set_codediff_buffer_keymap(bufnr, "n", shortcuts.toggle_comments_panel, function()
-    M.toggle_diff_comments_panel()
-  end, "GH PR: toggle comments panel")
-  set_codediff_buffer_keymap(bufnr, "n", shortcuts.toggle_changes_panel, function()
-    M.toggle_diff_changes_panel()
-  end, "GH PR: toggle changes panel")
+  set_codediff_buffer_keymap(bufnr, "n", shortcuts.toggle_review_panel, function()
+    M.toggle_diff_review_panel()
+  end, "GH PR: toggle diff review panel")
   set_codediff_buffer_keymap(bufnr, "n", shortcuts.submit_pending_comment, function()
     M.submit_pending_comment_review()
   end, "GH PR: submit pending comment review")
@@ -613,6 +660,18 @@ local function apply_codediff_open_result_context(pr, details, file, open_result
     end
     annotation_renderer.clear_buffer(base_buf)
     security_annotation_renderer.clear_buffer(base_buf)
+    if opts.commentable_zones == true then
+      commentable_zones.attach_to_buffer(base_buf, {
+        pr_number = pr.number,
+        path = base_path,
+        file = file,
+        kind = "base",
+        file_mode = file_mode,
+        layout = layout,
+      })
+    else
+      commentable_zones.clear_buffer(base_buf)
+    end
   end
 
   if is_valid_buf(head_buf) then
@@ -674,6 +733,21 @@ local function apply_codediff_open_result_context(pr, details, file, open_result
     else
       security_annotation_renderer.clear_buffer(head_buf)
     end
+    if opts.commentable_zones == true then
+      commentable_zones.attach_to_buffer(head_buf, {
+        pr_number = pr.number,
+        path = head_path,
+        file = file,
+        kind = layout == "inline" and "unified" or "head",
+        file_mode = file_mode,
+        layout = layout,
+      })
+    else
+      commentable_zones.clear_buffer(head_buf)
+    end
+    maybe_notify_codediff_open_hint(head_buf, {
+      commentable_zones = opts.commentable_zones == true,
+    })
   end
 
   if opts.register_runtime ~= false then
@@ -687,6 +761,7 @@ local function apply_codediff_open_result_context(pr, details, file, open_result
       file_mode = file_mode,
       source_name = opts.source_name,
       local_head_path = opts.local_head_path,
+      commentable_zones = opts.commentable_zones == true,
     })
   end
 end
@@ -726,6 +801,7 @@ function codediff_file_runtime.rehydrate(tabpage)
     security_annotations_ctx = entry.security_annotations_ctx,
     source_name = entry.source_name,
     local_head_path = entry.local_head_path,
+    commentable_zones = entry.commentable_zones == true,
     register_runtime = false,
   })
 
@@ -733,14 +809,14 @@ function codediff_file_runtime.rehydrate(tabpage)
 end
 
 local function sync_diff_comments_panel(pr, details, comments_ctx)
-  local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
-  if ok_panel and type(panel.sync_for_diff) == "function" then
+  local ok_rev, rev = pcall(require, "gh-pr.neotree.diff_review_source")
+  if ok_rev and type(rev.sync_for_diff) == "function" then
     local origin_win = vim.api.nvim_get_current_win()
     local origin_buf = vim.api.nvim_get_current_buf()
     if vim.b[origin_buf].gh_pr_is_non_text == true then
       return
     end
-    pcall(panel.sync_for_diff, {
+    pcall(rev.sync_for_diff, {
       pr = pr,
       details = details,
       comments_ctx = comments_ctx,

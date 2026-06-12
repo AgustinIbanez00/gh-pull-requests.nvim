@@ -1,5 +1,6 @@
 return {
   { lhs = "<Plug>(gh-pr-open)", rhs = "<Cmd>GhPrOpen<CR>", desc = "Open PR tree" },
+  { lhs = "<Plug>(gh-pr-create)", rhs = "<Cmd>GhPrCreate<CR>", desc = "Create PR" },
   { lhs = "<Plug>(gh-pr-list)", rhs = "<Cmd>GhPrList<CR>", desc = "List PRs (Telescope)" },
   { lhs = "<Plug>(gh-pr-comments)", rhs = "<Cmd>GhPrComments<CR>", desc = "Open PR comments tree" },
   { lhs = "<Plug>(gh-pr-start-review)", rhs = "<Cmd>GhPrStartReview<CR>", desc = "Start PR review flow" },
@@ -17,7 +18,7 @@ return {
   { lhs = "<Plug>(gh-pr-toggle-reviewed)", rhs = "<Cmd>GhPrToggleReviewed<CR>", desc = "Toggle viewed" },
   { lhs = "<Plug>(gh-pr-next-change)", rhs = "<Cmd>GhPrNextChange<CR>", desc = "Next diff change" },
   { lhs = "<Plug>(gh-pr-prev-change)", rhs = "<Cmd>GhPrPrevChange<CR>", desc = "Previous diff change" },
-  { lhs = "<Plug>(gh-pr-toggle-changes-panel)", rhs = "<Cmd>GhPrToggleChangesPanel<CR>", desc = "Toggle diff changes panel" },
+  { lhs = "<Plug>(gh-pr-toggle-review-panel)", rhs = "<Cmd>GhPrToggleReviewPanel<CR>", desc = "Toggle diff review panel" },
   { lhs = "<Plug>(gh-pr-approve)", rhs = "<Cmd>GhPrApprove<CR>", desc = "Approve active PR" },
   { lhs = "<Plug>(gh-pr-request-changes)", rhs = "<Cmd>GhPrRequestChanges<CR>", desc = "Request changes on active PR" },
   { lhs = "<Plug>(gh-pr-comment)", rhs = "<Cmd>GhPrComment<CR>", desc = "Comment on active PR" },
@@ -30,4 +31,6 @@ return {
   },
   { lhs = "<Plug>(gh-pr-review-discard)", rhs = "<Cmd>GhPrReviewDiscard<CR>", desc = "Discard pending review" },
   { lhs = "<Plug>(gh-pr-merge)", rhs = "<Cmd>GhPrMerge<CR>", desc = "Merge active PR" },
+  { lhs = "<Plug>(gh-pr-log-open)", rhs = "<Cmd>GhPrLogOpen<CR>", desc = "Open gh-pr logs" },
+  { lhs = "<Plug>(gh-pr-log-clear)", rhs = "<Cmd>GhPrLogClear<CR>", desc = "Clear gh-pr logs" },
 }

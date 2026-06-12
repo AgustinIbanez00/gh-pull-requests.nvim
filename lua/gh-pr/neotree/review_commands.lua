@@ -232,6 +232,20 @@ local function find_root_node(state)
   return nil
 end
 
+local function find_node_by_kind(state, kind)
+  if type(state) ~= "table" or type(state.tree) ~= "table" or type(kind) ~= "string" or kind == "" then
+    return nil
+  end
+
+  for _, candidate in ipairs(state.tree:get_nodes() or {}) do
+    if node_kind(candidate) == kind then
+      return candidate
+    end
+  end
+
+  return nil
+end
+
 local function find_child_by_kind(state, parent, kind)
   if type(kind) ~= "string" or kind == "" then
     return nil
@@ -268,6 +282,11 @@ local function find_comment_subsection(state, comments_node, suffix)
 end
 
 local function files_section_node(state)
+  local section = find_node_by_kind(state, "files")
+  if section then
+    return section
+  end
+
   local root = find_root_node(state)
   if not root then
     return nil
@@ -276,6 +295,11 @@ local function files_section_node(state)
 end
 
 local function comments_section_node(state)
+  local section = find_node_by_kind(state, "comments")
+  if section then
+    return section
+  end
+
   local root = find_root_node(state)
   if not root then
     return nil
@@ -555,7 +579,7 @@ M.refresh = function(state)
     refresh_context = {
       mode = "ui-refresh",
       reason = "manual",
-      notify = false,
+      notify = true,
     },
   })
 end

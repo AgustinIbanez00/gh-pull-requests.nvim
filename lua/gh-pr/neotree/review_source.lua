@@ -335,6 +335,10 @@ local function should_update_ui(refresh_context)
   return type(refresh_context) == "table" and refresh_context.mode == REFRESH_MODE_UI
 end
 
+local function should_notify_manual_refresh(refresh_context)
+  return should_update_ui(refresh_context) and refresh_context.reason == "manual" and refresh_context.notify == true
+end
+
 local function queue_pending_refresh(session, opts)
   local pending = type(session.pending_refresh) == "table" and session.pending_refresh or {
     force = false,
@@ -1580,6 +1584,9 @@ start_background_refresh = function(repo_context, opts)
       force = true,
       refresh_context = opts.refresh_context,
     })
+    if should_notify_manual_refresh(opts.refresh_context) then
+      vim.notify(source_label .. " refresh already in progress; queued latest request.", vim.log.levels.INFO)
+    end
     return false
   end
 
@@ -1587,7 +1594,9 @@ start_background_refresh = function(repo_context, opts)
   session.loading = true
   session.stale = session_is_stale(session)
   if ui_refresh then
-    if opts.refresh_context.reason == "timer" and opts.refresh_context.notify then
+    if should_notify_manual_refresh(opts.refresh_context) then
+      vim.notify("Refreshing " .. source_label .. " from GitHub...", vim.log.levels.INFO)
+    elseif opts.refresh_context.reason == "timer" and opts.refresh_context.notify then
       vim.notify("Updating PR...", vim.log.levels.INFO)
     end
     if current_repo_state_is_focused(repo_context.key) then

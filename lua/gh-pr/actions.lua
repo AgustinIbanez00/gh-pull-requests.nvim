@@ -5,8 +5,10 @@ local comment_popup = require("gh-pr.comment_popup")
 local navigation_actions = require("gh-pr.actions.navigation")
 local config = require("gh-pr.config")
 local coerce = require("gh-pr.core.coerce")
+local inline_comment_targets = require("gh-pr.core.inline_comment_targets")
 local diff_view_core = require("gh-pr.core.diff_view")
 local diff_actions = require("gh-pr.core.diff_actions")
+local activity = require("gh-pr.core.activity")
 local notify = require("gh-pr.core.notify")
 local overview_actions = require("gh-pr.core.overview_actions")
 local overview_edit_actions = require("gh-pr.core.overview_edit_actions")
@@ -306,15 +308,10 @@ local function render_pr_sources_from_cache()
 end
 
 local function refresh_diff_comments_panel_after_state_change()
-  local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
-  if not ok_panel or type(panel) ~= "table" then
-    return
-  end
-
-  if type(panel.refresh_current_tab) == "function" then
-    pcall(panel.refresh_current_tab, {
-      force_fetch = true,
-    })
+  local ok_rev, rev = pcall(require, "gh-pr.neotree.diff_review_source")
+  if not ok_rev or type(rev) ~= "table" then return end
+  if type(rev.refresh_current_tab) == "function" then
+    pcall(rev.refresh_current_tab, { force_fetch = true })
   end
 end
 
@@ -1113,51 +1110,6 @@ local function normalize_line_range(start_line, line)
   return coerce.normalize_line_range(start_line, line)
 end
 
-local function parse_patch_head_line_map(patch)
-  if type(patch) ~= "string" or patch == "" then
-    return nil
-  end
-
-  local line_map = {}
-  local old_line = nil
-  local new_line = nil
-  local has_hunks = false
-
-  for _, raw in ipairs(vim.split(patch, "\n", { plain = true, trimempty = false })) do
-    local old_start, new_start = raw:match("^@@%s+%-(%d+),?%d*%s+%+(%d+),?%d*%s+@@")
-    if old_start and new_start then
-      old_line = tonumber(old_start)
-      new_line = tonumber(new_start)
-      has_hunks = true
-      goto continue
-    end
-
-    if old_line and new_line then
-      local prefix = raw:sub(1, 1)
-      if prefix == " " then
-        line_map[new_line] = line_map[new_line] or { kind = "context" }
-        old_line = old_line + 1
-        new_line = new_line + 1
-      elseif prefix == "+" then
-        line_map[new_line] = { kind = "add" }
-        new_line = new_line + 1
-      elseif prefix == "-" then
-        old_line = old_line + 1
-      elseif prefix == "\\" then
-        -- "\ No newline at end of file"
-      end
-    end
-
-    ::continue::
-  end
-
-  if not has_hunks then
-    return nil
-  end
-
-  return line_map
-end
-
 local function resolve_inline_patch(pr_number, file, path)
   local patch = type(file) == "table" and type(file.patch) == "string" and file.patch or ""
   if patch ~= "" then
@@ -1198,109 +1150,12 @@ local function resolve_requested_inline_range(opts)
   return normalize_line_range(start_line, line)
 end
 
-local function validate_head_inline_target(pr_number, selected_file, path, start_line, line)
-  local patch, patch_err = resolve_inline_patch(pr_number, selected_file, path)
-  if not patch then
-    local reason = patch_err and tostring(patch_err) or "No textual patch available"
-    return nil, "No se puede comentar esta ubicación: " .. reason
-  end
-
-  local head_line_map = parse_patch_head_line_map(patch)
-  if type(head_line_map) ~= "table" or vim.tbl_isempty(head_line_map) then
-    return nil, "No se puede comentar esta ubicación: el archivo no tiene hunks válidos en el diff."
-  end
-
-  local first = start_line or line
-  for current = first, line do
-    if not head_line_map[current] then
-      return nil, "No se puede comentar fuera del alcance de los cambios del archivo en el diff."
-    end
-  end
-
-  return {
-    path = path,
-    start_line = start_line,
-    line = line,
-    side = "RIGHT",
-    start_side = "RIGHT",
-  }, nil
-end
-
-local function validate_added_inline_target(path, start_line, line)
-  local bufnr = vim.api.nvim_get_current_buf()
-  local max_line = vim.api.nvim_buf_line_count(bufnr)
-  if type(max_line) ~= "number" or max_line < 1 then
-    return nil, "No se pudo resolver el archivo para comentar."
-  end
-
-  local first = start_line or line
-  if first < 1 or line < 1 or first > max_line or line > max_line then
-    return nil, "El rango seleccionado está fuera del archivo."
-  end
-
-  return {
-    path = path,
-    start_line = start_line,
-    line = line,
-    side = "RIGHT",
-    start_side = "RIGHT",
-  }, nil
-end
-
-local function validate_unified_inline_target(path, start_render_line, end_render_line)
-  local unified_map = vim.b.gh_pr_unified_line_map
-  if type(unified_map) ~= "table" or vim.tbl_isempty(unified_map) then
-    return nil, "No se pudo validar la selección en modo unified. Refrescá el diff con R."
-  end
-
-  local first = start_render_line or end_render_line
-  local mapped_start = nil
-  local mapped_end = nil
-  local previous_head_line = nil
-
-  for render_line = first, end_render_line do
-    local entry = unified_map[render_line]
-    if type(entry) ~= "table" then
-      return nil, "No se puede comentar fuera del alcance de los cambios del archivo en el diff."
-    end
-
-    if entry.kind ~= "add" then
-      return nil, "En modo unified solo se puede comentar sobre líneas agregadas (+) del diff."
-    end
-
-    local head_line = normalize_line_number(entry.head_line)
-    if not head_line then
-      return nil, "No se pudo resolver la línea destino del comentario en el diff."
-    end
-
-    if previous_head_line and head_line ~= (previous_head_line + 1) then
-      return nil, "El rango seleccionado no es continuo en líneas agregadas (+) del diff."
-    end
-
-    previous_head_line = head_line
-    mapped_start = mapped_start or head_line
-    mapped_end = head_line
-  end
-
-  local start_line, line = normalize_line_range(mapped_start, mapped_end)
-  if not line then
-    return nil, "No se pudo resolver la línea destino del comentario en el diff."
-  end
-
-  return {
-    path = path,
-    start_line = start_line,
-    line = line,
-    side = "RIGHT",
-    start_side = "RIGHT",
-  }, nil
-end
-
 local function resolve_inline_comment_target(pr, details, selected_file, opts)
+  opts = type(opts) == "table" and opts or {}
   local bufnr = vim.api.nvim_get_current_buf()
   local kind = type(vim.b.gh_pr_file_kind) == "string" and vim.b.gh_pr_file_kind or ""
-  if kind ~= "head" and kind ~= "unified" then
-    return nil, "Inline comments solo están disponibles en MODIFIED (head) o unified."
+  if kind ~= "base" and kind ~= "head" and kind ~= "unified" then
+    return nil, "Inline comments are only available in PR diff buffers."
   end
 
   local path = resolve_inline_comment_path(details, selected_file)
@@ -1313,24 +1168,33 @@ local function resolve_inline_comment_target(pr, details, selected_file, opts)
     return nil, "Unable to resolve target line for inline comment"
   end
 
-  if kind == "unified" then
-    if diff_view_runtime.current_diff_backend(bufnr) == "codediff"
-      and diff_view_runtime.current_codediff_layout(bufnr) == "inline" then
-      local file_mode = type(vim.b.gh_pr_file_mode) == "string" and vim.b.gh_pr_file_mode or ""
-      if file_mode == "added_single" then
-        return validate_added_inline_target(path, start_line, line)
-      end
-      return validate_head_inline_target(pr.number, selected_file, path, start_line, line)
-    end
-    return validate_unified_inline_target(path, start_line, line)
-  end
-
   local file_mode = type(vim.b.gh_pr_file_mode) == "string" and vim.b.gh_pr_file_mode or ""
-  if file_mode == "added_single" then
-    return validate_added_inline_target(path, start_line, line)
+  local patch = nil
+  if file_mode ~= "added_single" then
+    local patch_err
+    patch, patch_err = resolve_inline_patch(pr.number, selected_file, path)
+    if not patch then
+      local reason = patch_err and tostring(patch_err) or "No textual patch available"
+      return nil, "Unable to comment at this location: " .. reason
+    end
+    if type(selected_file) == "table" then
+      selected_file.patch = patch
+    end
   end
 
-  return validate_head_inline_target(pr.number, selected_file, path, start_line, line)
+  return inline_comment_targets.resolve_buffer_range({
+    bufnr = bufnr,
+    path = path,
+    patch = patch,
+    start_line = start_line,
+    line = line,
+    kind = kind,
+    file_mode = file_mode,
+    backend = diff_view_runtime.current_diff_backend(bufnr),
+    layout = diff_view_runtime.current_codediff_layout(bufnr),
+    unified_line_map = vim.b[bufnr].gh_pr_unified_line_map,
+    action = opts.action,
+  })
 end
 
 local function visual_line_range()
@@ -1601,7 +1465,8 @@ function M.add_inline_suggestion(opts)
   end
 
   local selected_file = resolve_file(opts.file)
-  local target, target_err = resolve_inline_comment_target(pr, details, selected_file, opts)
+  local target_opts = vim.tbl_extend("force", {}, opts, { action = "suggestion" })
+  local target, target_err = resolve_inline_comment_target(pr, details, selected_file, target_opts)
   if not target then
     return notify_error(target_err)
   end
@@ -1698,13 +1563,17 @@ function M.review(event)
         return
       end
 
+      local handle = activity.begin("Submitting " .. (review_event_label(event) or "review") .. "...")
+      vim.cmd("redraw")
       local ok, review_err = pr_service.review(pr.number, event, body)
+      activity.done(handle)
       if not ok then
         notify_error(review_err)
         return
       end
 
       notify_info(string.format("%s review submitted for PR #%d", label:gsub("^%l", string.upper), pr.number))
+      refresh_pr_sources_after_state_change({ force = true })
     end)
   end)
 end
@@ -1740,7 +1609,10 @@ function M.comment_pr()
           return
         end
 
+        local handle = activity.begin("Publishing comment...")
+        vim.cmd("redraw")
         local ok, comment_err = pr_service.comment(pr.number, message)
+        activity.done(handle)
         if not ok then
           notify_error(comment_err)
           return
@@ -1761,6 +1633,9 @@ local function review_actions_context()
     pr_service = pr_service,
     prompt_review_body = prompt_review_body,
     refresh_line_comments_for_pr = refresh_line_comments_for_pr,
+    refresh_pr_sources = function(opts)
+      refresh_pr_sources_after_state_change(opts)
+    end,
     resolve_active_pr = resolve_active_pr,
     review_event_label = review_event_label,
   }
@@ -1801,13 +1676,17 @@ function M.merge(method)
       return
     end
 
+    local handle = activity.begin("Merging PR...")
+    vim.cmd("redraw")
     local ok, merge_err = pr_service.merge(pr.number, method, delete_choice == "yes")
+    activity.done(handle)
     if not ok then
       notify_error(merge_err)
       return
     end
 
     notify_info(string.format("Merge requested for PR #%d", pr.number))
+    refresh_pr_sources_after_state_change({ force = true })
   end)
 end
 

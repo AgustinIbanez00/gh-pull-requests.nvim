@@ -309,7 +309,6 @@ function M.build_line_comment_index(threads, opts, ctx)
   opts = opts or {}
 
   local show_resolved = opts.show_resolved ~= false
-  local show_outdated = opts.show_outdated ~= false
   local normalized_threads = ctx.normalize_threads(threads)
   local index = {}
 
@@ -318,26 +317,18 @@ function M.build_line_comment_index(threads, opts, ctx)
       goto continue
     end
 
-    if thread.is_outdated and not show_outdated then
-      goto continue
-    end
-
     local thread_path = ctx.normalize_string(thread.path, "")
     local thread_side = M.normalize_diff_side(thread.diff_side, ctx)
+    local thread_is_outdated = thread.is_outdated == true
 
     for _, comment in ipairs(thread.comments or {}) do
       local path = ctx.normalize_string(comment.path, thread_path)
       local comment_side = M.normalize_diff_side(comment.diff_side, ctx)
       local side_hint = comment_side ~= "" and comment_side or thread_side
+      local effective_side = side_hint ~= "" and side_hint or "RIGHT"
 
       local head_line = M.first_positive_line(comment.line, thread.line, thread.start_line)
       local base_line = M.first_positive_line(comment.original_line, thread.original_line, thread.original_start_line)
-
-      if side_hint == "RIGHT" and not head_line then
-        head_line = M.first_positive_line(thread.line, thread.start_line)
-      elseif side_hint == "LEFT" and not base_line then
-        base_line = M.first_positive_line(thread.original_line, thread.original_start_line)
-      end
 
       local head_start = M.first_positive_line(thread.start_line)
       local base_start = M.first_positive_line(thread.original_start_line)
@@ -350,6 +341,31 @@ function M.build_line_comment_index(threads, opts, ctx)
       if vim.tbl_isempty(base_range) and type(base_line) == "number" and base_line > 0 then
         base_range = { base_line }
       end
+
+      local target_side, target_range, anchor_line
+      if effective_side == "LEFT" then
+        target_side = "base"
+        target_range = base_range
+        anchor_line = base_line
+      else
+        target_side = "head"
+        target_range = head_range
+        anchor_line = head_line
+      end
+
+      local comment_is_outdated = comment.outdated == true
+      local skip_in_diff = thread_is_outdated
+        or comment_is_outdated
+        or type(anchor_line) ~= "number"
+        or anchor_line < 1
+
+      if skip_in_diff then
+        goto next_comment
+      end
+
+      local range_start = tonumber(target_range[1]) or anchor_line
+      local range_end = tonumber(target_range[#target_range]) or anchor_line
+      local is_multiline = range_end > range_start
 
       local entry = {
         thread_id = thread.id,
@@ -365,14 +381,20 @@ function M.build_line_comment_index(threads, opts, ctx)
         reaction_groups = comment.reaction_groups,
         is_pending = comment.is_pending == true,
         is_resolved = thread.is_resolved == true,
-        is_outdated = thread.is_outdated == true,
-        diff_side = side_hint,
+        is_outdated = thread_is_outdated or comment_is_outdated,
+        diff_side = effective_side,
+        effective_side = effective_side,
         line = head_line,
         original_line = base_line,
+        anchor_line = anchor_line,
+        range_start = range_start,
+        range_end = range_end,
+        is_multiline = is_multiline,
       }
 
-      add_line_items_with_range(index, path, "head", head_range, entry)
-      add_line_items_with_range(index, path, "base", base_range, entry)
+      add_line_items_with_range(index, path, target_side, target_range, entry)
+
+      ::next_comment::
     end
 
     ::continue::

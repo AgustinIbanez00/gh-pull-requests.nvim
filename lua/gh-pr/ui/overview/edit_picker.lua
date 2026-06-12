@@ -164,15 +164,8 @@ local function load_reviewer_candidates(details, ctx)
   return candidates, nil
 end
 
-local function open_label_multi_select(pr, details, ctx, callback)
-  local labels, labels_err = load_label_candidates(details, ctx)
-  if not labels then
-    ctx.notify_error("Unable to load repository labels: " .. tostring(labels_err))
-    callback(false)
-    return
-  end
-
-  local current = current_labels(details)
+local function build_label_items(labels, current)
+  current = type(current) == "table" and current or {}
   local selected = {}
   for _, value in ipairs(current) do
     selected[normalize_key(value)] = true
@@ -180,7 +173,7 @@ local function open_label_multi_select(pr, details, ctx, callback)
 
   local items = {}
   local seen = {}
-  for _, label in ipairs(labels) do
+  for _, label in ipairs(type(labels) == "table" and labels or {}) do
     local name = normalize_string(label.name)
     local key = normalize_key(name)
     if name ~= "" and key ~= "" and not seen[key] then
@@ -217,31 +210,11 @@ local function open_label_multi_select(pr, details, ctx, callback)
     return normalize_key(left.label) < normalize_key(right.label)
   end)
 
-  multi_select.open({
-    title = string.format("PR #%d - Edit labels", pr.number),
-    items = items,
-    on_confirm = function(values)
-      callback(values)
-    end,
-    on_cancel = function()
-      callback(nil)
-    end,
-  })
+  return items
 end
 
-local function open_reviewer_multi_select(pr, details, ctx, callback)
-  local candidates, candidates_err = load_reviewer_candidates(details, ctx)
-  if not candidates then
-    ctx.notify_error("Unable to load reviewer candidates: " .. tostring(candidates_err))
-    callback(false)
-    return
-  end
-
-  for _, warning in ipairs(type(candidates.warnings) == "table" and candidates.warnings or {}) do
-    ctx.notify_warn(warning)
-  end
-
-  local current = current_reviewers(details)
+local function build_reviewer_items(candidates, current)
+  current = type(current) == "table" and current or {}
   local selected = {}
   for _, value in ipairs(current) do
     selected[normalize_key(value)] = true
@@ -249,7 +222,7 @@ local function open_reviewer_multi_select(pr, details, ctx, callback)
 
   local items = {}
   local seen = {}
-  for _, candidate in ipairs(type(candidates.merged) == "table" and candidates.merged or {}) do
+  for _, candidate in ipairs(type(candidates) == "table" and type(candidates.merged) == "table" and candidates.merged or {}) do
     local value = normalize_string(candidate.value)
     local key = normalize_key(value)
     if value ~= "" and key ~= "" and not seen[key] then
@@ -290,9 +263,44 @@ local function open_reviewer_multi_select(pr, details, ctx, callback)
     return normalize_key(left.value) < normalize_key(right.value)
   end)
 
+  return items
+end
+
+local function open_label_multi_select(pr, details, ctx, callback)
+  local labels, labels_err = load_label_candidates(details, ctx)
+  if not labels then
+    ctx.notify_error("Unable to load repository labels: " .. tostring(labels_err))
+    callback(false)
+    return
+  end
+
+  multi_select.open({
+    title = string.format("PR #%d - Edit labels", pr.number),
+    items = build_label_items(labels, current_labels(details)),
+    on_confirm = function(values)
+      callback(values)
+    end,
+    on_cancel = function()
+      callback(nil)
+    end,
+  })
+end
+
+local function open_reviewer_multi_select(pr, details, ctx, callback)
+  local candidates, candidates_err = load_reviewer_candidates(details, ctx)
+  if not candidates then
+    ctx.notify_error("Unable to load reviewer candidates: " .. tostring(candidates_err))
+    callback(false)
+    return
+  end
+
+  for _, warning in ipairs(type(candidates.warnings) == "table" and candidates.warnings or {}) do
+    ctx.notify_warn(warning)
+  end
+
   multi_select.open({
     title = string.format("PR #%d - Edit reviewers", pr.number),
-    items = items,
+    items = build_reviewer_items(candidates, current_reviewers(details)),
     on_confirm = function(values)
       callback(values)
     end,
@@ -401,5 +409,13 @@ function M.confirm(pr_number, action_label, summary, callback)
     callback(choice == "confirm")
   end)
 end
+
+M._normalize_items = normalize_items
+M._current_labels = current_labels
+M._current_reviewers = current_reviewers
+M.load_label_candidates = load_label_candidates
+M.load_reviewer_candidates = load_reviewer_candidates
+M.build_label_items = build_label_items
+M.build_reviewer_items = build_reviewer_items
 
 return M

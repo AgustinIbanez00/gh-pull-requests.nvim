@@ -249,6 +249,11 @@ local defaults = {
       my_pr = true,
     },
   },
+  log = {
+    enabled = true,
+    level = "warn",
+    max_size_kb = 1024,
+  },
   diff_view = {
     mode = "vertical",
     ignore_whitespace = false,
@@ -260,6 +265,11 @@ local defaults = {
     },
     pr_explorer = {
       enabled = true,
+    },
+    commentable_zones = {
+      enabled = true,
+      sign = "+",
+      keymap = "+",
     },
     whitespace = {
       tab = ">-",
@@ -277,25 +287,24 @@ local defaults = {
       highlight_group = "GhPrDiffEndline",
     },
     shortcuts = vim.deepcopy(diff_shortcuts.defaults),
-    changes_panel = {
+    review_panel = {
       enabled = true,
-      auto_open = true,
-      position = "right",
-      width = 34,
-      min_width = 24,
-      max_width = 50,
-    },
-    comments_panel = {
-      enabled = true,
-      auto_open = "if_comments",
+      auto_open = "if_content",
       position = "bottom",
       height_ratio = 0.28,
       min_height = 8,
       max_height = 18,
-      follow_cursor = false,
       show_resolved = true,
       show_outdated = true,
       close_with_dq = true,
+      sections = {
+        changes = true,
+        comments = true,
+      },
+      active_hunk_highlight = {
+        enabled = true,
+        debounce_ms = 80,
+      },
     },
     images = {
       enabled = true,
@@ -413,23 +422,18 @@ local defaults = {
   },
   queries = {
     {
-      folder = "Inbox",
-      label = "Waiting For My Review",
-      query = "is:open review-requested:@me",
+      folder = "Pull Requests",
+      label = "Review",
+      query = "is:open review-requested:@me org:@org",
     },
     {
-      folder = "Inbox",
-      label = "Assigned To Me",
-      query = "is:open assignee:@me",
-    },
-    {
-      folder = "Mine",
-      label = "Created By Me",
+      folder = "Pull Requests",
+      label = "Mine",
       query = "is:open author:@me",
     },
     {
-      folder = "All",
-      label = "All Open",
+      folder = "Pull Requests",
+      label = "All",
       query = "is:open",
     },
   },
@@ -999,6 +1003,33 @@ local function sanitize_overview(overview)
   return result
 end
 
+local valid_log_levels = {
+  error = true,
+  warn = true,
+  info = true,
+  debug = true,
+}
+
+local function sanitize_log(log_options)
+  if type(log_options) ~= "table" then
+    return vim.deepcopy(defaults.log)
+  end
+
+  local result = vim.tbl_deep_extend("force", vim.deepcopy(defaults.log), log_options)
+
+  if type(result.enabled) ~= "boolean" then
+    result.enabled = defaults.log.enabled
+  end
+
+  if type(result.level) ~= "string" or not valid_log_levels[result.level] then
+    result.level = defaults.log.level
+  end
+
+  result.max_size_kb = sanitize_positive_integer(result.max_size_kb, defaults.log.max_size_kb)
+
+  return result
+end
+
 local function sanitize_cache(cache_options)
   if type(cache_options) ~= "table" then
     return vim.deepcopy(defaults.cache)
@@ -1462,6 +1493,20 @@ local function sanitize_diff_view(diff_view, raw_diff_view)
     result.pr_explorer.enabled = defaults.diff_view.pr_explorer.enabled
   end
 
+  result.commentable_zones = type(result.commentable_zones) == "table" and result.commentable_zones or {}
+  if type(result.commentable_zones.enabled) ~= "boolean" then
+    result.commentable_zones.enabled = defaults.diff_view.commentable_zones.enabled
+  end
+  if type(result.commentable_zones.sign) ~= "string" or result.commentable_zones.sign == "" then
+    result.commentable_zones.sign = defaults.diff_view.commentable_zones.sign
+  end
+  if #result.commentable_zones.sign > 2 then
+    result.commentable_zones.sign = result.commentable_zones.sign:sub(1, 2)
+  end
+  if type(result.commentable_zones.keymap) ~= "string" then
+    result.commentable_zones.keymap = defaults.diff_view.commentable_zones.keymap
+  end
+
   result.whitespace = type(result.whitespace) == "table" and result.whitespace or {}
   result.whitespace.tab = sanitize_listchars_token(result.whitespace.tab, defaults.diff_view.whitespace.tab)
   result.whitespace.space = sanitize_listchars_token(result.whitespace.space, defaults.diff_view.whitespace.space)
@@ -1499,111 +1544,104 @@ local function sanitize_diff_view(diff_view, raw_diff_view)
 
   result.shortcuts = diff_shortcuts.resolve(result.shortcuts)
 
-  result.changes_panel = type(result.changes_panel) == "table" and result.changes_panel or {}
-  if type(result.changes_panel.enabled) ~= "boolean" then
-    result.changes_panel.enabled = defaults.diff_view.changes_panel.enabled
+  -- Emit a soft warning if old keys are supplied
+  if type(result.changes_panel) == "table" then
+    if vim.notify_once then
+      vim.notify_once("gh-pr: diff_view.changes_panel is no longer supported; use diff_view.review_panel instead.", vim.log.levels.WARN)
+    end
+    result.changes_panel = nil
   end
-  if type(result.changes_panel.auto_open) ~= "boolean" then
-    result.changes_panel.auto_open = defaults.diff_view.changes_panel.auto_open
+  if type(result.comments_panel) == "table" then
+    if vim.notify_once then
+      vim.notify_once("gh-pr: diff_view.comments_panel has been renamed to diff_view.review_panel.", vim.log.levels.WARN)
+    end
+    if type(raw_diff_view.review_panel) ~= "table" then
+      result.review_panel = result.comments_panel
+    end
+    result.comments_panel = nil
   end
-  local changes_panel_position = type(result.changes_panel.position) == "string"
-      and result.changes_panel.position:lower()
-    or defaults.diff_view.changes_panel.position
-  if changes_panel_position ~= "left" and changes_panel_position ~= "right" then
-    changes_panel_position = defaults.diff_view.changes_panel.position
-  end
-  result.changes_panel.position = changes_panel_position
 
-  local changes_panel_min_width = tonumber(result.changes_panel.min_width)
-  if type(changes_panel_min_width) ~= "number" then
-    changes_panel_min_width = defaults.diff_view.changes_panel.min_width
+  result.review_panel = type(result.review_panel) == "table" and result.review_panel or {}
+  if type(result.review_panel.enabled) ~= "boolean" then
+    result.review_panel.enabled = defaults.diff_view.review_panel.enabled
   end
-  changes_panel_min_width = math.floor(changes_panel_min_width)
-  if changes_panel_min_width < 12 then
-    changes_panel_min_width = defaults.diff_view.changes_panel.min_width
+  local review_panel_auto_open = result.review_panel.auto_open
+  if review_panel_auto_open == true then
+    review_panel_auto_open = "if_content"
+  elseif review_panel_auto_open == false then
+    review_panel_auto_open = "never"
+  elseif review_panel_auto_open == "if_comments" then
+    review_panel_auto_open = "if_content"
   end
-  result.changes_panel.min_width = changes_panel_min_width
+  if review_panel_auto_open ~= "never"
+    and review_panel_auto_open ~= "if_content"
+    and review_panel_auto_open ~= "always" then
+    review_panel_auto_open = defaults.diff_view.review_panel.auto_open
+  end
+  result.review_panel.auto_open = review_panel_auto_open
 
-  local changes_panel_max_width = tonumber(result.changes_panel.max_width)
-  if type(changes_panel_max_width) ~= "number" then
-    changes_panel_max_width = defaults.diff_view.changes_panel.max_width
+  local review_panel_position = type(result.review_panel.position) == "string"
+      and result.review_panel.position:lower()
+    or defaults.diff_view.review_panel.position
+  if review_panel_position ~= "bottom" and review_panel_position ~= "right" then
+    review_panel_position = defaults.diff_view.review_panel.position
   end
-  changes_panel_max_width = math.floor(changes_panel_max_width)
-  if changes_panel_max_width < changes_panel_min_width then
-    changes_panel_max_width = math.max(changes_panel_min_width, defaults.diff_view.changes_panel.max_width)
-  end
-  result.changes_panel.max_width = changes_panel_max_width
+  result.review_panel.position = review_panel_position
 
-  local changes_panel_width = tonumber(result.changes_panel.width)
-  if type(changes_panel_width) ~= "number" then
-    changes_panel_width = defaults.diff_view.changes_panel.width
+  local review_panel_height_ratio = tonumber(result.review_panel.height_ratio)
+  if type(review_panel_height_ratio) ~= "number" or review_panel_height_ratio < 0.10 or review_panel_height_ratio > 0.80 then
+    review_panel_height_ratio = defaults.diff_view.review_panel.height_ratio
   end
-  changes_panel_width = math.floor(changes_panel_width)
-  result.changes_panel.width = math.max(changes_panel_min_width, math.min(changes_panel_max_width, changes_panel_width))
+  result.review_panel.height_ratio = review_panel_height_ratio
 
-  result.comments_panel = type(result.comments_panel) == "table" and result.comments_panel or {}
-  if type(result.comments_panel.enabled) ~= "boolean" then
-    result.comments_panel.enabled = defaults.diff_view.comments_panel.enabled
+  local review_panel_min_height = tonumber(result.review_panel.min_height)
+  if type(review_panel_min_height) ~= "number" then
+    review_panel_min_height = defaults.diff_view.review_panel.min_height
   end
-  local comments_panel_auto_open = result.comments_panel.auto_open
-  if comments_panel_auto_open == true then
-    comments_panel_auto_open = "if_comments"
-  elseif comments_panel_auto_open == false then
-    comments_panel_auto_open = "never"
+  review_panel_min_height = math.floor(review_panel_min_height)
+  if review_panel_min_height < 3 then
+    review_panel_min_height = defaults.diff_view.review_panel.min_height
   end
-  if comments_panel_auto_open ~= "never"
-    and comments_panel_auto_open ~= "if_comments"
-    and comments_panel_auto_open ~= "always" then
-    comments_panel_auto_open = defaults.diff_view.comments_panel.auto_open
-  end
-  result.comments_panel.auto_open = comments_panel_auto_open
+  result.review_panel.min_height = review_panel_min_height
 
-  local comments_panel_position = type(result.comments_panel.position) == "string"
-      and result.comments_panel.position:lower()
-    or defaults.diff_view.comments_panel.position
-  if comments_panel_position ~= "bottom" and comments_panel_position ~= "right" then
-    comments_panel_position = defaults.diff_view.comments_panel.position
+  local review_panel_max_height = tonumber(result.review_panel.max_height)
+  if type(review_panel_max_height) ~= "number" then
+    review_panel_max_height = defaults.diff_view.review_panel.max_height
   end
-  result.comments_panel.position = comments_panel_position
+  review_panel_max_height = math.floor(review_panel_max_height)
+  if review_panel_max_height < review_panel_min_height then
+    review_panel_max_height = math.max(review_panel_min_height, defaults.diff_view.review_panel.max_height)
+  end
+  result.review_panel.max_height = review_panel_max_height
 
-  local comments_panel_height_ratio = tonumber(result.comments_panel.height_ratio)
-  if type(comments_panel_height_ratio) ~= "number" or comments_panel_height_ratio < 0.10 or comments_panel_height_ratio > 0.80 then
-    comments_panel_height_ratio = defaults.diff_view.comments_panel.height_ratio
+  if type(result.review_panel.show_resolved) ~= "boolean" then
+    result.review_panel.show_resolved = defaults.diff_view.review_panel.show_resolved
   end
-  result.comments_panel.height_ratio = comments_panel_height_ratio
+  if type(result.review_panel.show_outdated) ~= "boolean" then
+    result.review_panel.show_outdated = defaults.diff_view.review_panel.show_outdated
+  end
+  if type(result.review_panel.close_with_dq) ~= "boolean" then
+    result.review_panel.close_with_dq = defaults.diff_view.review_panel.close_with_dq
+  end
 
-  local comments_panel_min_height = tonumber(result.comments_panel.min_height)
-  if type(comments_panel_min_height) ~= "number" then
-    comments_panel_min_height = defaults.diff_view.comments_panel.min_height
+  result.review_panel.sections = type(result.review_panel.sections) == "table" and result.review_panel.sections or {}
+  if type(result.review_panel.sections.changes) ~= "boolean" then
+    result.review_panel.sections.changes = defaults.diff_view.review_panel.sections.changes
   end
-  comments_panel_min_height = math.floor(comments_panel_min_height)
-  if comments_panel_min_height < 3 then
-    comments_panel_min_height = defaults.diff_view.comments_panel.min_height
+  if type(result.review_panel.sections.comments) ~= "boolean" then
+    result.review_panel.sections.comments = defaults.diff_view.review_panel.sections.comments
   end
-  result.comments_panel.min_height = comments_panel_min_height
 
-  local comments_panel_max_height = tonumber(result.comments_panel.max_height)
-  if type(comments_panel_max_height) ~= "number" then
-    comments_panel_max_height = defaults.diff_view.comments_panel.max_height
+  result.review_panel.active_hunk_highlight = type(result.review_panel.active_hunk_highlight) == "table"
+    and result.review_panel.active_hunk_highlight or {}
+  if type(result.review_panel.active_hunk_highlight.enabled) ~= "boolean" then
+    result.review_panel.active_hunk_highlight.enabled = defaults.diff_view.review_panel.active_hunk_highlight.enabled
   end
-  comments_panel_max_height = math.floor(comments_panel_max_height)
-  if comments_panel_max_height < comments_panel_min_height then
-    comments_panel_max_height = math.max(comments_panel_min_height, defaults.diff_view.comments_panel.max_height)
+  local ah_debounce = tonumber(result.review_panel.active_hunk_highlight.debounce_ms)
+  if type(ah_debounce) ~= "number" or ah_debounce < 0 then
+    ah_debounce = defaults.diff_view.review_panel.active_hunk_highlight.debounce_ms
   end
-  result.comments_panel.max_height = comments_panel_max_height
-
-  if type(result.comments_panel.follow_cursor) ~= "boolean" then
-    result.comments_panel.follow_cursor = defaults.diff_view.comments_panel.follow_cursor
-  end
-  if type(result.comments_panel.show_resolved) ~= "boolean" then
-    result.comments_panel.show_resolved = defaults.diff_view.comments_panel.show_resolved
-  end
-  if type(result.comments_panel.show_outdated) ~= "boolean" then
-    result.comments_panel.show_outdated = defaults.diff_view.comments_panel.show_outdated
-  end
-  if type(result.comments_panel.close_with_dq) ~= "boolean" then
-    result.comments_panel.close_with_dq = defaults.diff_view.comments_panel.close_with_dq
-  end
+  result.review_panel.active_hunk_highlight.debounce_ms = math.floor(ah_debounce)
 
   result.images = type(result.images) == "table" and result.images or {}
   if type(result.images.enabled) ~= "boolean" then
@@ -1760,6 +1798,7 @@ function M.setup(opts)
   state.line_comments = sanitize_line_comments(state.line_comments)
   state.overview = sanitize_overview(type(opts.overview) == "table" and opts.overview or nil)
   state.cache = sanitize_cache(state.cache)
+  state.log = sanitize_log(state.log)
   state.follow_current_file = sanitize_follow_current_file(state.follow_current_file)
   state.diff_view = sanitize_diff_view(state.diff_view, type(opts.diff_view) == "table" and opts.diff_view or nil)
   state.path_render = sanitize_path_render(state.path_render, opts)

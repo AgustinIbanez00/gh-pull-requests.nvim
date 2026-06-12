@@ -574,6 +574,19 @@ function M.attach_to_buffer(bufnr, ctx)
   for line, entries in pairs(line_map) do
     local kind = marker_kind(entries)
 
+    local is_anchor = false
+    local is_in_multiline_range = false
+    for _, entry in ipairs(entries) do
+      if entry.is_multiline then
+        is_in_multiline_range = true
+        if tonumber(entry.range_end) == line then
+          is_anchor = true
+        end
+      else
+        is_anchor = true
+      end
+    end
+
     if flags.sign then
       pcall(vim.fn.sign_place, 0, sign_group, sign_names[kind], bufnr, {
         lnum = line,
@@ -589,7 +602,15 @@ function M.attach_to_buffer(bufnr, ctx)
       })
     end
 
-    if flags.virtual_text and vt_opts.enabled then
+    if is_in_multiline_range and not is_anchor then
+      pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, line - 1, 0, {
+        line_hl_group = "GhPrCommentRange",
+        hl_eol = true,
+        priority = 70,
+      })
+    end
+
+    if is_anchor and flags.virtual_text and vt_opts.enabled then
       local label = ""
       local virt_hl_group = virt_hl_groups[kind]
 

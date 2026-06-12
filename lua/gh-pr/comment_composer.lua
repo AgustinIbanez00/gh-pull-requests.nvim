@@ -1,4 +1,5 @@
 local M = {}
+local namespace = vim.api.nvim_create_namespace("gh-pr-comment-composer")
 
 local function safe_string(value, fallback)
   if type(value) == "string" and value ~= "" then
@@ -85,6 +86,23 @@ local function focus_origin_window(winid)
   end
 end
 
+local function apply_editor_hints(bufnr, opts)
+  if not valid_buf(bufnr) then
+    return
+  end
+
+  local hint = safe_string(opts.hint_text, "Ctrl-s save | q/Esc cancel")
+  vim.b[bufnr].gh_pr_composer_hint = hint
+  pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, 0, 0, {
+    virt_lines = {
+      {
+        { hint, "Comment" },
+      },
+    },
+    virt_lines_above = true,
+  })
+end
+
 function M.open(opts)
   opts = type(opts) == "table" and opts or {}
   local on_submit = type(opts.on_submit) == "function" and opts.on_submit or function() end
@@ -120,7 +138,11 @@ function M.open(opts)
   vim.api.nvim_win_set_option(winid, "wrap", true)
   vim.api.nvim_win_set_option(winid, "linebreak", true)
   vim.api.nvim_win_set_option(winid, "cursorline", true)
+  vim.api.nvim_win_set_option(winid, "number", true)
+  vim.api.nvim_win_set_option(winid, "relativenumber", false)
+  vim.api.nvim_win_set_option(winid, "signcolumn", "no")
   vim.api.nvim_win_set_option(winid, "winhl", "NormalFloat:NormalFloat,FloatBorder:FloatBorder")
+  apply_editor_hints(bufnr, opts)
 
   local finished = false
 

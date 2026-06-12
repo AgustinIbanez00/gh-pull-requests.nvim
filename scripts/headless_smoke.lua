@@ -24,8 +24,8 @@ do
   local cfg = require("gh-pr.config").get()
   local prefetch = cfg.diff_view.prefetch or {}
   local pr_explorer = cfg.diff_view.pr_explorer or {}
-  local comments_panel = cfg.diff_view.comments_panel or {}
-  local changes_panel = cfg.diff_view.changes_panel or {}
+  local commentable_zones = cfg.diff_view.commentable_zones or {}
+  local review_panel = cfg.diff_view.review_panel or {}
   local non_text = cfg.diff_view.non_text or {}
   local cache = cfg.cache or {}
   local follow_current_file = cfg.follow_current_file or {}
@@ -43,26 +43,31 @@ do
   local ok_security_section = pcall(require, "gh-pr.neotree.review_sections.security")
 
   assert(vim.fn.exists(":GhPrOpen") == 2, "Missing :GhPrOpen command")
+  assert(vim.fn.exists(":GhPrCreate") == 2, "Missing :GhPrCreate command")
+  assert(vim.fn.exists(":GhPrNew") == 2, "Missing :GhPrNew command")
   assert(vim.fn.exists(":GhPrReviewRefresh") == 2, "Missing :GhPrReviewRefresh command")
   assert(vim.fn.exists(":GhPrMyPr") == 2, "Missing :GhPrMyPr command")
   assert(vim.fn.exists(":GhPrMyPR") == 2, "Missing :GhPrMyPR alias")
   assert(vim.fn.exists(":GhPRReviewRefresh") == 2, "Missing :GhPRReviewRefresh alias")
-  assert(vim.fn.exists(":GhPrToggleChangesPanel") == 2, "Missing :GhPrToggleChangesPanel command")
+  assert(vim.fn.exists(":GhPrToggleReviewPanel") == 2, "Missing :GhPrToggleReviewPanel command")
   assert(vim.fn.maparg("<Plug>(gh-pr-open)", "n") ~= "", "Missing <Plug>(gh-pr-open)")
+  assert(vim.fn.maparg("<Plug>(gh-pr-create)", "n") ~= "", "Missing <Plug>(gh-pr-create)")
   assert(vim.fn.maparg("<Plug>(gh-pr-review-refresh)", "n") ~= "", "Missing <Plug>(gh-pr-review-refresh)")
   assert(vim.fn.maparg("<Plug>(gh-pr-my-pr)", "n") ~= "", "Missing <Plug>(gh-pr-my-pr)")
-  assert(vim.fn.maparg("<Plug>(gh-pr-toggle-changes-panel)", "n") ~= "",
-    "Missing <Plug>(gh-pr-toggle-changes-panel)")
+  assert(vim.fn.maparg("<Plug>(gh-pr-toggle-review-panel)", "n") ~= "",
+    "Missing <Plug>(gh-pr-toggle-review-panel)")
   assert(prefetch.enabled == true, "Missing diff_view.prefetch.enabled")
   assert(prefetch.concurrency == 2, "Missing diff_view.prefetch.concurrency")
   assert(prefetch.text_extensions[1] == "lua" and prefetch.text_extensions[2] == "md",
     "Missing diff_view.prefetch.text_extensions")
   assert(pr_explorer.enabled == true, "Missing diff_view.pr_explorer.enabled")
-  assert(comments_panel.position == "bottom", "Missing diff_view.comments_panel.position default")
-  assert(changes_panel.enabled == true and changes_panel.auto_open == true,
-    "Missing diff_view.changes_panel enabled/auto_open defaults")
-  assert(changes_panel.position == "right" and changes_panel.width == 34,
-    "Missing diff_view.changes_panel position/width defaults")
+  assert(commentable_zones.enabled == true, "Missing diff_view.commentable_zones.enabled")
+  assert(commentable_zones.sign == "+" and commentable_zones.keymap == "+",
+    "Missing diff_view.commentable_zones marker/action defaults")
+  assert(review_panel.enabled == true, "Missing diff_view.review_panel.enabled default")
+  assert(review_panel.auto_open == "if_content", "Missing diff_view.review_panel.auto_open default")
+  assert(review_panel.position == "bottom", "Missing diff_view.review_panel.position default")
+  assert(review_panel.sections and review_panel.sections.changes == true, "Missing diff_view.review_panel.sections.changes default")
   assert(non_text.enabled == true, "Missing diff_view.non_text.enabled")
   assert(non_text.auto_preview == true, "Missing diff_view.non_text.auto_preview")
   assert(non_text.show_metadata == true, "Missing diff_view.non_text.show_metadata")
@@ -76,6 +81,8 @@ do
     "Missing overview activity diff context defaults")
   assert(overview_thread_diff.max_lines == 12, "Missing overview activity diff.max_lines default")
   assert(type(require("gh-pr").open_my_pr_tree) == "function", "Missing open_my_pr_tree facade")
+  assert(type(require("gh-pr").create_pull_request) == "function", "Missing create_pull_request facade")
+  assert(type(require("gh-pr").new_pull_request) == "function", "Missing new_pull_request facade")
   assert(type(require("gh-pr").toggle_changes_panel) == "function", "Missing toggle_changes_panel facade")
   assert(type(cache.gh_my_pr) == "table" and cache.gh_my_pr.enabled == true, "Missing cache.gh_my_pr.enabled")
   assert(cache.gh_my_pr.ttl_seconds == 30, "Missing cache.gh_my_pr.ttl_seconds default")
@@ -125,6 +132,631 @@ do
 
   local ok, health = pcall(require, "gh-pr.health")
   assert(ok and type(health.check) == "function", "Missing gh-pr health check entrypoint")
+end
+
+do
+  local targets = require("gh-pr.core.inline_comment_targets")
+  local patch = table.concat({
+    "@@ -1,3 +1,4 @@",
+    " keep",
+    "-old",
+    "+new",
+    "+extra",
+    " tail",
+  }, "\n")
+
+  local parsed = targets.parse_patch(patch)
+  assert(parsed.has_hunks == true, "Inline target parser should detect hunks")
+  assert(parsed.LEFT[1] and parsed.LEFT[1].kind == "context", "Parser should mark LEFT context lines")
+  assert(parsed.LEFT[2] and parsed.LEFT[2].kind == "delete", "Parser should mark LEFT deleted lines")
+  assert(parsed.RIGHT[2] and parsed.RIGHT[2].kind == "add", "Parser should mark RIGHT added lines")
+  assert(parsed.RIGHT[4] and parsed.RIGHT[4].kind == "context", "Parser should mark RIGHT context lines")
+
+  local base_target = select(1, targets.resolve_buffer_range({
+    path = "lua/example.lua",
+    patch = patch,
+    kind = "base",
+    start_line = nil,
+    line = 2,
+  }))
+  assert(base_target and base_target.side == "LEFT" and base_target.line == 2,
+    "Inline target resolver should allow LEFT/base deleted-line comments")
+
+  local head_range = select(1, targets.resolve_buffer_range({
+    path = "lua/example.lua",
+    patch = patch,
+    kind = "head",
+    start_line = 2,
+    line = 3,
+  }))
+  assert(head_range and head_range.side == "RIGHT" and head_range.start_line == 2 and head_range.line == 3,
+    "Inline target resolver should allow continuous RIGHT/head ranges")
+
+  local invalid_target, invalid_err = targets.resolve_buffer_range({
+    path = "lua/example.lua",
+    patch = patch,
+    kind = "head",
+    line = 99,
+  })
+  assert(invalid_target == nil and type(invalid_err) == "string",
+    "Inline target resolver should reject lines outside the patch")
+
+  local delete_target = select(1, targets.resolve_buffer_range({
+    path = "lua/example.lua",
+    patch = patch,
+    kind = "unified",
+    line = 1,
+    unified_line_map = {
+      [1] = { kind = "delete", base_line = 2 },
+      [2] = { kind = "add", head_line = 2 },
+      [3] = { kind = "add", head_line = 3 },
+    },
+  }))
+  assert(delete_target and delete_target.side == "LEFT" and delete_target.line == 2,
+    "Unified resolver should map deleted render lines to LEFT targets")
+
+  local suggestion_left, suggestion_left_err = targets.resolve_buffer_range({
+    path = "lua/example.lua",
+    patch = patch,
+    kind = "unified",
+    line = 1,
+    action = "suggestion",
+    unified_line_map = {
+      [1] = { kind = "delete", base_line = 2 },
+    },
+  })
+  assert(suggestion_left == nil and tostring(suggestion_left_err):find("right%-side") ~= nil,
+    "Inline suggestions should be rejected on LEFT/deleted targets")
+
+  local suggestion_range = select(1, targets.resolve_buffer_range({
+    path = "lua/example.lua",
+    patch = patch,
+    kind = "unified",
+    start_line = 2,
+    line = 3,
+    action = "suggestion",
+    unified_line_map = {
+      [2] = { kind = "add", head_line = 2 },
+      [3] = { kind = "add", head_line = 3 },
+    },
+  }))
+  assert(suggestion_range and suggestion_range.side == "RIGHT" and suggestion_range.start_line == 2,
+    "Inline suggestions should be allowed on continuous RIGHT ranges")
+
+  local mixed_range, mixed_err = targets.resolve_buffer_range({
+    path = "lua/example.lua",
+    patch = patch,
+    kind = "unified",
+    start_line = 1,
+    line = 2,
+    unified_line_map = {
+      [1] = { kind = "delete", base_line = 2 },
+      [2] = { kind = "add", head_line = 2 },
+    },
+  })
+  assert(mixed_range == nil and tostring(mixed_err):find("mix") ~= nil,
+    "Inline target resolver should reject mixed LEFT/RIGHT visual ranges")
+end
+
+do
+  local create = require("gh-pr.core.create_pull_request")
+  local context = {
+    repository = { full_name = "owner/repo" },
+    default_branch = "main",
+    current_branch = "feature/create-wizard",
+    remote_branches = { "origin/main", "origin/feature/create-wizard", "upstream/review-ready" },
+    local_branches = { "main", "feature/create-wizard", "local-only" },
+  }
+
+  local candidates = create.build_head_candidates(context)
+  assert(candidates[1].value == "feature/create-wizard" and candidates[1].current == true,
+    "Head branch candidates should put the current branch first")
+  local local_only
+  for _, candidate in ipairs(candidates) do
+    if candidate.value == "local-only" then
+      local_only = candidate
+    end
+  end
+  assert(local_only and local_only.remote_available == false,
+    "Head branch candidates should keep unpushed branches marked unavailable")
+
+  local state = {
+    title = "Create wizard",
+    body = "Line one\nLine two",
+    head = "feature/create-wizard",
+    base = "main",
+    labels = { "bug", "bug", "enhancement" },
+    reviewers = { "alice", "org/team", "alice" },
+    draft = true,
+  }
+  local ok, validation_err = create.validate_state(state, context)
+  assert(ok == true and validation_err == nil, "Valid PR creation state should pass validation")
+
+  local command = create.build_create_command(state)
+  assert(vim.deep_equal(command.args, {
+    "pr", "create",
+    "--title", "Create wizard",
+    "--body-file", "-",
+    "--head", "feature/create-wizard",
+    "--base", "main",
+    "--label", "bug",
+    "--label", "enhancement",
+    "--reviewer", "alice",
+    "--reviewer", "org/team",
+    "--draft",
+  }), "PR creation command should use explicit non-interactive flags")
+  assert(command.stdin == "Line one\nLine two", "PR creation command should pass multiline body on stdin")
+
+  local empty_body_command = create.build_create_command(vim.tbl_extend("force", state, { body = "", draft = false }))
+  assert(empty_body_command.stdin == "", "PR creation command should support empty bodies")
+  assert(empty_body_command.args[#empty_body_command.args] ~= "--draft", "Ready PR creation command should omit --draft")
+
+  local _, same_branch_err = create.validate_state(vim.tbl_extend("force", state, { head = "main" }), context)
+  assert(tostring(same_branch_err):find("matches the base branch", 1, true) ~= nil,
+    "PR creation should block head branch equal to base")
+  local _, unpushed_err = create.validate_state(vim.tbl_extend("force", state, { head = "local-only" }), context)
+  assert(tostring(unpushed_err):find("not available on any remote", 1, true) ~= nil,
+    "PR creation should block unpushed head branches")
+
+  local parsed = create.parse_created_pr("https://github.com/owner/repo/pull/123\n")
+  assert(parsed.number == 123 and parsed.url == "https://github.com/owner/repo/pull/123",
+    "PR creation result parser should resolve pull request URL and number")
+end
+
+do
+  local picker = require("gh-pr.ui.overview.edit_picker")
+  local label_items = picker.build_label_items({
+    { name = "bug", description = "Bug", color = "ff0000" },
+    { name = "bug", description = "Duplicate", color = "00ff00" },
+    { name = "docs", description = "Docs", color = "0000ff" },
+  }, { "bug", "missing" })
+
+  local label_values = {}
+  local selected = {}
+  for _, item in ipairs(label_items) do
+    label_values[#label_values + 1] = item.value
+    if item.selected then
+      selected[item.value] = true
+    end
+  end
+  assert(#label_items == 3 and selected.bug == true and selected.missing == true,
+    "Label selector items should be preloaded, deduped, and keep current selections")
+
+  local reviewer_items = picker.build_reviewer_items({
+    merged = {
+      { kind = "user", value = "alice", display = "@alice" },
+      { kind = "user", value = "alice", display = "@alice duplicate" },
+      { kind = "team", value = "org/platform", display = "@org/platform" },
+    },
+  }, { "alice", "org/old-team" })
+  local reviewer_seen = {}
+  local reviewer_selected = {}
+  for _, item in ipairs(reviewer_items) do
+    reviewer_seen[item.value] = (reviewer_seen[item.value] or 0) + 1
+    if item.selected then
+      reviewer_selected[item.value] = true
+    end
+  end
+  assert(reviewer_seen.alice == 1 and reviewer_seen["org/platform"] == 1 and reviewer_seen["org/old-team"] == 1,
+    "Reviewer selector items should be preloaded and deduped")
+  assert(reviewer_selected.alice == true and reviewer_selected["org/old-team"] == true,
+    "Reviewer selector items should keep current reviewer selections")
+end
+
+do
+  local wizard = require("gh-pr.ui.create_pull_request")
+
+  local function create_context()
+    return {
+      repository = { full_name = "owner/repo" },
+      default_branch = "main",
+      current_branch = "feature/create-wizard",
+      remote_branches = { "origin/feature/create-wizard" },
+      local_branches = { "main", "feature/create-wizard", "local-only" },
+    }
+  end
+
+  local function attach_buffer(state)
+    state.bufnr = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_option(state.bufnr, "modifiable", false)
+    state.setup_highlights = function() end
+    return state.bufnr
+  end
+
+  local function close_state(state)
+    if type(state) ~= "table" then
+      return
+    end
+    if type(state.winid) == "number" and vim.api.nvim_win_is_valid(state.winid) then
+      pcall(vim.api.nvim_win_close, state.winid, true)
+    end
+    if type(state.bufnr) == "number" and vim.api.nvim_buf_is_valid(state.bufnr) then
+      pcall(vim.api.nvim_buf_delete, state.bufnr, { force = true })
+    end
+  end
+
+  local function find_tab(render, key)
+    for _, tab in ipairs(type(render.tabs) == "table" and render.tabs or {}) do
+      if tab.key == key then
+        return tab
+      end
+    end
+    return nil
+  end
+
+  do
+    local render_state = wizard._new_session({
+      context = create_context(),
+      initial_state = {
+        title = "Create wizard",
+        body = "",
+        head = "feature/create-wizard",
+      },
+      step_index = 1,
+      setup_highlights = function() end,
+    })
+    attach_buffer(render_state)
+    local render = wizard.render(render_state)
+    local text = table.concat(render.lines, "\n")
+    assert(text:find("Repo: owner/repo  Base: main  Head: feature/create-wizard", 1, true) ~= nil,
+      "Create wizard should render compact repo/base/head header")
+    assert(text:find("[1 Title]", 1, true) ~= nil and text:find("2 Description", 1, true) ~= nil
+        and text:find("7 Review", 1, true) ~= nil,
+      "Create wizard should render an enumerated tabline with the active tab")
+    assert(find_tab(render, "title").group == "GhPrCreateTabActive",
+      "Active create wizard tab should use active highlight")
+    close_state(render_state)
+  end
+
+  do
+    local visual_state = wizard._new_session({
+      context = create_context(),
+      initial_state = {
+        title = "",
+        body = "",
+        head = "local-only",
+        labels = {},
+        reviewers = {},
+        draft = false,
+      },
+      step_index = 2,
+      setup_highlights = function() end,
+    })
+    attach_buffer(visual_state)
+    local render = wizard.render(visual_state)
+    assert(find_tab(render, "title").status == "required_missing"
+        and find_tab(render, "title").group == "GhPrCreateTabWarn",
+      "Create wizard should mark missing required title tabs as warning")
+    assert(find_tab(render, "body").status == "optional_empty"
+        and find_tab(render, "body").group == "GhPrCreateTabActive",
+      "Create wizard should keep focused optional-empty tabs active")
+    assert(find_tab(render, "head").status == "invalid"
+        and find_tab(render, "head").group == "GhPrCreateTabWarn",
+      "Create wizard should mark invalid head branch tabs as warning")
+    assert(find_tab(render, "labels").status == "optional_empty"
+        and find_tab(render, "labels").group == "GhPrCreateTab",
+      "Create wizard should mark optional empty tabs with the normal tab highlight")
+    assert(find_tab(render, "draft").status == "complete"
+        and find_tab(render, "draft").group == "GhPrCreateTabDone",
+      "Create wizard should mark complete tabs with the done highlight")
+    close_state(visual_state)
+  end
+
+  do
+    local events = {}
+    local function cancel_handler(name)
+      return function(_, done)
+        events[#events + 1] = name
+        done(nil, { cancelled = true })
+      end
+    end
+
+    local nav_state = select(1, wizard.open({
+      context = create_context(),
+      initial_state = {
+        title = "Create wizard",
+        body = "Body",
+        head = "feature/create-wizard",
+      },
+      handlers = {
+        title = cancel_handler("title"),
+        body = cancel_handler("body"),
+        head = cancel_handler("head"),
+        labels = cancel_handler("labels"),
+        reviewers = cancel_handler("reviewers"),
+        draft = cancel_handler("draft"),
+      },
+      confirm_create = function(_, callback)
+        events[#events + 1] = "confirm"
+        callback(false)
+      end,
+      setup_highlights = function() end,
+      notify_error = function(message)
+        error(message)
+      end,
+      notify_info = function() end,
+      notify_warn = function(message)
+        error(message)
+      end,
+    }))
+
+    local function feed(keys)
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), "x", false)
+      vim.wait(30)
+    end
+
+    feed("l")
+    assert(nav_state.step_index == 2 and #events == 0,
+      "Create wizard l navigation should focus next tab without activating it")
+    feed("<Right>")
+    assert(nav_state.step_index == 3 and #events == 0,
+      "Create wizard right-arrow navigation should focus next tab without activating it")
+    feed("h")
+    assert(nav_state.step_index == 2 and #events == 0,
+      "Create wizard h navigation should focus previous tab without activating it")
+    feed("<Left>")
+    assert(nav_state.step_index == 1 and #events == 0,
+      "Create wizard left-arrow navigation should focus previous tab without activating it")
+
+    local expected_digits = { "title", "body", "head", "labels", "reviewers", "draft" }
+    for index, expected in ipairs(expected_digits) do
+      feed(tostring(index))
+      assert(events[#events] == expected and nav_state.step_index == index,
+        string.format("Create wizard digit %d should jump to and activate %s", index, expected))
+    end
+
+    feed("7")
+    assert(events[#events] == "confirm" and nav_state.step_index == 7,
+      "Create wizard digit 7 should jump to review and open final confirmation when valid")
+
+    feed("q")
+    assert(nav_state.finished == true, "Create wizard q mapping should cancel the session")
+  end
+
+  do
+    local esc_state = select(1, wizard.open({
+      context = create_context(),
+      initial_state = {
+        title = "Create wizard",
+        head = "feature/create-wizard",
+      },
+      setup_highlights = function() end,
+      notify_info = function() end,
+      notify_error = function(message)
+        error(message)
+      end,
+      notify_warn = function(message)
+        error(message)
+      end,
+    }))
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+    vim.wait(30)
+    assert(esc_state.finished == true, "Create wizard Esc mapping should cancel the session")
+  end
+
+  local events = {}
+  local refreshed = false
+  local opened_overview
+  local state = wizard._new_session({
+    context = create_context(),
+    handlers = {
+      title = function(_, done)
+        events[#events + 1] = "title"
+        done("Create wizard")
+      end,
+      body = function(_, done)
+        events[#events + 1] = "body"
+        done("Body\ntext")
+      end,
+      head = function(_, done)
+        events[#events + 1] = "head"
+        done("feature/create-wizard")
+      end,
+      labels = function(_, done)
+        events[#events + 1] = "labels"
+        done({ "bug" })
+      end,
+      reviewers = function(_, done)
+        events[#events + 1] = "reviewers"
+        done({ "alice", "org/team" })
+      end,
+      draft = function(_, done)
+        events[#events + 1] = "draft"
+        done(true)
+      end,
+    },
+    confirm_create = function(_, callback)
+      events[#events + 1] = "confirm"
+      callback(true)
+    end,
+    submit = function(session, callback)
+      events[#events + 1] = "submit"
+      assert(session.data.title == "Create wizard", "Wizard should carry edited title into submit")
+      assert(session.data.body == "Body\ntext", "Wizard should carry edited body into submit")
+      assert(session.data.draft == true, "Wizard should carry selected draft status into submit")
+      callback({ number = 77, url = "https://github.com/owner/repo/pull/77" }, nil)
+    end,
+    refresh_sources = function()
+      refreshed = true
+    end,
+    open_overview = function(number)
+      opened_overview = number
+    end,
+    select = function(items, _, callback)
+      if items[1] == "open overview" then
+        callback("open overview")
+      else
+        callback(items[1])
+      end
+    end,
+    notify_error = function(message)
+      error(message)
+    end,
+    notify_info = function() end,
+    notify_warn = function(message)
+      error(message)
+    end,
+  })
+
+  wizard._activate(state)
+  wizard._activate(state)
+  wizard._activate(state)
+  wizard._activate(state)
+  wizard._activate(state)
+  wizard._activate(state)
+  assert(state.step_index == 7, "Wizard should advance through all editable steps to review")
+  wizard._back(state)
+  assert(state.step_index == 6, "Wizard back navigation should move to the previous step")
+  wizard._activate(state)
+  assert(state.step_index == 7, "Wizard should return to review after editing draft again")
+  wizard._activate(state)
+  assert(refreshed == true and opened_overview == 77 and state.finished == true,
+    "Wizard final confirmation should submit, refresh, finish, and offer overview")
+  assert(table.concat(events, ",") == "title,body,head,labels,reviewers,draft,draft,confirm,submit",
+    "Wizard should execute steps, back/edit, final confirmation, and submit in order")
+
+  local cancelled_message
+  local cancelled = wizard._new_session({
+    context = {},
+    notify_info = function(message)
+      cancelled_message = message
+    end,
+  })
+  wizard._cancel(cancelled)
+  assert(cancelled.finished == true and tostring(cancelled_message):find("cancelled", 1, true) ~= nil,
+    "Wizard cancel should finish the session and report cancellation")
+end
+
+do
+  local composer = require("gh-pr.comment_composer")
+  local bufnr, winid = composer.open({
+    title = "Composer smoke",
+    initial_lines = { "hello" },
+    enter = false,
+    on_submit = function() end,
+    on_cancel = function() end,
+  })
+  assert(vim.api.nvim_win_get_option(winid, "number") == true,
+    "Comment/description composer should show line numbers")
+  assert(tostring(vim.b[bufnr].gh_pr_composer_hint):find("Ctrl%-s save", 1, false) ~= nil,
+    "Comment/description composer should expose visible save/cancel hints")
+  vim.api.nvim_win_close(winid, true)
+end
+
+do
+  local original_common_commands = package.loaded["neo-tree.sources.common.commands"]
+  local original_renderer = package.loaded["neo-tree.ui.renderer"]
+  local original_registry = package.loaded["gh-pr.neotree.registry"]
+  local original_review_commands = package.loaded["gh-pr.neotree.review_commands"]
+  local refresh_opts
+
+  package.loaded["neo-tree.sources.common.commands"] = {
+    _add_common_commands = function() end,
+  }
+  package.loaded["neo-tree.ui.renderer"] = {
+    redraw = function() end,
+  }
+  package.loaded["gh-pr.neotree.registry"] = {
+    get = function(name)
+      assert(name == "gh_pr_review", "review refresh should resolve the gh_pr_review source")
+      return {
+        request_refresh = function(_, opts)
+          refresh_opts = opts
+        end,
+      }
+    end,
+  }
+  package.loaded["gh-pr.neotree.review_commands"] = nil
+
+  require("gh-pr.neotree.review_commands").refresh({
+    name = "gh_pr_review",
+  })
+
+  assert(type(refresh_opts) == "table", "Manual PR Review refresh should call source refresh")
+  assert(refresh_opts.force == true, "Manual PR Review refresh should force GitHub reload")
+  assert(type(refresh_opts.refresh_context) == "table", "Manual PR Review refresh should pass context")
+  assert(refresh_opts.refresh_context.mode == "ui-refresh", "Manual PR Review refresh should update UI")
+  assert(refresh_opts.refresh_context.reason == "manual", "Manual PR Review refresh should be marked manual")
+  assert(refresh_opts.refresh_context.notify == true, "Manual PR Review refresh should request immediate feedback")
+
+  package.loaded["neo-tree.sources.common.commands"] = original_common_commands
+  package.loaded["neo-tree.ui.renderer"] = original_renderer
+  package.loaded["gh-pr.neotree.registry"] = original_registry
+  package.loaded["gh-pr.neotree.review_commands"] = original_review_commands
+end
+
+do
+  local gh = require("gh-pr.gh")
+  local original_vim_system = vim.system
+  local callback_output
+  local callback_error
+
+  vim.system = nil
+  gh.run_command_async({
+    vim.v.progpath,
+    "--headless",
+    "-u",
+    "NONE",
+    "--cmd",
+    "lua io.write('jobstart-fallback-ok')",
+    "+qa!",
+  }, {}, function(output, err)
+    callback_output = output
+    callback_error = err
+  end)
+
+  assert(vim.wait(3000, function()
+    return callback_output ~= nil or callback_error ~= nil
+  end, 20), "jobstart fallback callback should complete")
+  vim.system = original_vim_system
+
+  assert(callback_error == nil, "jobstart fallback should not report an error: " .. tostring(callback_error))
+  assert(callback_output == "jobstart-fallback-ok", "jobstart fallback should capture stdout")
+end
+
+do
+  local overview_section = require("gh-pr.neotree.review_sections.overview")
+  local nodes = overview_section.build_root_nodes({
+    number = 42,
+    title = "Flatten review root",
+  }, {
+    number = 42,
+    title = "Flatten review root",
+  }, {
+    labels = {},
+    files = {
+      title = "Files 2",
+      children = {
+        {
+          id = "file-a",
+          name = "a.lua",
+          type = "file",
+          extra = { kind = "file" },
+        },
+      },
+    },
+    reviewers = { title = "Reviewers", children = {} },
+    commits = { title = "Commits", children = {} },
+    checks = { title = "Checks", children = {} },
+    security = { title = "Security", children = {} },
+    comments = { title = "Comments", children = {} },
+    drafts = { title = "Drafts", children = {} },
+  })
+
+  assert(type(nodes) == "table" and #nodes == 9, "PR Review should render PR summary plus sections as top-level nodes")
+  assert(nodes[1].extra and nodes[1].extra.kind == "overview", "PR Review first node should be an overview sibling")
+  assert(nodes[1].children == nil, "PR Review first node should not parent the other sections")
+
+  local by_kind = {}
+  for _, node in ipairs(nodes) do
+    if node.extra and node.extra.kind then
+      by_kind[node.extra.kind] = node
+    end
+    assert(not (node.extra and node.extra.kind == "root"), "PR Review should not render a root wrapper node")
+  end
+
+  assert(by_kind.files and by_kind.files.name == "Files 2", "Files should stay a top-level PR Review section")
+  assert(by_kind.comments and by_kind.comments.name == "Comments", "Comments should stay a top-level PR Review section")
 end
 
 do
@@ -1309,8 +1941,7 @@ do
   assert(diff_shortcuts.defaults.line_comments_popup == "<localleader>k"
       and diff_shortcuts.defaults.inline_comment == "<localleader>c"
       and diff_shortcuts.defaults.inline_suggestion == "<localleader>s"
-      and diff_shortcuts.defaults.toggle_comments_panel == "<localleader>C"
-      and diff_shortcuts.defaults.toggle_changes_panel == "<localleader>o",
+      and diff_shortcuts.defaults.toggle_review_panel == "<localleader>C",
     "Inline comment defaults should use the short localleader mappings")
 
   local duplicate_shortcuts, duplicate_diags = diff_shortcuts.resolve_effective({
@@ -1374,10 +2005,8 @@ do
     "Virtual diff buffer should expose the short inline-comment mapping")
   assert(vim.fn.maparg(effective_defaults.inline_comment, "x", false, true).desc == "Add inline PR comment for selection",
     "Virtual diff buffer should expose the short visual inline-comment mapping")
-  assert(vim.fn.maparg(effective_defaults.toggle_comments_panel, "n", false, true).desc == "Toggle diff comments panel",
-    "Virtual diff buffer should expose the short comments-panel mapping")
-  assert(vim.fn.maparg(effective_defaults.toggle_changes_panel, "n", false, true).desc == "Toggle diff changes panel",
-    "Virtual diff buffer should expose the short changes-panel mapping")
+  assert(vim.fn.maparg(effective_defaults.toggle_review_panel, "n", false, true).desc == "Toggle diff review panel",
+    "Virtual diff buffer should expose the short review-panel mapping")
   assert(vim.fn.maparg(effective_defaults.line_comments_popup, "n", false, true).desc == "Show line comments popup",
     "Virtual diff buffer should expose the line-comments popup mapping")
   assert(vim.fn.maparg("<CR>", "n", false, true).desc == "Open line comments on commented lines",
@@ -1386,7 +2015,7 @@ do
       and vim.fn.maparg(legacy_defaults.close_quick, "n") == ""
       and vim.fn.maparg(legacy_defaults.inline_comment, "n") == ""
       and vim.fn.maparg(legacy_defaults.inline_comment, "x") == ""
-      and vim.fn.maparg(legacy_defaults.toggle_comments_panel, "n") == "",
+      and vim.fn.maparg(legacy_defaults.toggle_review_panel, "n") == "",
     "Virtual diff buffer should remove legacy d-prefixed and ic/is/dc mappings")
 
   package.loaded["codediff.config"] = {
@@ -1424,8 +2053,10 @@ do
     "codediff buffer should expose the short gh-pr help mapping")
   assert(vim.fn.maparg(effective_defaults.close_quick, "n", false, true).desc == "GH PR: quick close",
     "codediff buffer should expose the short gh-pr quick-close mapping")
-  assert(vim.fn.maparg(effective_defaults.toggle_changes_panel, "n", false, true).desc == "GH PR: toggle changes panel",
-    "codediff buffer should expose the short gh-pr changes-panel mapping")
+  assert(vim.fn.maparg(effective_defaults.toggle_review_panel, "n", false, true).desc == "GH PR: toggle diff review panel",
+    "codediff buffer should expose the short gh-pr review-panel mapping")
+  assert(vim.fn.maparg("+", "n", false, true).desc == "GH PR: add inline comment at commentable line",
+    "codediff buffer should expose the commentable-zone plus mapping")
   assert(vim.fn.maparg("q", "n") == "" and vim.fn.maparg("g?", "n") == "",
     "gh-pr should not override native codediff q/g? mappings")
 
@@ -1436,6 +2067,9 @@ do
     "codediff help should mention the native t layout toggle")
   assert(codediff_lines:find("Horizontal split remains available only in the gh-pr virtual backend", 1, true) ~= nil,
     "codediff help should explain that horizontal layout stays virtual-only")
+  assert(codediff_lines:find("localleader", 1, true) ~= nil
+      and codediff_lines:find("marked commentable (+) lines", 1, true) ~= nil,
+    "codediff help should show expanded localleader context and plus comment action")
 
   local virtual_lines = table.concat(action_helpers.diff_shortcut_lines(virtual_buf), "\n")
   assert(virtual_lines:find("codediff native", 1, true) == nil,
@@ -1699,6 +2333,160 @@ do
     pcall(vim.api.nvim_set_current_buf, original_buf)
   end
   assert(ok, err)
+end
+
+do
+  local commentable_zones = require("gh-pr.commentable_zones")
+  local pr_service = require("gh-pr.pr_service")
+  local state = require("gh-pr.state")
+  local patch = table.concat({
+    "@@ -1,3 +1,4 @@",
+    " keep",
+    "-old",
+    "+new",
+    "+extra",
+    " tail",
+  }, "\n")
+  local file_path = "lua/commentable.lua"
+
+  commentable_zones._reset_for_tests()
+
+  local head_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(head_buf, 0, -1, false, { "keep", "new", "extra", "tail" })
+  vim.b[head_buf].gh_pr_diff_backend = "codediff"
+  vim.b[head_buf].gh_pr_file_kind = "head"
+  vim.b[head_buf].gh_pr_file_mode = "diff_pair"
+  vim.b[head_buf].gh_pr_codediff_layout = "side-by-side"
+  vim.b[head_buf].gh_pr_number = 123
+  vim.b[head_buf].gh_pr_path = file_path
+  commentable_zones.attach_to_buffer(head_buf, {
+    pr_number = 123,
+    path = file_path,
+    file = { filename = file_path, patch = patch },
+    kind = "head",
+    file_mode = "diff_pair",
+    layout = "side-by-side",
+  })
+  assert(type(vim.b[head_buf].gh_pr_commentable_zones[2]) == "table"
+      and type(vim.b[head_buf].gh_pr_commentable_zones[3]) == "table",
+    "Commentable zones should mark RIGHT/head patch targets")
+
+  local base_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(base_buf, 0, -1, false, { "keep", "old", "tail" })
+  vim.b[base_buf].gh_pr_diff_backend = "codediff"
+  vim.b[base_buf].gh_pr_file_kind = "base"
+  vim.b[base_buf].gh_pr_file_mode = "diff_pair"
+  vim.b[base_buf].gh_pr_codediff_layout = "side-by-side"
+  vim.b[base_buf].gh_pr_number = 123
+  vim.b[base_buf].gh_pr_path = file_path
+  commentable_zones.attach_to_buffer(base_buf, {
+    pr_number = 123,
+    path = file_path,
+    file = { filename = file_path, patch = patch },
+    kind = "base",
+    file_mode = "diff_pair",
+    layout = "side-by-side",
+  })
+  assert(type(vim.b[base_buf].gh_pr_commentable_zones[2]) == "table",
+    "Commentable zones should mark LEFT/base patch targets")
+
+  local non_text_buf = vim.api.nvim_create_buf(false, true)
+  vim.b[non_text_buf].gh_pr_diff_backend = "codediff"
+  vim.b[non_text_buf].gh_pr_file_kind = "head"
+  vim.b[non_text_buf].gh_pr_is_non_text = true
+  vim.b[non_text_buf].gh_pr_number = 123
+  vim.b[non_text_buf].gh_pr_path = file_path
+  commentable_zones.attach_to_buffer(non_text_buf, {
+    pr_number = 123,
+    path = file_path,
+    file = { filename = file_path, patch = patch },
+    kind = "head",
+  })
+  assert(vim.tbl_isempty(vim.b[non_text_buf].gh_pr_commentable_zones or {}),
+    "Non-text codediff buffers should not receive commentable markers")
+
+  local original_fetch = pr_service.fetch_pr_files_api_async
+  local previous_pr, previous_details = state.get_active_pr()
+  local previous_file = state.get_active_file()
+  local active_file = { filename = file_path }
+  state.set_active_pr({ number = 456 }, {
+    files = {
+      active_file,
+    },
+  })
+  state.set_active_file(active_file)
+
+  local async_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(async_buf, 0, -1, false, { "keep", "new", "extra", "tail" })
+  vim.b[async_buf].gh_pr_diff_backend = "codediff"
+  vim.b[async_buf].gh_pr_file_kind = "head"
+  vim.b[async_buf].gh_pr_file_mode = "diff_pair"
+  vim.b[async_buf].gh_pr_codediff_layout = "side-by-side"
+  vim.b[async_buf].gh_pr_number = 456
+  vim.b[async_buf].gh_pr_path = file_path
+  local async_base_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(async_base_buf, 0, -1, false, { "keep", "old", "tail" })
+  vim.b[async_base_buf].gh_pr_diff_backend = "codediff"
+  vim.b[async_base_buf].gh_pr_file_kind = "base"
+  vim.b[async_base_buf].gh_pr_file_mode = "diff_pair"
+  vim.b[async_base_buf].gh_pr_codediff_layout = "side-by-side"
+  vim.b[async_base_buf].gh_pr_number = 456
+  vim.b[async_base_buf].gh_pr_path = file_path
+
+  local fetch_callback
+  local fetch_count = 0
+  pr_service.fetch_pr_files_api_async = function(number, callback)
+    fetch_count = fetch_count + 1
+    assert(number == 456, "Async commentable-zone patch fetch should use the active PR number")
+    fetch_callback = callback
+  end
+
+  commentable_zones.attach_to_buffer(async_buf, {
+    pr_number = 456,
+    path = file_path,
+    file = active_file,
+    kind = "head",
+    file_mode = "diff_pair",
+    layout = "side-by-side",
+  })
+  commentable_zones.attach_to_buffer(async_base_buf, {
+    pr_number = 456,
+    path = file_path,
+    file = active_file,
+    kind = "base",
+    file_mode = "diff_pair",
+    layout = "side-by-side",
+  })
+  assert(vim.tbl_isempty(vim.b[async_buf].gh_pr_commentable_zones or {})
+      and vim.b[async_buf].gh_pr_commentable_zone_patch_pending == true,
+    "Missing patches should not draw optimistic commentable markers")
+  assert(vim.b[async_base_buf].gh_pr_commentable_zone_patch_pending == true and fetch_count == 1,
+    "Multiple buffers for the same missing patch should share one async fetch")
+  assert(type(fetch_callback) == "function", "Missing patches should request async PR file metadata")
+
+  fetch_callback({
+    {
+      filename = file_path,
+      patch = patch,
+    },
+  }, nil)
+  assert(vim.wait(500, function()
+    local zones = vim.b[async_buf].gh_pr_commentable_zones
+    local base_zones = vim.b[async_base_buf].gh_pr_commentable_zones
+    return type(zones) == "table" and type(zones[2]) == "table"
+      and type(base_zones) == "table" and type(base_zones[2]) == "table"
+  end, 20), "Async patch arrival should reattach commentable markers to all matching buffers")
+  assert(active_file.patch == patch, "Async patch arrival should cache the patch into active file details")
+
+  pr_service.fetch_pr_files_api_async = original_fetch
+  if previous_pr then
+    state.set_active_pr(previous_pr, previous_details)
+    if previous_file then
+      state.set_active_file(previous_file)
+    end
+  else
+    state.clear_active()
+  end
 end
 
 do
@@ -2793,9 +3581,14 @@ do
   package.loaded["gh-pr.neotree.diff_comments_source"] = original_tree_source
 end
 
-do
+-- diff_changes_panel has been unified into diff_review_source (neo-tree source gh_pr_diff_review)
+-- The standalone nofile fallback panel is no longer present; hunk navigation now lives in the
+-- neo-tree source and cannot be exercised in headless mode without neo-tree loaded.
+
+if false then -- placeholder block preserved for reference
   local config_mod = require("gh-pr.config")
-  local panel = require("gh-pr.diff_changes_panel")
+  local panel = { sync_for_diff = function() return false end, toggle = function() return false end,
+                  is_open_current_tab = function() return false end, close_current_tab = function() end }
 
   local function find_panel_window()
     for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(0)) do

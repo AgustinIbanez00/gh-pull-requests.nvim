@@ -50,6 +50,29 @@ Commands
     By default `gh_pr` only appears after an async workspace probe confirms
     that the current workspace is a git repository with a GitHub remote.
 
+:GhPrCreate
+    Opens the pull request creation wizard. Alias: `:GhPrNew`.
+    The wizard collects title, description, head branch, labels, reviewers,
+    and draft status, then shows a final review screen before creating.
+    Navigation:
+      - `1`-`7` jumps to a tab and opens its editor/selector
+      - `h` / `l` and arrows move focus between tabs
+      - `<CR>` / `e` opens the focused tab
+      - `q` / `<Esc>` cancels
+    The base branch is read-only, resolved from the repository default
+    branch, and passed with `--base`. The head branch defaults to the current
+    branch and must be different from base and available on a remote.
+    Labels and reviewers are selected from preloaded GitHub options; selector
+    load failures offer retry/skip/cancel, not free-form entry.
+    Submit uses non-interactive `gh pr create` flags:
+      `--title`, `--body-file -`, `--head`, `--base`, repeated `--label`,
+      repeated `--reviewer`, plus `--draft` when selected.
+    Title, description, and shared comment composers show line numbers plus
+    visible `Ctrl-s save | q/Esc cancel` hints.
+
+:GhPrNew
+    Alias for `:GhPrCreate`.
+
 :GhPrList
     Opens Telescope query and pull request picker.
 
@@ -135,9 +158,13 @@ Commands
     one descendant file is viewed (recursive count including subfolders).
     Marking viewed/unviewed from `gh_pr_review` does not force-focus
     the `gh_pr` panel.
+    The `PR #...` overview node is a top-level sibling of `Labels`,
+    `Files`, `Reviewers`, and the other sections instead of a wrapper
+    parent for the whole review tree.
     Opening `Overview` from Neo-tree reuses the existing overview session
     (same PR) and performs a silent background refresh.
-    Inside `gh_pr_review`, `R` forces refresh from GitHub for active PR.
+    Inside `gh_pr_review`, `R` forces refresh from GitHub for active PR
+    and immediately notifies that background refresh started.
     `r` re-runs start-review flow for selected PR context.
     `ra` submit pending review as approve.
     `rc` submit pending review as comment.
@@ -190,10 +217,12 @@ Commands
     Loads more items in a section (`checks`, `commits`, `comments`,
     `reviews`, `threads`).
 
-:GhPrToggleChangesPanel
-    Toggles a side `nofile` hunk list for the current textual PR file diff.
-    The panel uses filetype `gh_pr_diff_changes`; `<CR>` jumps to a hunk and
-    `q`/`<Esc>` closes the panel.
+:GhPrToggleReviewPanel
+    Toggles the unified diff review panel (neo-tree source `gh_pr_diff_review`)
+    for the current textual PR file diff. The panel shows a Changes section
+    with navigable hunks and a Comments section with review threads. `<CR>` on
+    a hunk node jumps to that hunk; `<CR>` on a comment node navigates to the
+    thread. `q` closes the panel.
 
 Overview buffer keymaps:
     `a` approve review
@@ -352,15 +381,19 @@ Overview panes keymaps:
     If codediff is unavailable/fails, gh-pr prompts once per session:
       - use legacy virtual fallback backend for this session
       - or keep codediff-only mode (explicit error on diff opens)
-    Neovim 0.10+ is recommended for non-blocking codediff GitHub fetches via
-    `vim.system`; on older Neovim versions the compatibility fallback may
-    still block while shelling out to `gh`.
+    Neovim 0.10+ uses `vim.system` for async GitHub fetches; Neovim 0.9
+    uses a non-blocking `jobstart` fallback while shelling out to `gh`.
     Set `diff_view.debug.codediff_failures = true` to emit debug
     notifications with failure reason, fallback decisions, and review
     prefetch start/result events.
     In codediff file diffs, inline comments/suggestions and diff comments panel
-    are available; codediff inline/unified uses the modified side for inline
-    actions.
+    are available. GitHub-valid inline comment targets are marked with a `+`
+    sign when textual PR patch data is available; press `+` or
+    `<localleader>c` to comment the current line. If patch metadata arrives
+    asynchronously after codediff opens, gh-pr attaches markers without
+    reopening the diff. Regular inline comments can target visible
+    original/left or modified/right diff lines; inline suggestions are
+    restricted to modified/right-side targets.
     Line comment indicators/authors are rendered in codediff side-by-side,
     codediff inline, and gh-pr virtual unified text diffs.
     Multiline review comments mark the full range (`startLine -> line`) for
@@ -435,10 +468,11 @@ Overview panes keymaps:
       `<localleader>Q` close diff view(s) and open PR Review
       `<localleader>C` toggle diff comments panel
       `<localleader>o` toggle diff changes panel
-      `<localleader>c` add inline comment at cursor (`MODIFIED`/head or `unified`)
-      visual `<localleader>c` add inline comment for selected range (`v`/`V`, head or `unified`)
-      `<localleader>s` add inline suggestion at cursor (`suggestion` template)
-      visual `<localleader>s` add inline suggestion for selected range (`v`/`V`)
+      `+` add inline comment on marked codediff commentable lines
+      `<localleader>c` add inline comment at cursor on a GitHub-valid diff line
+      visual `<localleader>c` add inline comment for a same-side selected range (`v`/`V`)
+      `<localleader>s` add inline suggestion at cursor on a modified/right-side line (`suggestion` template)
+      visual `<localleader>s` add inline suggestion for a modified/right-side selected range (`v`/`V`)
       non-text preview buffers disable `<localleader>k`, `<localleader>c`,
       `<localleader>s`, `<localleader>n`, `<localleader>p`, check
       annotation overlays, and comments-tree auto-open
@@ -545,12 +579,13 @@ Overview panes keymaps:
     mind.
 
 Keymaps
-=======
+-------
 
 Top-level mappings are exposed as <Plug> targets. Global <leader> mappings are
 disabled by default.
 
 <Plug>(gh-pr-open)            Open PR UI (:GhPrOpen)
+<Plug>(gh-pr-create)          Open PR creation wizard (:GhPrCreate)
 <Plug>(gh-pr-list)            Open Telescope list (:GhPrList)
 <Plug>(gh-pr-comments)        Open comments tree (:GhPrComments)
 <Plug>(gh-pr-start-review)    Start PR review flow (:GhPrStartReview)
@@ -568,7 +603,7 @@ disabled by default.
 <Plug>(gh-pr-toggle-reviewed) Toggle viewed (:GhPrToggleReviewed)
 <Plug>(gh-pr-next-change)     Next diff hunk (:GhPrNextChange)
 <Plug>(gh-pr-prev-change)     Previous diff hunk (:GhPrPrevChange)
-<Plug>(gh-pr-toggle-changes-panel) Toggle diff changes panel (:GhPrToggleChangesPanel)
+<Plug>(gh-pr-toggle-review-panel) Toggle diff review panel (:GhPrToggleReviewPanel)
 <Plug>(gh-pr-approve)         Approve active PR (:GhPrApprove)
 <Plug>(gh-pr-request-changes) Request changes on active PR (:GhPrRequestChanges)
 <Plug>(gh-pr-comment)         Submit PR comment review (:GhPrComment)
@@ -765,6 +800,9 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.render_endlines` (`false`)
 - `diff_view.debug.codediff_failures` (`false`; debug notify for codediff failures/fallback decisions and review prefetch activity)
 - `diff_view.pr_explorer.enabled` (`true`; reuse a local codediff explorer for compatible PR text diffs)
+- `diff_view.commentable_zones.enabled` (`true`; show `+` signs on GitHub-valid codediff inline comment targets)
+- `diff_view.commentable_zones.sign` (`"+"`)
+- `diff_view.commentable_zones.keymap` (`"+"`; buffer-local add-inline-comment action)
 - `diff_view.prefetch.enabled` (`true`; warm textual PR file pairs on review start/refresh)
 - `diff_view.prefetch.concurrency` (`4`)
 - `diff_view.prefetch.text_extensions` (common text/code extension allowlist)
@@ -805,27 +843,23 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.shortcuts.submit_pending_request_changes` (`"<localleader>rr"`)
 - `diff_view.shortcuts.discard_pending_review` (`"<localleader>rd"`)
 - `diff_view.shortcuts.toggle_review_tree` (`"<localleader>rx"`)
-- `diff_view.shortcuts.toggle_comments_panel` (`"<localleader>C"`)
-- `diff_view.shortcuts.toggle_changes_panel` (`"<localleader>o"`)
+- `diff_view.shortcuts.toggle_review_panel` (`"<localleader>C"`)
 - `diff_view.shortcuts.image_default_action` (`"<localleader>io"`; default action for non-text preview buffers)
 - `diff_view.shortcuts.image_fallback_menu` (`"<localleader>im"`; preview actions menu for non-text preview buffers)
 - `diff_view.shortcuts.show_open_hint` (`true`)
-- `diff_view.changes_panel.enabled` (`true`)
-- `diff_view.changes_panel.auto_open` (`true`; opens beside textual PR file diffs without stealing focus)
-- `diff_view.changes_panel.position` (`"right"`; also `"left"`)
-- `diff_view.changes_panel.width` (`34`)
-- `diff_view.changes_panel.min_width` (`24`)
-- `diff_view.changes_panel.max_width` (`50`)
-- `diff_view.comments_panel.enabled` (`true`)
-- `diff_view.comments_panel.auto_open` (`"if_comments"` for current-file comments only, also `"never"` / `"always"`; boolean alias `true => "if_comments"`, `false => "never"`)
-- `diff_view.comments_panel.position` (`"bottom"`; also supports `"right"`)
-- `diff_view.comments_panel.height_ratio` (`0.28`; bottom Neo-tree diff comments pane height, also used by the legacy fallback panel)
-- `diff_view.comments_panel.min_height` (`8`; bottom Neo-tree diff comments pane minimum height)
-- `diff_view.comments_panel.max_height` (`18`; bottom Neo-tree diff comments pane maximum height)
-- `diff_view.comments_panel.follow_cursor` (`false`; deprecated/no-op, kept only for compatibility)
-- `diff_view.comments_panel.show_resolved` (`true`)
-- `diff_view.comments_panel.show_outdated` (`true`)
-- `diff_view.comments_panel.close_with_dq` (`true`)
+- `diff_view.review_panel.enabled` (`true`)
+- `diff_view.review_panel.auto_open` (`"if_content"`; opens when hunks or comments are present; also `"never"` / `"always"`)
+- `diff_view.review_panel.position` (`"bottom"`; also `"right"`)
+- `diff_view.review_panel.height_ratio` (`0.28`)
+- `diff_view.review_panel.min_height` (`8`)
+- `diff_view.review_panel.max_height` (`18`)
+- `diff_view.review_panel.show_resolved` (`true`)
+- `diff_view.review_panel.show_outdated` (`true`)
+- `diff_view.review_panel.close_with_dq` (`true`)
+- `diff_view.review_panel.sections.changes` (`true`; show the Changes folder)
+- `diff_view.review_panel.sections.comments` (`true`; show the Comments folder)
+- `diff_view.review_panel.active_hunk_highlight.enabled` (`true`; highlight active hunk node on CursorMoved)
+- `diff_view.review_panel.active_hunk_highlight.debounce_ms` (`80`)
 - `<localleader>` in diff shortcuts uses `vim.g.maplocalleader`; when unset,
   gh-pr falls back to `,` for diff-buffer mappings.
 - `diff_view.images.enabled` (`true`)
@@ -845,7 +879,7 @@ Call `require("gh-pr").setup({ ... })` with:
 - `diff_view.non_text.enabled` (`true`)
 - `diff_view.non_text.auto_preview` (`true`; image and generic binary files bypass codediff fallback prompts)
 - `diff_view.non_text.show_metadata` (`true`; render metadata/action cards for non-text preview buffers)
-- `queries` list: `{ folder, label, query }`
+- `queries` list: `{ folder, label, query }` (defaults: Review/Mine/All under "Pull Requests")
 - `ui.use_neotree` (`true`)
 - `ui.telescope_fallback` (`true`)
 - `ui.neotree_sources.pr.auto_register` (`true`)
@@ -918,6 +952,8 @@ Highlights
 - Baseline `GhPr*` highlight groups are defined as links to standard Neovim
   highlight groups.
 - gh-pr re-applies these baseline links on `ColorScheme`.
+- Codediff commentable `+` signs use `GhPrCommentableZone`, linked to
+  `DiagnosticHint` by default.
 - Reviewer state tokens in `Overview > Collaboration` use:
   `GhPrOverviewReviewerApproved`,
   `GhPrOverviewReviewerPending`,
@@ -978,4 +1014,3 @@ any local manual edits.
 
 v1 files (`{"queries":[...]}` with no `version` field) are migrated in-memory
 on first load; the file is written in v2 on the next save.
-

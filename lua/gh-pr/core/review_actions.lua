@@ -1,4 +1,5 @@
 local M = {}
+local activity = require("gh-pr.core.activity")
 
 local function pending_review_defaults()
   return {
@@ -32,7 +33,13 @@ function M.submit_pending_review(event, ctx)
         return
       end
 
+      local ev_label = event == "approve" and "approval"
+        or event == "request_changes" and "review"
+        or "comment"
+      local handle = activity.begin("Submitting " .. ev_label .. "...")
+      vim.cmd("redraw")
       local ok, review_err = ctx.pr_service.submit_pending_review(pr.number, event, body)
+      activity.done(handle)
       if not ok then
         ctx.notify_error(review_err)
         return
@@ -40,6 +47,7 @@ function M.submit_pending_review(event, ctx)
 
       ctx.notify_info(string.format("Pending %s review submitted for PR #%d", label, pr.number))
       ctx.refresh_line_comments_for_pr(pr.number, details)
+      ctx.refresh_pr_sources({ force = true })
     end)
   end)
 end
@@ -70,13 +78,17 @@ function M.discard_pending_review(ctx)
       return
     end
 
+    local handle = activity.begin("Discarding pending review...")
+    vim.cmd("redraw")
     local ok, discard_err = ctx.pr_service.discard_pending_review(pr.number)
+    activity.done(handle)
     if not ok then
       ctx.notify_error(discard_err)
       return
     end
 
     ctx.notify_info(string.format("Pending review discarded for PR #%d", pr.number))
+    ctx.refresh_pr_sources({ force = true })
   end)
 end
 

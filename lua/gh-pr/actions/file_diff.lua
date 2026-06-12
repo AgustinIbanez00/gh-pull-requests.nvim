@@ -42,7 +42,6 @@ function FileDiff.register(M, ctx)
   local apply_codediff_open_result_context = thread_diff_helpers.apply_codediff_open_result_context
   local codediff_file_runtime = thread_diff_helpers.codediff_file_runtime
   local resolve_commit = thread_diff_helpers.resolve_commit
-  local sync_diff_comments_panel = thread_diff_helpers.sync_diff_comments_panel
 
   local function pr_explorer_enabled()
     local plugin_config = type(config.get()) == "table" and config.get() or {}
@@ -256,22 +255,25 @@ function FileDiff.register(M, ctx)
         security_annotations_ctx = extra_ctx.security_annotations_ctx,
         source_name = extra_ctx.source_name,
         local_head_path = extra_ctx.local_head_path,
+        commentable_zones = true,
       })
-      sync_diff_comments_panel(pr, details, comments_ctx)
-      local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
-      if ok_changes and type(changes_panel.sync_for_diff) == "function" then
+      local ok_rev, rev = pcall(require, "gh-pr.neotree.diff_review_source")
+      if ok_rev and type(rev.sync_for_diff) == "function" then
         local origin_win = vim.api.nvim_get_current_win()
         local origin_buf = vim.api.nvim_get_current_buf()
-        pcall(changes_panel.sync_for_diff, {
-          pr = pr,
-          details = details,
-          pr_number = pr.number,
-          origin_win = origin_win,
-          origin_buf = origin_buf,
-          file_path = normalize_path(vim.b[origin_buf].gh_pr_file_path or vim.b[origin_buf].gh_pr_path),
-          file_kind = vim.b[origin_buf].gh_pr_file_kind,
-          open_result = open_result,
-        })
+        if vim.b[origin_buf].gh_pr_is_non_text ~= true then
+          pcall(rev.sync_for_diff, {
+            pr = pr,
+            details = details,
+            comments_ctx = comments_ctx,
+            pr_number = pr.number,
+            origin_win = origin_win,
+            origin_buf = origin_buf,
+            file_path = normalize_path(vim.b[origin_buf].gh_pr_file_path or vim.b[origin_buf].gh_pr_path),
+            file_kind = vim.b[origin_buf].gh_pr_file_kind,
+            open_result = open_result,
+          })
+        end
       end
     end
   end
@@ -428,14 +430,14 @@ function M.open_diff(file, opts)
 
     diff_view_runtime.focus_virtual_diff_result(diff_result, opts)
 
-    sync_diff_comments_panel(pr, details, comments_ctx)
-    local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
-    if ok_changes and type(changes_panel.sync_for_diff) == "function" then
+    local ok_rev, rev = pcall(require, "gh-pr.neotree.diff_review_source")
+    if ok_rev and type(rev.sync_for_diff) == "function" then
       local origin_buf = vim.api.nvim_get_current_buf()
       if vim.b[origin_buf].gh_pr_is_non_text ~= true then
-        pcall(changes_panel.sync_for_diff, {
+        pcall(rev.sync_for_diff, {
           pr = pr,
           details = details,
+          comments_ctx = comments_ctx,
           pr_number = pr.number,
           origin_win = vim.api.nvim_get_current_win(),
           origin_buf = origin_buf,
@@ -678,14 +680,14 @@ local function reopen_current_diff_with_preferences_impl(opts)
       target_line = cursor[1],
       target_original_line = cursor[1],
     })
-    sync_diff_comments_panel(pr, details, comments_ctx)
-    local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
-    if ok_changes and type(changes_panel.sync_for_diff) == "function" then
+    local ok_rev2, rev2 = pcall(require, "gh-pr.neotree.diff_review_source")
+    if ok_rev2 and type(rev2.sync_for_diff) == "function" then
       local origin_buf = vim.api.nvim_get_current_buf()
       if vim.b[origin_buf].gh_pr_is_non_text ~= true then
-        pcall(changes_panel.sync_for_diff, {
+        pcall(rev2.sync_for_diff, {
           pr = pr,
           details = details,
+          comments_ctx = comments_ctx,
           pr_number = pr.number,
           origin_win = vim.api.nvim_get_current_win(),
           origin_buf = origin_buf,
@@ -796,9 +798,9 @@ function M.close_quick()
 
   local base_win, head_win = find_diff_pair_windows_for_current_file()
   if valid_window(base_win) and valid_window(head_win) then
-    local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
-    if ok_changes and type(changes_panel.close_current_tab) == "function" then
-      pcall(changes_panel.close_current_tab, { suppress_auto_open = true })
+    local ok_rev, rev = pcall(require, "gh-pr.neotree.diff_review_source")
+    if ok_rev and type(rev.close_current_tab) == "function" then
+      pcall(rev.close_current_tab)
     end
     local head_buf = vim.api.nvim_win_get_buf(head_win)
     close_window_if_valid(head_win)
@@ -810,26 +812,17 @@ function M.close_quick()
   end
 
   close_current_diff_view()
-  local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
-  if ok_panel and type(panel.close_current_tab) == "function" then
-    pcall(panel.close_current_tab)
-  end
-  local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
-  if ok_changes and type(changes_panel.close_current_tab) == "function" then
-    pcall(changes_panel.close_current_tab, { suppress_auto_open = true })
+  local ok_rev2, rev2 = pcall(require, "gh-pr.neotree.diff_review_source")
+  if ok_rev2 and type(rev2.close_current_tab) == "function" then
+    pcall(rev2.close_current_tab)
   end
   open_review_tree_after_close()
 end
 
 function M.close_all_and_open_review()
-  local ok_changes, changes_panel = pcall(require, "gh-pr.diff_changes_panel")
-  if ok_changes and type(changes_panel.close_current_tab) == "function" then
-    pcall(changes_panel.close_current_tab, { suppress_auto_open = true })
-  end
-
-  local ok_panel, panel = pcall(require, "gh-pr.diff_comments_panel")
-  if ok_panel and type(panel.close_current_tab) == "function" then
-    pcall(panel.close_current_tab, { respect_close_with_dq = true })
+  local ok_rev, rev = pcall(require, "gh-pr.neotree.diff_review_source")
+  if ok_rev and type(rev.close_current_tab) == "function" then
+    pcall(rev.close_current_tab, { respect_close_with_dq = true })
   end
 
   local kind = vim.b.gh_pr_file_kind
@@ -1180,6 +1173,7 @@ local function diff_shortcut_lines(bufnr)
   local image_opts = non_text_preview.image_diff_options()
   local image_default_action = non_text_preview.resolve_default_action(image_opts)
   local configured_diff = (config.get() or {}).diff_view or {}
+  local commentable_zones = type(configured_diff.commentable_zones) == "table" and configured_diff.commentable_zones or {}
   local configured_whitespace = type(configured_diff.whitespace) == "table" and configured_diff.whitespace or {}
   local whitespace_tab = type(configured_whitespace.tab) == "string" and configured_whitespace.tab ~= ""
       and configured_whitespace.tab
@@ -1228,6 +1222,7 @@ local function diff_shortcut_lines(bufnr)
     shortcut_line("backend", backend),
     shortcut_line("mode", mode_label),
     shortcut_line("spaces", is_non_text and string.format("n/a (%s)", asset_label) or whitespace_mode_label),
+    shortcut_line("localleader", diff_view_runtime.display_keybinding("<localleader>")),
   }
   if backend ~= "codediff" then
     lines[#lines + 1] = shortcut_line("render", is_non_text and string.format("n/a (%s)", asset_label) or (prefs.render_whitespace and "visible" or "hidden"))
@@ -1254,8 +1249,7 @@ local function diff_shortcut_lines(bufnr)
   end
   add_shortcut(lines, shortcuts.close_quick, "Quick close (or close head in 2-way diff)")
   add_shortcut(lines, shortcuts.close_all_open_review, "Close view(s) and open PR Review")
-  add_shortcut(lines, shortcuts.toggle_comments_panel, "Toggle diff comments panel")
-  add_shortcut(lines, shortcuts.toggle_changes_panel, "Toggle diff changes panel")
+  add_shortcut(lines, shortcuts.toggle_review_panel, "Toggle diff review panel")
 
   if backend ~= "codediff" and not is_non_text then
     add_shortcut(lines, shortcuts.toggle_render_whitespace, "Toggle leading/trailing space/tab symbols")
@@ -1336,6 +1330,12 @@ local function diff_shortcut_lines(bufnr)
   if is_non_text then
     add_shortcut(lines, shortcuts.inline_comment, string.format("Not available for %s files", asset_label))
     add_shortcut(lines, shortcuts.inline_suggestion, string.format("Not available for %s files", asset_label))
+  elseif backend == "codediff" and commentable_zones.enabled ~= false and type(commentable_zones.keymap) == "string" and commentable_zones.keymap ~= "" then
+    add_shortcut(lines, commentable_zones.keymap, "Create inline comment on marked commentable (+) lines")
+    add_shortcut(lines, shortcuts.inline_comment, "Create inline comment at cursor")
+    add_visual_shortcut(lines, shortcuts.inline_comment, "Create inline comment on selected range")
+    add_shortcut(lines, shortcuts.inline_suggestion, "Create inline suggestion on modified/right-side lines")
+    add_visual_shortcut(lines, shortcuts.inline_suggestion, "Create inline suggestion on selected modified/right-side range")
   elseif kind == "head" and file_mode == "added_single" then
     add_shortcut(lines, shortcuts.inline_comment, "Create inline comment at cursor (any line)")
     add_visual_shortcut(lines, shortcuts.inline_comment, "Create inline comment on selected range")
@@ -1346,11 +1346,15 @@ local function diff_shortcut_lines(bufnr)
     add_visual_shortcut(lines, shortcuts.inline_comment, "Create inline comment on selected range")
     add_shortcut(lines, shortcuts.inline_suggestion, "Create inline suggestion at cursor")
     add_visual_shortcut(lines, shortcuts.inline_suggestion, "Create inline suggestion on selected range")
+  elseif kind == "base" then
+    add_shortcut(lines, shortcuts.inline_comment, "Create inline comment on original/left-side diff line")
+    add_visual_shortcut(lines, shortcuts.inline_comment, "Create inline comment on selected original/left-side range")
+    add_shortcut(lines, shortcuts.inline_suggestion, "Only available on modified/right-side lines")
   elseif virtual_unified then
-    add_shortcut(lines, shortcuts.inline_comment, "Create inline comment on added (+) line")
-    add_visual_shortcut(lines, shortcuts.inline_comment, "Create inline comment on added (+) range")
-    add_shortcut(lines, shortcuts.inline_suggestion, "Create inline suggestion on added (+) line")
-    add_visual_shortcut(lines, shortcuts.inline_suggestion, "Create inline suggestion on added (+) range")
+    add_shortcut(lines, shortcuts.inline_comment, "Create inline comment on commentable diff line")
+    add_visual_shortcut(lines, shortcuts.inline_comment, "Create inline comment on selected same-side diff range")
+    add_shortcut(lines, shortcuts.inline_suggestion, "Create inline suggestion on modified/right-side diff line")
+    add_visual_shortcut(lines, shortcuts.inline_suggestion, "Create inline suggestion on selected modified/right-side range")
   elseif codediff_inline then
     add_shortcut(lines, shortcuts.inline_comment, "Create inline comment at cursor")
     add_visual_shortcut(lines, shortcuts.inline_comment, "Create inline comment on selected range")

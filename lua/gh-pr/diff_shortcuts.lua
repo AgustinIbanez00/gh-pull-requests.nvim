@@ -27,8 +27,7 @@ local ordered_actions = {
   "submit_pending_request_changes",
   "discard_pending_review",
   "toggle_review_tree",
-  "toggle_comments_panel",
-  "toggle_changes_panel",
+  "toggle_review_panel",
   "image_default_action",
   "image_fallback_menu",
 }
@@ -80,8 +79,7 @@ M.defaults = {
   submit_pending_request_changes = "<localleader>rr",
   discard_pending_review = "<localleader>rd",
   toggle_review_tree = "<localleader>rx",
-  toggle_comments_panel = "<localleader>C",
-  toggle_changes_panel = "<localleader>o",
+  toggle_review_panel = "<localleader>C",
   image_default_action = "<localleader>io",
   image_fallback_menu = "<localleader>im",
   show_open_hint = true,
@@ -101,8 +99,7 @@ M.legacy_defaults = {
   prev_file = "<localleader>dF",
   next_reviewed_file = "<localleader>dv",
   prev_reviewed_file = "<localleader>dV",
-  toggle_comments_panel = "<localleader>dc",
-  toggle_changes_panel = "<localleader>do",
+  toggle_review_panel = "<localleader>dc",
 }
 
 function M.resolve(shortcuts)

@@ -1579,7 +1579,6 @@ query($owner:String!, $name:String!, $number:Int!) {
               line
               originalLine
               diffHunk
-              diffSide
               body
               createdAt
               state
@@ -1596,17 +1595,6 @@ query($owner:String!, $name:String!, $number:Int!) {
                 users {
                   totalCount
                 }
-              }
-              pullRequestReviewThread {
-                id
-                isResolved
-                isOutdated
-                path
-                line
-                originalLine
-                startLine
-                originalStartLine
-                diffSide
               }
             }
           }
@@ -1718,7 +1706,6 @@ query($owner:String!, $name:String!, $number:Int!) {
               line
               originalLine
               diffHunk
-              diffSide
               body
               createdAt
               state
@@ -1735,17 +1722,6 @@ query($owner:String!, $name:String!, $number:Int!) {
                 users {
                   totalCount
                 }
-              }
-              pullRequestReviewThread {
-                id
-                isResolved
-                isOutdated
-                path
-                line
-                originalLine
-                startLine
-                originalStartLine
-                diffSide
               }
             }
           }

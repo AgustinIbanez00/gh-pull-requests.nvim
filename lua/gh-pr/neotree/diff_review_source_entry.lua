@@ -3,8 +3,8 @@ local diff_shortcuts = require("gh-pr.diff_shortcuts")
 local registry = require("gh-pr.neotree.registry")
 
 local M = {
-  name = "gh_pr_diff_comments",
-  display_name = "GH Diff Comments",
+  name = "gh_pr_diff_review",
+  display_name = "GH Diff Review",
 }
 
 local DEFAULT_RENDERERS = {
@@ -31,18 +31,15 @@ local DEFAULT_RENDERERS = {
 }
 
 local function get_impl()
-  local source = registry.get("gh_pr_diff_comments")
-  if source then
-    return source
-  end
-
-  source = require("gh-pr.neotree.diff_comments_source")
-  registry.register("gh_pr_diff_comments", source)
+  local source = registry.get("gh_pr_diff_review")
+  if source then return source end
+  source = require("gh-pr.neotree.diff_review_source")
+  registry.register("gh_pr_diff_review", source)
   return source
 end
 
 function M.setup(source_config, _)
-  local commands = require("gh-pr.neotree.diff_comments_commands")
+  local commands = require("gh-pr.neotree.diff_review_commands")
   local components = require("gh-pr.neotree.components")
   local preview_options = (((config.get() or {}).line_comments or {}).comments_tree or {}).preview or {}
   local configured_shortcuts = ((config.get() or {}).diff_view or {}).shortcuts or {}
@@ -61,7 +58,7 @@ function M.setup(source_config, _)
 
   local default_mappings = {
     ["<space>"] = "toggle_node",
-    ["<CR>"] = "gh_pr_diff_comments_open",
+    ["<CR>"] = "gh_pr_diff_review_open",
     ["o"] = "open_comment",
     [preview_keymap] = "preview_comment",
     ["R"] = "refresh",

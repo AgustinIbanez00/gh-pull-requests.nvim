@@ -265,6 +265,7 @@ function M.add(query)
   local stored = load_file()
   local meta = stored and stored.meta or { conflict_choice = "ask" }
   save(config.get_queries(), meta)
+  trigger_refresh()
 end
 
 function M.update(id, query)
@@ -273,6 +274,7 @@ function M.update(id, query)
     local stored = load_file()
     local meta = stored and stored.meta or { conflict_choice = "ask" }
     save(config.get_queries(), meta)
+    trigger_refresh()
   end
   return changed
 end
@@ -283,6 +285,7 @@ function M.delete(id)
     local stored = load_file()
     local meta = stored and stored.meta or { conflict_choice = "ask" }
     save(config.get_queries(), meta)
+    trigger_refresh()
   end
   return changed
 end

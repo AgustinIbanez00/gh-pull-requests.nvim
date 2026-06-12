@@ -162,114 +162,102 @@ function M.build_root_nodes(pr, details, sections)
 
   return {
     {
-      id = string.format("ghpr-review:%d:root", pr.number),
+      id = string.format("ghpr-review:%d:overview", pr.number),
       name = string.format("PR #%d - %s", pr.number, pr.title or ""),
-      type = "folder",
+      type = "overview",
       extra = {
-        kind = "root",
+        kind = "overview",
         pr = pr,
         details = details,
       },
-      children = {
-        {
-          id = string.format("ghpr-review:%d:overview", pr.number),
-          name = "Overview",
-          type = "overview",
-          extra = {
-            kind = "overview",
-            pr = pr,
-            details = details,
-          },
-        },
-        {
-          id = string.format("ghpr-review:%d:labels", pr.number),
-          name = "Labels",
-          type = "directory",
-          extra = {
-            kind = "labels",
-            pr = pr,
-            details = details,
-          },
-          children = labels,
-        },
-        {
-          id = string.format("ghpr-review:%d:files", pr.number),
-          name = type(files.title) == "string" and files.title or "Files",
-          type = "files",
-          extra = {
-            kind = "files",
-            pr = pr,
-            details = details,
-          },
-          children = files.children or {},
-        },
-        {
-          id = string.format("ghpr-review:%d:reviewers", pr.number),
-          name = type(reviewers.title) == "string" and reviewers.title or "Reviewers",
-          type = "directory",
-          extra = {
-            kind = "reviewers",
-            pr = pr,
-            details = details,
-          },
-          children = reviewers.children or {},
-        },
-        {
-          id = string.format("ghpr-review:%d:commits", pr.number),
-          name = type(commits.title) == "string" and commits.title or "Commits",
-          type = "directory",
-          extra = {
-            kind = "commits",
-            pr = pr,
-            details = details,
-          },
-          children = commits.children or {},
-        },
-        {
-          id = string.format("ghpr-review:%d:checks", pr.number),
-          name = type(checks.title) == "string" and checks.title or "Checks",
-          type = "directory",
-          extra = {
-            kind = "checks",
-            pr = pr,
-            details = details,
-          },
-          children = checks.children or {},
-        },
-        {
-          id = string.format("ghpr-review:%d:security", pr.number),
-          name = type(security.title) == "string" and security.title or "Security",
-          type = "directory",
-          extra = {
-            kind = "security",
-            pr = pr,
-            details = details,
-          },
-          children = security.children or {},
-        },
-        {
-          id = string.format("ghpr-review:%d:comments", pr.number),
-          name = type(comments.title) == "string" and comments.title or "Comments",
-          type = "directory",
-          extra = {
-            kind = "comments",
-            pr = pr,
-            details = details,
-          },
-          children = comments.children or {},
-        },
-        {
-          id = string.format("ghpr-review:%d:drafts", pr.number),
-          name = type(drafts.title) == "string" and drafts.title or "Drafts",
-          type = "directory",
-          extra = {
-            kind = "drafts",
-            pr = pr,
-            details = details,
-          },
-          children = drafts.children or {},
-        },
+    },
+    {
+      id = string.format("ghpr-review:%d:labels", pr.number),
+      name = "Labels",
+      type = "directory",
+      extra = {
+        kind = "labels",
+        pr = pr,
+        details = details,
       },
+      children = labels,
+    },
+    {
+      id = string.format("ghpr-review:%d:files", pr.number),
+      name = type(files.title) == "string" and files.title or "Files",
+      type = "files",
+      extra = {
+        kind = "files",
+        pr = pr,
+        details = details,
+      },
+      children = files.children or {},
+    },
+    {
+      id = string.format("ghpr-review:%d:reviewers", pr.number),
+      name = type(reviewers.title) == "string" and reviewers.title or "Reviewers",
+      type = "directory",
+      extra = {
+        kind = "reviewers",
+        pr = pr,
+        details = details,
+      },
+      children = reviewers.children or {},
+    },
+    {
+      id = string.format("ghpr-review:%d:commits", pr.number),
+      name = type(commits.title) == "string" and commits.title or "Commits",
+      type = "directory",
+      extra = {
+        kind = "commits",
+        pr = pr,
+        details = details,
+      },
+      children = commits.children or {},
+    },
+    {
+      id = string.format("ghpr-review:%d:checks", pr.number),
+      name = type(checks.title) == "string" and checks.title or "Checks",
+      type = "directory",
+      extra = {
+        kind = "checks",
+        pr = pr,
+        details = details,
+      },
+      children = checks.children or {},
+    },
+    {
+      id = string.format("ghpr-review:%d:security", pr.number),
+      name = type(security.title) == "string" and security.title or "Security",
+      type = "directory",
+      extra = {
+        kind = "security",
+        pr = pr,
+        details = details,
+      },
+      children = security.children or {},
+    },
+    {
+      id = string.format("ghpr-review:%d:comments", pr.number),
+      name = type(comments.title) == "string" and comments.title or "Comments",
+      type = "directory",
+      extra = {
+        kind = "comments",
+        pr = pr,
+        details = details,
+      },
+      children = comments.children or {},
+    },
+    {
+      id = string.format("ghpr-review:%d:drafts", pr.number),
+      name = type(drafts.title) == "string" and drafts.title or "Drafts",
+      type = "directory",
+      extra = {
+        kind = "drafts",
+        pr = pr,
+        details = details,
+      },
+      children = drafts.children or {},
     },
   }
 end

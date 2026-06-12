@@ -23,9 +23,31 @@ local function complete_overview_more(arg_lead, cmd_line)
   return matches
 end
 
+local function prefix_completer(items)
+  return function(arg_lead, cmd_line)
+    local parts = vim.split(cmd_line, "%s+", { trimempty = true })
+    if #parts > 2 then
+      return {}
+    end
+
+    local matches = {}
+    for _, item in ipairs(items) do
+      if arg_lead == "" or item:sub(1, #arg_lead) == arg_lead then
+        matches[#matches + 1] = item
+      end
+    end
+    return matches
+  end
+end
+
+local complete_log_channel = prefix_completer({ "lua", "codediff", "github", "general" })
+local complete_log_level = prefix_completer({ "error", "warn", "info", "debug" })
+
 function M.build(call, command_no_args)
   return {
     { name = "GhPrOpen", callback = command_no_args("open_pull_requests"), opts = { desc = "Open GitHub pull request view" } },
+    { name = "GhPrCreate", callback = command_no_args("create_pull_request"), opts = { desc = "Create a GitHub pull request" } },
+    { name = "GhPrNew", callback = command_no_args("new_pull_request"), opts = { desc = "Create a GitHub pull request" } },
     { name = "GhPrList", callback = command_no_args("list_pull_requests"), opts = { desc = "List pull requests using Telescope" } },
     { name = "GhPrTelescope", callback = command_no_args("open_telescope"), opts = { desc = "Open Telescope fallback query/PR picker" } },
     {
@@ -126,9 +148,9 @@ function M.build(call, command_no_args)
     { name = "GhPrNextChange", callback = command_no_args("next_change"), opts = { desc = "Jump to next diff change" } },
     { name = "GhPrPrevChange", callback = command_no_args("prev_change"), opts = { desc = "Jump to previous diff change" } },
     {
-      name = "GhPrToggleChangesPanel",
-      callback = command_no_args("toggle_changes_panel"),
-      opts = { desc = "Toggle diff changes panel" },
+      name = "GhPrToggleReviewPanel",
+      callback = command_no_args("toggle_review_panel"),
+      opts = { desc = "Toggle diff review panel (changes + comments)" },
     },
     {
       name = "GhPrApprove",
@@ -191,6 +213,39 @@ function M.build(call, command_no_args)
       name = "GhPrQueriesReloadLua",
       callback = command_no_args("queries_reload_lua"),
       opts = { desc = "Force reload queries from Lua config, discarding local edits" },
+    },
+    {
+      name = "GhPrLogOpen",
+      callback = function(command)
+        call("log_open", optional_arg(command))
+      end,
+      opts = {
+        nargs = "?",
+        complete = complete_log_channel,
+        desc = "Open gh-pr log file (channel: lua|codediff|github|general) or logs dir",
+      },
+    },
+    {
+      name = "GhPrLogClear",
+      callback = function(command)
+        call("log_clear", optional_arg(command))
+      end,
+      opts = {
+        nargs = "?",
+        complete = complete_log_channel,
+        desc = "Clear gh-pr logs (a single channel or all channels)",
+      },
+    },
+    {
+      name = "GhPrLogLevel",
+      callback = function(command)
+        call("log_level", optional_arg(command))
+      end,
+      opts = {
+        nargs = "?",
+        complete = complete_log_level,
+        desc = "Show or set gh-pr log level (error|warn|info|debug)",
+      },
     },
   }
 end

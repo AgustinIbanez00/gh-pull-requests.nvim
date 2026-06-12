@@ -1091,8 +1091,7 @@ local function set_pr_buffer_keymaps(bufnr, keymap_opts)
     diff_shortcuts.submit_pending_request_changes,
     diff_shortcuts.discard_pending_review,
     diff_shortcuts.toggle_review_tree,
-    diff_shortcuts.toggle_comments_panel,
-    diff_shortcuts.toggle_changes_panel,
+    diff_shortcuts.toggle_review_panel,
     diff_shortcuts.image_default_action,
     diff_shortcuts.image_fallback_menu,
   }
@@ -1129,8 +1128,7 @@ local function set_pr_buffer_keymaps(bufnr, keymap_opts)
   )
   set_buffer_keymap("n", diff_shortcuts.discard_pending_review, call_action("discard_pending_review"), "Discard pending review")
   set_buffer_keymap("n", diff_shortcuts.toggle_review_tree, call_action("toggle_review_tree"), "Toggle PR Review source")
-  set_buffer_keymap("n", diff_shortcuts.toggle_comments_panel, call_action("toggle_diff_comments_panel"), "Toggle diff comments panel")
-  set_buffer_keymap("n", diff_shortcuts.toggle_changes_panel, call_action("toggle_diff_changes_panel"), "Toggle diff changes panel")
+  set_buffer_keymap("n", diff_shortcuts.toggle_review_panel, call_action("toggle_diff_review_panel"), "Toggle diff review panel")
 
   if asset_mode then
     set_buffer_keymap(

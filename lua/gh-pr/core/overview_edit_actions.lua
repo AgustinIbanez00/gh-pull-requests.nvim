@@ -1,4 +1,5 @@
 local M = {}
+local activity = require("gh-pr.core.activity")
 local reviewer_model = require("gh-pr.core.reviewers")
 
 local overview_edit_labels = {
@@ -11,6 +12,18 @@ local overview_edit_labels = {
   change_state = "Change state",
   change_draft = "Change draft status",
   rerequest_reviewer = "Re-request reviewer",
+}
+
+local activity_labels = {
+  edit_title         = "Updating title...",
+  edit_body          = "Updating description...",
+  edit_labels        = "Updating labels...",
+  edit_reviewers     = "Updating reviewers...",
+  edit_assignees     = "Updating assignees...",
+  edit_milestone     = "Updating milestone...",
+  change_state       = "Updating PR state...",
+  change_draft       = "Updating draft status...",
+  rerequest_reviewer = "Re-requesting reviewer...",
 }
 
 local function positive_integer(value, fallback)
@@ -566,7 +579,10 @@ function M.run(kind, payload, ctx)
         return
       end
 
+      local handle = activity.begin(activity_labels[kind] or "Updating...")
+      vim.cmd("redraw")
       local ok, op_err = operation.run(pr.number)
+      activity.done(handle)
       if not ok then
         ctx.notify_error(op_err)
         return
@@ -605,7 +621,10 @@ function M.run(kind, payload, ctx)
         return
       end
 
+      local handle = activity.begin(activity_labels[kind] or "Updating...")
+      vim.cmd("redraw")
       local ok, op_err = operation.run(pr.number)
+      activity.done(handle)
       if not ok then
         ctx.notify_error(op_err)
         return
