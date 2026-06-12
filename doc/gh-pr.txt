@@ -6,7 +6,7 @@ GitHub CLI as backend.
 Requirements
 ============
 
-- Neovim >= 0.9 (0.10+ recommended for `vim.system` / `vim.ui.open` support)
+- Neovim >= 0.12
 - `gh` installed and authenticated
 - inside a git repository
 - `render-markdown.nvim` installed (required dependency)
@@ -381,8 +381,8 @@ Overview panes keymaps:
     If codediff is unavailable/fails, gh-pr prompts once per session:
       - use legacy virtual fallback backend for this session
       - or keep codediff-only mode (explicit error on diff opens)
-    Neovim 0.10+ uses `vim.system` for async GitHub fetches; Neovim 0.9
-    uses a non-blocking `jobstart` fallback while shelling out to `gh`.
+    gh-pr uses `vim.system` for async GitHub fetches while shelling out to
+    `gh`.
     Set `diff_view.debug.codediff_failures = true` to emit debug
     notifications with failure reason, fallback decisions, and review
     prefetch start/result events.

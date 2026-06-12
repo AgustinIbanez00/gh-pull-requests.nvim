@@ -2,7 +2,7 @@
 
 A GitHub Pull Request workflow for Neovim (VSCode-like), powered by the GitHub CLI (`gh`).
 
-[![Neovim](https://img.shields.io/badge/Neovim-0.9%2B-57A143?logo=neovim&logoColor=white)](#requirements)
+[![Neovim](https://img.shields.io/badge/Neovim-0.12%2B-57A143?logo=neovim&logoColor=white)](#requirements)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Release](https://img.shields.io/github/v/release/AgustinIbanez00/gh-pull-requests.nvim)](https://github.com/AgustinIbanez00/gh-pull-requests.nvim/releases)
 [![CI](https://github.com/AgustinIbanez00/gh-pull-requests.nvim/actions/workflows/ci.yml/badge.svg)](https://github.com/AgustinIbanez00/gh-pull-requests.nvim/actions/workflows/ci.yml)
@@ -87,7 +87,7 @@ Use the tracked [screenshot capture guide](assets/screenshots/README.md) to keep
 
 ## Requirements
 
-- Neovim >= 0.9 (0.10+ recommended for `vim.system` / `vim.ui.open` support)
+- Neovim >= 0.12
 - GitHub CLI (`gh`) installed and authenticated (`gh auth login`)
 - Run inside a git repository
 - [render-markdown.nvim](https://github.com/MeanderingProgrammer/render-markdown.nvim) installed
@@ -880,7 +880,7 @@ Diff backend behavior:
 - Image and generic binary/non-renderable files bypass codediff fallback prompts and open dedicated gh-pr non-text preview buffers.
 - If codediff is unavailable or fails for a codediff-eligible diff, gh-pr prompts once per session to decide whether to use the virtual fallback backend for the rest of the session.
 - If fallback is rejected, diff open actions return explicit errors.
-- Neovim 0.10+ uses `vim.system` for async GitHub fetches; Neovim 0.9 uses a non-blocking `jobstart` fallback while shelling out to `gh`.
+- gh-pr uses `vim.system` for async GitHub fetches while shelling out to `gh`.
 - Inline comments/suggestions and diff comments panel are available in codediff file diffs. GitHub-valid inline comment targets are marked with a `+` sign in codediff buffers; press `+` or `<localleader>c` to comment the current line.
 - `+` markers are drawn only when gh-pr has textual PR patch data for the file. If patch metadata arrives asynchronously after a codediff buffer opens, markers are attached without reopening the diff.
 - Regular inline comments can target visible original/left or modified/right diff lines; inline suggestions are restricted to modified/right-side targets.
